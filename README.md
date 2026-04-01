@@ -459,77 +459,6 @@ python tools/calibrate_atr.py  # ATR calibration
 
 ---
 
-## SECTION 11 - RECOMMENDATIONS FOR DRASTIC IMPROVEMENTS
-
-### HIGH PRIORITY — Expected to significantly improve expectancy
-
-#### REC-1: Multi-Timeframe Confluence Scoring
-Instead of binary signal/no-signal, score each setup on a 0-100 scale based on:
-- H4 trend alignment (ADX direction + strength)
-- H1 structure (higher highs/lows)
-- M15 momentum (EMA slope)
-- Volume confirmation
-- DXY correlation strength
-
-Only take trades scoring >65. This single change could improve win rate by 10-15pp by filtering marginal setups.
-
-#### REC-2: Adaptive ATR Percentile Thresholds
-Current ATR thresholds are static (30/55/85/95). XAUUSD volatility regime has shifted significantly since 2024. Implement rolling 90-day recalibration:
-```python
-# Every Sunday midnight:
-atr_distribution = get_90_day_atr_distribution()
-ATR_PCT_QUIET_REF = np.percentile(atr_distribution, 30)
-ATR_PCT_SUPER_THRESHOLD = np.percentile(atr_distribution, 55)
-```
-This prevents the system from being permanently stuck in one regime during volatility regime shifts.
-
-#### REC-3: Session-Specific Strategy Performance Tracking
-Track win rate and expectancy per strategy PER SESSION. If S1 has 60% WR in London but 30% in London-NY overlap, automatically disable S1 in overlap after 30+ trades confirm the pattern. This is a data-driven strategy filter that improves over time.
-
-#### REC-4: Implement Trailing TP (Partial Close at 2R, Trail Remainder)
-Current system takes 50% at 2R and trails the rest. Consider a 3-tier exit:
-- 33% at 1.5R (lock in some profit early)
-- 33% at 3R (capture the meat of the move)
-- 34% trails with 2.5× ATR (ride the tail)
-
-This captures more of the distribution tail on big moves while still banking profits.
-
-#### REC-5: Order Flow / Tick Volume Divergence
-Add a pre-entry check: if price is making new highs but tick volume is declining (bearish divergence), skip the LONG entry. This is a powerful filter for false breakouts that volume alone doesn't catch.
-
-### MEDIUM PRIORITY — Structural improvements
-
-#### REC-6: Implement Proper Backtesting Framework
-The system has no backtesting capability. Without it, every parameter change is a live experiment. Build a replay engine that:
-- Reads historical M5/M15/H1 OHLCV from database
-- Simulates all signal engines with historical state
-- Produces strategy-level P&L curves
-- Enables parameter optimization before live deployment
-
-#### REC-7: Add Intraday Equity Curve Monitoring
-Track equity curve slope intraday. If equity drops >1.5% in 2 hours, reduce all new position sizes by 50% for the rest of the session (not a full halt like KS3, just a throttle). This catches "bad days" earlier than the daily limit.
-
-#### REC-8: Implement Strategy Rotation Based on Regime History
-If the last 5 regime readings were all RANGING_CLEAR, boost S2/S3 sizing and reduce S1/S4 sizing. If trending for 5+ readings, do the opposite. This dynamically allocates capital to strategies that match current conditions.
-
-#### REC-9: Add Spread Prediction Model
-Instead of reacting to current spread, predict spread 15 minutes ahead using:
-- Time of day (spread follows predictable intraday patterns)
-- Upcoming events (spread widens before NFP)
-- Recent spread trajectory
-
-This allows pre-emptive order timing — place orders when spread is predicted to be lowest.
-
-#### REC-10: Implement Monte Carlo Position Sizing
-Replace fixed 1%/2% risk with Kelly Criterion-derived sizing:
-```python
-kelly_fraction = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
-safe_kelly = kelly_fraction * 0.25  # Quarter-Kelly for safety
-```
-This mathematically optimizes growth rate while controlling drawdown.
-
----
-
 ## APPENDICES
 
 ### Appendix A - Change Log
@@ -559,5 +488,3 @@ This mathematically optimizes growth rate while controlling drawdown.
 ---
 
 *"The biggest edge in this system isn't any single strategy — it's fixing the bugs that prevent existing edge from being realized."*
-
-*Documentation Version 3.0 — Post-Critical Review Edition*
