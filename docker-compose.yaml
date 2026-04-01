@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: Leela_xauusd_db
+    environment:
+      POSTGRES_DB: xauusd
+      POSTGRES_USER: xauusd_user
+      POSTGRES_PASSWORD: Leela_0000
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+volumes:
+  postgres_data:

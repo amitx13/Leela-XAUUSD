@@ -1,0 +1,1 @@
+"""engines package — Layer 1–6 implementations."""
