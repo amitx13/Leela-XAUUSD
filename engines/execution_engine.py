@@ -839,6 +839,7 @@ def on_trade_opened(
     B5 Fix: stop_price_original = candidate stop — NEVER updated after entry.
     G8 Fix: persist_critical_state() called here.
     C5:     trend_family_occupied set ONLY for S1-family signals.
+    V3.0:   S8 independent lane added (Change 5.1) — early return, no trend_family_occupied.
     """
     trade_id = str(uuid.uuid4())
 
@@ -920,7 +921,29 @@ def on_trade_opened(
     )
 
     signal = candidate["signal_type"]
-    
+
+    # ── S8: Independent position lane (ATR spike) ──────────────────────────
+    # S8 does NOT occupy trend_family. Coexists with S1/S4/S5.
+    if signal == "S8_ATR_SPIKE":
+        state["s8_open_ticket"]         = ticket
+        state["s8_entry_price"]         = actual_price
+        state["s8_stop_price_original"] = candidate.get("stop_level", 0.0)
+        state["s8_stop_price_current"]  = candidate.get("stop_level", 0.0)
+        state["s8_trade_direction"]     = candidate.get("direction", None)
+        state["s8_be_activated"]        = False
+        state["s8_open_time_utc"]       = datetime.now(pytz.utc).isoformat()
+        state["s8_fired_today"]         = True
+        from engines.position_manager import pm_on_fill as _pm_s8
+        from db.persistence import persist_critical_state as _persist_s8
+        _pm_s8(signal, ticket, candidate["direction"], float(candidate["lot_size"]))
+        _persist_s8(state)
+        log_event("S8_POSITION_OPENED",
+                  trade_id=trade_id, ticket=ticket,
+                  entry=actual_price,
+                  stop=candidate.get("stop_level"),
+                  direction=candidate.get("direction"))
+        return    # ← EARLY RETURN: skip trend_family_occupied setter
+
     # ── Phase 2: R3 Independent Family Branch ────────────────────────────────
     # R3 does not occupy the trend family and tracks its own position ticket.
     if signal == "R3_CAL_MOMENTUM":
@@ -943,7 +966,7 @@ def on_trade_opened(
                   lots=candidate["lot_size"])
         return   # ← EARLY RETURN: skip the main family state updates below
 
-    # ── Standard path (all non-R3 signals) ─────────────────────────────────--
+    # ── Standard path (all non-R3/S8 signals) ────────────────────────────────
     # Everything below is EXISTING code, unchanged.
     state["open_position"]       = ticket
     state["entry_price"]         = actual_price
@@ -991,7 +1014,7 @@ def on_trade_opened(
               price=round(actual_price, 3), lots=candidate["lot_size"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────��──────
 # TRADE CLOSE — KS4 countdown + Change 56 correlation check
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1006,6 +1029,7 @@ def on_trade_closed(
     B5: R-multiple always vs stop_price_original (never stop_price_current).
     v1.1: trigger_ks4_countdown() when loss streak hits KS4_LOSS_STREAK_COUNT.
     Change 56: run P&L correlation check every 10 closed trades.
+    V3.0: S8 guard added (Change 5.2) — S8 close does NOT clear trend_family_occupied.
     """
     rows = execute_query(
         """SELECT trade_id, entry_price, stop_price_original, lot_size,
@@ -1102,8 +1126,19 @@ def on_trade_closed(
         state["r3_stop_price"]  = 0.0
         state["r3_tp_price"]    = 0.0
         # Fall through to equity/P&L update below (shared with all signals)
+    elif signal == "S8_ATR_SPIKE":
+        # S8 independent lane — clean up S8 state only.
+        # Do NOT touch trend_family_occupied (S1 may still be open).
+        state["s8_open_ticket"]         = None
+        state["s8_entry_price"]         = 0.0
+        state["s8_stop_price_original"] = 0.0
+        state["s8_stop_price_current"]  = 0.0
+        state["s8_trade_direction"]     = None
+        state["s8_be_activated"]        = False
+        state["s8_open_time_utc"]       = None
+        # Fall through to equity/P&L update below (shared with all signals)
     else:
-        # ── Existing non-R3 state cleanup (UNCHANGED) ─────────────────────────
+        # ── Existing non-R3/S8 state cleanup (UNCHANGED) ──────────────────────
         if signal not in ("S1D_PYRAMID", "S1E_PYRAMID"):
             state["open_position"]          = None
             state["trend_family_occupied"]  = False
@@ -1217,6 +1252,7 @@ def emergency_shutdown(reason: str, state: dict) -> None:
     C5 Fix: Magic filter enforced on EVERY position and order.
     Never closes positions or cancels orders with wrong magic number.
     Sends SMTP alert. Calls mt5.shutdown() + reset_mt5_connection().
+    V3.0: S8 + R3 independent lane state cleared on shutdown (Change 5.4).
     """
     log_critical("EMERGENCY_SHUTDOWN_INITIATED", reason=reason)
 
@@ -1248,6 +1284,19 @@ def emergency_shutdown(reason: str, state: dict) -> None:
     state["shutdown_reason"]       = reason
     state["trend_family_occupied"] = False
     state["open_position"]         = None
+
+    # Clean independent position lanes (S8 + R3)
+    # Without this, stale keys after restart would make bot think positions are open.
+    state["s8_open_ticket"]         = None
+    state["s8_entry_price"]         = 0.0
+    state["s8_be_activated"]        = False
+    state["s8_open_time_utc"]       = None
+    state["s8_trade_direction"]     = None
+    state["s8_stop_price_original"] = 0.0
+    state["s8_stop_price_current"]  = 0.0
+    state["r3_open_ticket"]         = None
+    state["r3_open_time"]           = None
+
     persist_critical_state(state)
 
     send_ks_alert("EMERGENCY_SHUTDOWN", (
