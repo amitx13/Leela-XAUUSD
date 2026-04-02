@@ -63,6 +63,7 @@ from engines.risk_engine import (
     check_ks5_weekly_loss,
     check_ks6_drawdown,
     decrement_ks4_countdown,
+    run_pre_trade_kill_switches,
 )
 from engines.signal_engine import (
     evaluate_s1_signal,
@@ -74,6 +75,7 @@ from engines.signal_engine import (
     evaluate_s3_signal,
     evaluate_s6_signal,
     evaluate_s7_signal,
+    evaluate_s8_signal,       # FIX: was missing — S8 never fired
     detect_stop_hunt,
     auto_reset_s1b_counter,
     check_and_fire_london_time_kill,
@@ -267,7 +269,15 @@ def midnight_reset_job() -> None:
     STATE["s1b_pending_ticket"]       = None    # safety clear on new day
     STATE["s6_fired_today"]           = False
     STATE["s7_fired_today"]           = False
-    
+    # FIX: explicit daily reset for S8 flags (also reset by reset_daily_counters
+    # in state.py but logged here for audit trail)
+    STATE["s8_fired_today"]           = False
+    STATE["s8_armed"]                 = False
+    STATE["s8_arm_time"]              = None
+    STATE["s8_arm_candle_time"]       = None
+    STATE["s8_spike_candle_idx"]      = None
+    log_event("S8_DAILY_FLAGS_RESET")
+
     try:
         d1_atr = get_daily_atr14()
         if d1_atr is not None:
@@ -522,6 +532,7 @@ def m5_mgmt_job() -> None:
       2. Detect S1 pending fills
       3. Detect S6 pending fills
       4. Detect S7 pending fills
+      4.5 S8 ATR Spike — evaluate + dispatch (with KS gate)   ← FIX
       ★5. R3 arm detection (checks for recent HIGH events)
       ★6. R3 broker-close detection (SL/TP hit on R3 independent ticket)
       ★7. R3 hard exit (30-min hold limit)
@@ -548,6 +559,27 @@ def m5_mgmt_job() -> None:
     _check_for_s1_pending_fill()
     _check_for_s6_pending_fill()
     _check_for_s7_pending_fill()
+
+    # ── 4.5 S8: ATR Spike — evaluate and dispatch ─────────────────────────────
+    # Runs only when trend family is free and S8 has not fired today.
+    # Full KS gate (KS3/KS5/KS6/KS7) applied before dispatch.
+    if (not STATE.get("trend_family_occupied")
+            and not STATE.get("s8_fired_today")
+            and not STATE.get("s1_pending_buy_ticket")
+            and not STATE.get("s1_pending_sell_ticket")):
+        s8_candidate = evaluate_s8_signal(STATE)
+        if s8_candidate:
+            # Run full pre-trade kill switch stack before dispatching
+            ks_permitted, ks_reason = run_pre_trade_kill_switches(STATE)
+            if ks_permitted:
+                STARVATION_TRACKER.record_evaluation()
+                STARVATION_TRACKER.record_signal()
+                _dispatch_candidate(s8_candidate)
+            else:
+                STARVATION_TRACKER.record_block(
+                    s8_candidate["signal_type"], "kill_switch", ks_reason
+                )
+                log_event("S8_BLOCKED_BY_KILL_SWITCH", reason=ks_reason)
 
     # ── ★ 5. R3: Attempt to arm on this M5 close ─────────────────────────────
     if not STATE.get("r3_fired_today"):
@@ -1049,6 +1081,9 @@ def _dispatch_candidate(candidate: dict) -> None:
       2. Portfolio Risk Brain — VAR, correlation, session cap
       3. place_order() — execution engine handles KS2, spread, C5, C6
     v1.1: decrements KS4 countdown on every successful placement.
+
+    FIX: phase gate string corrected from 'R3_CAL_MOM' → 'R3_CAL_MOMENTUM'
+         to match SignalType enum value (was silently blocking all R3 live trades).
     """
     validate_state_keys(STATE)
 
@@ -1062,7 +1097,8 @@ def _dispatch_candidate(candidate: dict) -> None:
         return
 
     # ── 1. Phase gate ─────────────────────────────────────────────────────────
-    PHASE2_STRATEGIES = {"S4_NY_CONT", "S5_NY_CONT", "R3_CAL_MOM"}
+    # FIX: was "R3_CAL_MOM" — does not match SignalType.R3_CAL_MOMENTUM.value
+    PHASE2_STRATEGIES = {"S4_LONDON_PULL", "S5_NY_COMPRESS", "R3_CAL_MOMENTUM"}
     current_phase = int(get_config_value("PHASE") or 0)
     if candidate["signal_type"] in PHASE2_STRATEGIES and current_phase < 2:
         STARVATION_TRACKER.record_block(candidate["signal_type"], "compound_gate", "phase<2")
