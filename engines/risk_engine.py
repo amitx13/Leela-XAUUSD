@@ -727,7 +727,7 @@ def run_pre_trade_kill_switches(state: dict) -> tuple[bool, str]:
 def can_s1_family_fire(state: dict) -> tuple[bool, str]:
     """
     Gate for S1 + S1b combined daily attempts (spec Part 6).
-    MAX_S1_FAMILY_ATTEMPTS = 3.
+    MAX_S1_FAMILY_ATTEMPTS = 4.
     """
     if state["s1_family_attempts_today"] >= config.MAX_S1_FAMILY_ATTEMPTS:
         return False, "DAILY_SIGNAL_LIMIT_REACHED"
