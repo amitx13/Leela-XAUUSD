@@ -1,7 +1,7 @@
 # XAUUSD Trading System - Complete Documentation
-### Version 3.0 | Date: 2026-04-01 | Author: Amit Prasad
+### Version 3.1 | Date: 2026-04-01 | Author: Amit Prasad
 ### Classification: System Architecture & Operations Manual
-### Post-Critical Review Edition — All BUG/LOOP/SIZE/KS/EXP fixes applied
+### Post-Critical Review + Phase 1A/1B (Backtesting, Monitoring, Edge Decay)
 
 ---
 
@@ -43,7 +43,11 @@ The system operates on the principle that XAUUSD exhibits predictable volatility
 - **ATR-Based Stops**: All strategies use ATR-scaled stops (v3.0 — replaced fixed-point stops)
 - **Volume Filtering**: S1 breakouts require minimum volume confirmation (v3.0)
 - **ADX Trend Filtering**: S6/S7 dual orders biased by trend direction (v3.0)
-- **Active Conviction Sizing**: A+ conditions boost size after 50+ trades (v3.0)
+- **Active Conviction Sizing**: EWMA-weighted A+ conditions boost size after 50+ trades (v3.1)
+- **Starvation Tracking** (v3.1): Automated detection of signal pipeline blockages
+- **Edge Decay Detection** (v3.1): Rolling expectancy/WR monitor with auto-revert to Phase 1
+- **Backtesting Framework** (v3.1): Full M5 replay engine with walk-forward validation
+- **Monte Carlo Risk Analysis** (v3.1): 10K-simulation drawdown probability estimation
 - **Complete Audit Trail**: Every trade decision logged with full context
 
 ---
@@ -94,7 +98,14 @@ The system operates on the principle that XAUUSD exhibits predictable volatility
                   ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                 TRUTH ENGINE                                │
-│  Performance analytics, conviction delta, weekly reviews    │
+│  Performance analytics, EWMA conviction, edge decay monitor │
+│  Starvation tracking, weekly reviews                        │
+└─────────────────┬───────────────────────────────────────────┘
+                  ↓
+┌─────────────────────────────────────────────────────────────┐
+│              BACKTESTING FRAMEWORK (v3.1)                    │
+│  M5 replay engine, execution simulator, walk-forward        │
+│  Monte Carlo risk-of-ruin analysis (10K simulations)        │
 └─────────────────────────────────────────────────────────────┘
 ```
 

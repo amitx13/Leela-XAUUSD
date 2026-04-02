@@ -261,3 +261,10 @@ S5_ENTRY_END_HOUR_UTC       = 15     # Entry window closes at 15:00 UTC
 S5_STOP_ATR_BUFFER          = 0.30   # Stop beyond London extreme = 0.3 × H1 ATR
 S5_TP_RANGE_MULT            = 1.00   # TP = 1.0 × London range from entry
 S5_HARD_EXIT_HOUR_UTC       = 22     # Force-close any S5 position at 22:00 UTC
+
+# ── Edge Decay Detection (1A-3) ───────────────────────────────────────────────
+EDGE_WARNING_EXPECTANCY  = 0.10   # below system minimum of 0.15R
+EDGE_CRITICAL_EXPECTANCY = 0.05   # near zero edge
+EDGE_WARNING_WR          = 0.40   # below system minimum of 45%
+EDGE_CRITICAL_WR         = 0.35   # severely degraded
+EDGE_MIN_TRADES          = 30     # minimum trades for detection

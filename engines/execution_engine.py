@@ -442,7 +442,7 @@ def place_s1_pending_orders(state: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# S6 ASIAN BREAKOUT PENDING ORDERS — Phase 1 Step 7 stub
+# S6 ASIAN BREAKOUT PENDING ORDERS — S7 Daily Structure Breakout
 # ─────────────────────────────────────────────────────────────────────────────
 
 def place_s6_pending_orders(state: dict, s6result: dict) -> None:

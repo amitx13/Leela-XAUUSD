@@ -224,6 +224,47 @@ CREATE INDEX IF NOT EXISTS ix_trades_campaign_id ON system_state.trades (campaig
 CREATE INDEX IF NOT EXISTS ix_trades_exit_time   ON system_state.trades (exit_time);
 """
 
+SYSTEM_STATE_STARVATION_LOG = """
+CREATE TABLE IF NOT EXISTS system_state.starvation_log (
+    id                  BIGSERIAL    PRIMARY KEY,
+    log_date            DATE         NOT NULL,
+    signals_evaluated   INTEGER      NOT NULL DEFAULT 0,
+    signals_generated   INTEGER      NOT NULL DEFAULT 0,
+    orders_placed       INTEGER      NOT NULL DEFAULT 0,
+    orders_filled       INTEGER      NOT NULL DEFAULT 0,
+    pass_through_rate   DECIMAL(8,4) DEFAULT 0,
+    top_blocker_1       VARCHAR(40),
+    top_blocker_1_count INTEGER,
+    top_blocker_2       VARCHAR(40),
+    top_blocker_2_count INTEGER,
+    top_blocker_3       VARCHAR(40),
+    top_blocker_3_count INTEGER,
+    details             JSONB,
+    created_at          TIMESTAMPTZ  DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_starvation_log_date
+    ON system_state.starvation_log (log_date);
+"""
+
+SYSTEM_STATE_EDGE_HEALTH_LOG = """
+CREATE TABLE IF NOT EXISTS system_state.edge_health_log (
+    id          BIGSERIAL    PRIMARY KEY,
+    check_time  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    status      VARCHAR(10)  NOT NULL,    -- HEALTHY / WARNING / CRITICAL
+    wr_100      DECIMAL(8,4),
+    exp_100     DECIMAL(8,4),
+    trades_100  INTEGER,
+    wr_30       DECIMAL(8,4),
+    exp_30      DECIMAL(8,4),
+    trades_30   INTEGER,
+    alerts      JSONB,
+    actions     JSONB,
+    created_at  TIMESTAMPTZ  DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_edge_health_log_time
+    ON system_state.edge_health_log (check_time);
+"""
+
 SYSTEM_STATE_PERFORMANCE = """
 CREATE TABLE IF NOT EXISTS system_state.performance (
     id              BIGSERIAL    PRIMARY KEY,
@@ -293,6 +334,8 @@ def create_all_schemas() -> None:
             ("system_state.regime_log",                 SYSTEM_STATE_REGIME_LOG),
             ("system_state.spread_log",                 SYSTEM_STATE_SPREAD_LOG),
             ("system_state.trades",                     SYSTEM_STATE_TRADES),
+            ("system_state.starvation_log",             SYSTEM_STATE_STARVATION_LOG),
+            ("system_state.edge_health_log",            SYSTEM_STATE_EDGE_HEALTH_LOG),
             ("system_state.performance",                SYSTEM_STATE_PERFORMANCE),
             ("system_state.system_state_persistent",    SYSTEM_STATE_PERSISTENT),
             ("public.system_config",                    SYSTEM_CONFIG),
@@ -329,6 +372,8 @@ def verify_schema() -> bool:
         ("system_state", "regime_log"),
         ("system_state", "spread_log"),
         ("system_state", "trades"),
+        ("system_state", "starvation_log"),
+        ("system_state", "edge_health_log"),
         ("system_state", "performance"),
         ("system_state", "system_state_persistent"),
         ("public",       "system_config"),

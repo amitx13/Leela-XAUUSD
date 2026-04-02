@@ -464,35 +464,54 @@ def weekly_review_report() -> None:
               phase_2_eligible=ph2_ok)
 
 
+def _ewma_win_rate(trades_ordered_oldest_first: list[dict], alpha: float = 0.05) -> float | None:
+    """
+    Exponentially weighted win rate.  alpha=0.05 gives half-life ≈ 14 trades.
+    trades must be ordered oldest-first (exit_time ASC).
+    Returns None if fewer than 10 trades.
+    """
+    if len(trades_ordered_oldest_first) < 10:
+        return None
+    n = len(trades_ordered_oldest_first)
+    weights = [(1 - alpha) ** (n - 1 - i) for i in range(n)]
+    total_weight = sum(weights)
+    weighted_wins = sum(
+        w * (1.0 if t["outcome"] == "WIN" else 0.0)
+        for w, t in zip(weights, trades_ordered_oldest_first)
+    )
+    return weighted_wins / total_weight
+
+
 def get_conviction_delta() -> Optional[float]:
     """
-    EXP-10: Returns the win-rate delta (in decimal) between A_PLUS and OBSERVATION
-    conviction trades. Returns None if insufficient data.
+    EXP-10 / 1A-1: Returns the EWMA win-rate delta (in decimal) between
+    A_PLUS and OBSERVATION conviction trades.  Returns None if insufficient data.
+
+    Uses exponentially weighted moving average (alpha=0.05, half-life ≈ 14 trades)
+    so recent trades matter more than older ones — detects conviction decay faster
+    than the previous equal-weighted AVG approach.
 
     Used by risk_engine to decide whether to promote conviction to active sizing.
-    Requires at least 20 trades in each bucket to be meaningful.
+    Requires at least 10 trades per bucket (enforced by _ewma_win_rate).
     """
     from db.connection import execute_query as _eq
 
-    rows = _eq(
-        """SELECT conviction_level,
-                  COUNT(*) AS cnt,
-                  AVG(CASE WHEN outcome = 'WIN' THEN 1.0 ELSE 0.0 END) AS win_rate
-           FROM system_state.trades
-           WHERE exit_time IS NOT NULL
-             AND conviction_level IS NOT NULL
-             AND conviction_level IN ('A_PLUS', 'OBSERVATION')
-           GROUP BY conviction_level
-           HAVING COUNT(*) >= 20""",
-        {}
-    )
+    def _fetch_trades(conv_level: str) -> list[dict]:
+        return _eq(
+            """SELECT outcome, exit_time
+               FROM system_state.trades
+               WHERE exit_time IS NOT NULL
+                 AND conviction_level = :conv_level
+               ORDER BY exit_time ASC
+               LIMIT 50""",
+            {"conv_level": conv_level}
+        )
 
-    if not rows or len(rows) < 2:
-        return None
+    a_plus_trades = _fetch_trades("A_PLUS")
+    obs_trades = _fetch_trades("OBSERVATION")
 
-    wr_map = {r["conviction_level"]: float(r["win_rate"]) for r in rows}
-    a_plus_wr = wr_map.get("A_PLUS")
-    obs_wr = wr_map.get("OBSERVATION")
+    a_plus_wr = _ewma_win_rate(a_plus_trades)
+    obs_wr = _ewma_win_rate(obs_trades)
 
     if a_plus_wr is None or obs_wr is None:
         return None
@@ -501,5 +520,224 @@ def get_conviction_delta() -> Optional[float]:
     log_event("CONVICTION_DELTA_COMPUTED",
               a_plus_wr=round(a_plus_wr, 3),
               observation_wr=round(obs_wr, 3),
-              delta_pp=round(delta * 100, 1))
+              delta_pp=round(delta * 100, 1),
+              method="EWMA_alpha_0.05")
     return delta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDGE DECAY MONITOR  (1A-3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EdgeDecayMonitor:
+    """
+    Detects degradation of the system's statistical edge by monitoring
+    rolling win rate and expectancy across the last 100 and last 30 trades.
+
+    Status levels:
+        HEALTHY  — all metrics above warning thresholds
+        WARNING  — one or more metrics below warning but above critical
+        CRITICAL — one or more metrics below critical thresholds;
+                   auto-reverts to Phase 1 risk as a safety measure
+
+    Thresholds are read from config:
+        EDGE_WARNING_EXPECTANCY   = 0.10   (below system min of 0.15R)
+        EDGE_CRITICAL_EXPECTANCY  = 0.05   (near zero edge)
+        EDGE_WARNING_WR           = 0.40   (below system min of 45%)
+        EDGE_CRITICAL_WR          = 0.35   (severely degraded)
+        EDGE_MIN_TRADES           = 30     (minimum trades for detection)
+    """
+
+    def __init__(self):
+        self.status = "HEALTHY"
+        self.alerts: list[str] = []
+        self.actions: list[str] = []
+
+    def check(self) -> dict:
+        """
+        Pull last 100 closed trades, compute rolling win rate and expectancy
+        for the full window (100) and a fast window (30).
+
+        Returns dict with keys: status, alerts, actions, metrics.
+        """
+        from db.connection import execute_query as _eq
+
+        self.alerts = []
+        self.actions = []
+        self.status = "HEALTHY"
+
+        trades = _eq(
+            """SELECT outcome, r_multiple, exit_time
+               FROM system_state.trades
+               WHERE exit_time IS NOT NULL
+                 AND r_multiple IS NOT NULL
+               ORDER BY exit_time DESC
+               LIMIT 100""",
+            {}
+        )
+
+        if len(trades) < config.EDGE_MIN_TRADES:
+            self.alerts.append(
+                f"Insufficient trades for edge detection: {len(trades)}/{config.EDGE_MIN_TRADES}"
+            )
+            return self._result(trades_100={}, trades_30={})
+
+        # ── Compute metrics for full window (up to 100 trades) ────────────
+        metrics_100 = self._compute_metrics(trades)
+
+        # ── Compute metrics for fast window (last 30 trades) ──────────────
+        fast_trades = trades[:30]
+        metrics_30 = self._compute_metrics(fast_trades)
+
+        # ── Evaluate thresholds ───────────────────────────────────────────
+        self._evaluate("100-trade", metrics_100)
+        self._evaluate("30-trade", metrics_30)
+
+        # ── If CRITICAL: auto-revert to Phase 1 risk ─────────────────────
+        if self.status == "CRITICAL":
+            self._auto_revert_phase_1()
+
+        # ── Persist to edge_health_log ────────────────────────────────────
+        self._persist(metrics_100, metrics_30)
+
+        log_event("EDGE_DECAY_CHECK",
+                  status=self.status,
+                  wr_100=metrics_100.get("win_rate"),
+                  exp_100=metrics_100.get("expectancy"),
+                  wr_30=metrics_30.get("win_rate"),
+                  exp_30=metrics_30.get("expectancy"),
+                  alert_count=len(self.alerts))
+
+        return self._result(metrics_100, metrics_30)
+
+    @staticmethod
+    def _compute_metrics(trades: list[dict]) -> dict:
+        """Compute win rate and expectancy (mean R) for a list of trades."""
+        if not trades:
+            return {"win_rate": 0.0, "expectancy": 0.0, "trade_count": 0}
+
+        r_vals = [float(t["r_multiple"]) for t in trades]
+        wins = sum(1 for r in r_vals if r > 0)
+        total = len(r_vals)
+
+        win_rate = wins / total if total > 0 else 0.0
+        expectancy = sum(r_vals) / total if total > 0 else 0.0
+
+        return {
+            "win_rate": round(win_rate, 4),
+            "expectancy": round(expectancy, 4),
+            "trade_count": total,
+        }
+
+    def _evaluate(self, window_label: str, metrics: dict) -> None:
+        """Check metrics against warning/critical thresholds and update status."""
+        wr = metrics.get("win_rate", 0.0)
+        exp = metrics.get("expectancy", 0.0)
+
+        # ── Critical checks ───────────────────────────────────────────────
+        if exp < config.EDGE_CRITICAL_EXPECTANCY:
+            self.status = "CRITICAL"
+            self.alerts.append(
+                f"CRITICAL [{window_label}]: expectancy {exp:+.4f}R "
+                f"< {config.EDGE_CRITICAL_EXPECTANCY}R threshold"
+            )
+            self.actions.append("Auto-revert to Phase 1 risk (1.0% per trade)")
+
+        if wr < config.EDGE_CRITICAL_WR:
+            self.status = "CRITICAL"
+            self.alerts.append(
+                f"CRITICAL [{window_label}]: win rate {wr:.1%} "
+                f"< {config.EDGE_CRITICAL_WR:.0%} threshold"
+            )
+            self.actions.append("Auto-revert to Phase 1 risk (1.0% per trade)")
+
+        # ── Warning checks (only upgrade to WARNING, never downgrade from CRITICAL)
+        if self.status != "CRITICAL":
+            if exp < config.EDGE_WARNING_EXPECTANCY:
+                self.status = "WARNING"
+                self.alerts.append(
+                    f"WARNING [{window_label}]: expectancy {exp:+.4f}R "
+                    f"< {config.EDGE_WARNING_EXPECTANCY}R threshold"
+                )
+                self.actions.append("Review strategy parameters — edge may be degrading")
+
+            if wr < config.EDGE_WARNING_WR:
+                self.status = "WARNING"
+                self.alerts.append(
+                    f"WARNING [{window_label}]: win rate {wr:.1%} "
+                    f"< {config.EDGE_WARNING_WR:.0%} threshold"
+                )
+                self.actions.append("Review recent trade quality and market conditions")
+
+    def _auto_revert_phase_1(self) -> None:
+        """Force system back to Phase 1 risk parameters as a safety measure."""
+        from db.connection import execute_write as _ew
+        try:
+            _ew(
+                """UPDATE public.system_config
+                   SET value = '1', set_at = now(), set_by = 'EDGE_DECAY_AUTO'
+                   WHERE key = 'BASE_RISK_PHASE'""",
+                {}
+            )
+            self.actions.append("EXECUTED: Reverted BASE_RISK_PHASE to 1")
+            log_warning("EDGE_DECAY_AUTO_REVERT",
+                        message="Auto-reverted to Phase 1 risk due to CRITICAL edge decay")
+        except Exception as e:
+            log_warning("EDGE_DECAY_REVERT_FAILED", error=str(e))
+            self.actions.append(f"FAILED to revert phase: {e}")
+
+    def _persist(self, metrics_100: dict, metrics_30: dict) -> None:
+        """Write check results to system_state.edge_health_log."""
+        from db.connection import execute_write as _ew
+        import json
+        try:
+            _ew(
+                """INSERT INTO system_state.edge_health_log
+                   (check_time, status,
+                    wr_100, exp_100, trades_100,
+                    wr_30, exp_30, trades_30,
+                    alerts, actions)
+                   VALUES (now(), :status,
+                           :wr_100, :exp_100, :trades_100,
+                           :wr_30, :exp_30, :trades_30,
+                           :alerts, :actions)""",
+                {
+                    "status": self.status,
+                    "wr_100": metrics_100.get("win_rate"),
+                    "exp_100": metrics_100.get("expectancy"),
+                    "trades_100": metrics_100.get("trade_count", 0),
+                    "wr_30": metrics_30.get("win_rate"),
+                    "exp_30": metrics_30.get("expectancy"),
+                    "trades_30": metrics_30.get("trade_count", 0),
+                    "alerts": json.dumps(self.alerts),
+                    "actions": json.dumps(self.actions),
+                }
+            )
+        except Exception as e:
+            log_warning("EDGE_HEALTH_LOG_PERSIST_FAILED", error=str(e))
+
+    def _result(self, trades_100: dict, trades_30: dict) -> dict:
+        """Build the return dict."""
+        return {
+            "status": self.status,
+            "alerts": list(self.alerts),
+            "actions": list(self.actions),
+            "metrics_100": trades_100,
+            "metrics_30": trades_30,
+        }
+
+
+def daily_edge_check() -> dict:
+    """
+    Convenience function for daily edge health check.
+    Called by the scheduler or weekly review.
+
+    Returns dict with status, alerts, actions, and metrics.
+    """
+    monitor = EdgeDecayMonitor()
+    result = monitor.check()
+
+    for alert in result["alerts"]:
+        log_warning("EDGE_DECAY_ALERT", message=alert)
+
+    return result

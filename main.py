@@ -95,6 +95,8 @@ from engines.execution_engine import (
 )
 from state import reset_daily_counters   # BUG-1 FIX: use state.py version (resets Phase 2 + S8 daily flags)
 from engines.portfolio_risk import check_portfolio_risk, run_correlation_check
+from engines.starvation_tracker import StarvationTracker
+from engines.truth_engine import daily_edge_check
 
 from engines.signal_engine_phase2 import (
     # R3 — Calendar Momentum
@@ -120,11 +122,13 @@ from engines.signal_engine_phase2 import (
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-STATE      = build_initial_state()
-PAPER_MODE = False
+STATE              = build_initial_state()
+PAPER_MODE         = False
+STARVATION_TRACKER = StarvationTracker()
 
 _last_m15_time: datetime | None = None
 _last_m5_time:  datetime | None = None
+_prev_session:  str | None      = None   # session boundary detection for starvation checks
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILS
@@ -287,6 +291,13 @@ def midnight_reset_job() -> None:
                           buy_entry=s7_result["buy_candidate"]["entry_level"],
                           sell_entry=s7_result["sell_candidate"]["entry_level"])
 
+    # ── Phase 1A: Starvation daily summary + reset ──────────────────────────
+    _safe_execute("starvation_daily", STARVATION_TRACKER.daily_summary)
+    STARVATION_TRACKER.reset()
+
+    # ── Phase 1A: Edge decay daily check ─────────────────────────────────────
+    _safe_execute("edge_decay_daily", daily_edge_check)
+
     log_event("MIDNIGHT_RESET_COMPLETE",
               date=datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat())
 
@@ -342,7 +353,7 @@ def m15_dispatch_job() -> None:
       ★9.  S5 London session tracking + noon compression check + signal evaluation
       ★10. Hard exits: S4 at 16:00 UTC, S5 at 22:00 UTC
     """
-    global _last_m15_time
+    global _last_m15_time, _prev_session
 
     if not STATE.get("trading_enabled"):
         return
@@ -358,6 +369,13 @@ def m15_dispatch_job() -> None:
 
     log_event("M15_CANDLE_CLOSE", time=str(bar_time))
     validate_state_keys(STATE)
+
+    # ── Phase 1A: Session boundary starvation check ──────────────────────────
+    from utils.session import get_current_session as _get_sess
+    _cur_session = _get_sess()
+    if _prev_session is not None and _cur_session != _prev_session:
+        _safe_execute("starvation_check", STARVATION_TRACKER.check_starvation, _prev_session)
+    _prev_session = _cur_session
 
     # ── 1. Time kills ────────────────────────────────────────────────────────
     check_and_fire_london_time_kill(STATE)
@@ -412,8 +430,10 @@ def m15_dispatch_job() -> None:
                     _safe_execute("s1_pending_late", place_s1_pending_orders, STATE)
                     log_event("S1_PENDING_PLACED_LATE", regime=regime.value)
                 else:
+                    STARVATION_TRACKER.record_evaluation()
                     candidate = evaluate_s1_signal(STATE)
                     if candidate:
+                        STARVATION_TRACKER.record_signal()
                         _dispatch_candidate(candidate)
                         return
 
@@ -421,8 +441,10 @@ def m15_dispatch_job() -> None:
     if (STATE.get("failed_breakout_flag")
             and not STATE.get("trend_family_occupied")
             and not STATE.get("reversal_family_occupied")):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s1b_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             _dispatch_candidate(candidate)
             return
 
@@ -431,8 +453,10 @@ def m15_dispatch_job() -> None:
             and not STATE.get("trend_family_occupied")
             and not STATE.get("reversal_family_occupied")
             and not STATE.get("s3_fired_today")):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s3_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             STATE["s3_fired_today"]           = True
             STATE["reversal_family_occupied"] = True
             _dispatch_candidate(candidate)
@@ -440,15 +464,19 @@ def m15_dispatch_job() -> None:
 
     # ── 6. S2: Mean Reversion ─────────────────────────────────────────────────
     if regime == RegimeState.RANGING_CLEAR and not STATE.get("trend_family_occupied"):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s2_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             _dispatch_candidate(candidate)
             return
 
     # ── 7. S1f: Post-Time-Kill re-entry ──────────────────────────────────────
     if STATE.get("london_tk_fired_today") and not STATE.get("trend_family_occupied"):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s1f_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             _dispatch_candidate(candidate)
             return
 
@@ -458,8 +486,10 @@ def m15_dispatch_job() -> None:
     if (STATE.get("s4_ema_touched")
             and not STATE.get("trend_family_occupied")
             and not STATE.get("s4_fired_today")):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s4_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             STATE["s4_fired_today"] = True
             _dispatch_candidate(candidate)
             return
@@ -470,8 +500,10 @@ def m15_dispatch_job() -> None:
     if (STATE.get("s5_compression_confirmed")
             and not STATE.get("trend_family_occupied")
             and not STATE.get("s5_fired_today")):
+        STARVATION_TRACKER.record_evaluation()
         candidate = evaluate_s5_signal(STATE)
         if candidate:
+            STARVATION_TRACKER.record_signal()
             STATE["s5_fired_today"] = True
             _dispatch_candidate(candidate)
             return
@@ -701,6 +733,7 @@ def _check_for_s1_pending_fill() -> None:
                       ticket=ticket, direction=direction,
                       price=round(pos.price_open, 3),
                       lots=pos.volume, sl=round(pos.sl, 3))
+            STARVATION_TRACKER.record_fill()
             on_trade_opened_from_pending_fill(
                 ticket=ticket, pos_price=pos.price_open,
                 pos_volume=pos.volume, pos_sl=pos.sl,
@@ -732,6 +765,7 @@ def _check_for_s1_pending_fill() -> None:
                       ticket=s1b_ticket, direction=direction,
                       price=round(pos.price_open, 3),
                       lots=pos.volume, sl=round(pos.sl, 3))
+            STARVATION_TRACKER.record_fill()
             on_trade_opened_from_pending_fill(
                 ticket=s1b_ticket, pos_price=pos.price_open,
                 pos_volume=pos.volume, pos_sl=pos.sl,
@@ -768,6 +802,7 @@ def _check_for_s6_pending_fill() -> None:
             log_event("S6_PENDING_FILLED",
                       ticket=ticket, direction=direction,
                       price=round(pos.price_open, 3), lots=pos.volume)
+            STARVATION_TRACKER.record_fill()
             on_trade_opened_from_pending_fill(
                 ticket=ticket, pos_price=pos.price_open,
                 pos_volume=pos.volume, pos_sl=pos.sl,
@@ -815,6 +850,7 @@ def _check_for_s7_pending_fill() -> None:
             log_event("S7_PENDING_FILLED",
                       ticket=ticket, direction=direction,
                       price=round(pos.price_open, 3), lots=pos.volume)
+            STARVATION_TRACKER.record_fill()
             on_trade_opened_from_pending_fill(
                 ticket=ticket, pos_price=pos.price_open,
                 pos_volume=pos.volume, pos_sl=pos.sl,
@@ -1029,12 +1065,14 @@ def _dispatch_candidate(candidate: dict) -> None:
     PHASE2_STRATEGIES = {"S4_NY_CONT", "S5_NY_CONT", "R3_CAL_MOM"}
     current_phase = int(get_config_value("PHASE") or 0)
     if candidate["signal_type"] in PHASE2_STRATEGIES and current_phase < 2:
+        STARVATION_TRACKER.record_block(candidate["signal_type"], "compound_gate", "phase<2")
         log_event("PHASE_GATE_BLOCKED", signal=candidate["signal_type"])
         return
 
     # ── 2. Portfolio Risk Brain ───────────────────────────────────────────────
     permitted, reason = check_portfolio_risk(candidate, STATE)
     if not permitted:
+        STARVATION_TRACKER.record_block(candidate["signal_type"], "portfolio", reason)
         log_event("PORTFOLIO_RISK_BLOCKED",
                   signal=candidate["signal_type"], reason=reason)
         return
@@ -1047,6 +1085,9 @@ def _dispatch_candidate(candidate: dict) -> None:
 
     # ── 3. Execute ────────────────────────────────────────────────────────────
     ticket = place_order(candidate, STATE)
+
+    if ticket:
+        STARVATION_TRACKER.record_order()
 
     # v1.1: KS4 countdown — decrement on every successful placement
     if ticket and STATE.get("ks4_reduced_trades_remaining", 0) > 0:

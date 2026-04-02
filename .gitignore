@@ -31,3 +31,5 @@ Thumbs.db
 
 # Secrets
 .env
+
+backtest_data/

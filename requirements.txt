@@ -1,32 +1,37 @@
-# MT5 bridge — Linux side only
+# ── MT5 bridge — Linux side only ──────────────────────────────────────────────
 mt5linux==1.0.3
 rpyc==5.2.3
 plumbum==1.7.0
 pyparsing>=3.1.0
 
-# Data
+# ── Data & Indicators ────────────────────────────────────────────────────────
 pandas==2.2.2
 numpy==1.26.4
 yfinance==0.2.40
+pyarrow>=14.0.0            # Parquet support for backtest data storage
 # pandas-ta: install separately →
 # pip install git+https://github.com/twopirllc/pandas-ta.git@development
 
-# Database
+# ── Database ──────────────────────────────────────────────────────────────────
 SQLAlchemy==2.0.30
 psycopg2-binary==2.9.9
 
-# Scheduling
+# ── Scheduling ────────────────────────────────────────────────────────────────
 APScheduler==3.10.4
 
-# Timezone
+# ── Timezone ──────────────────────────────────────────────────────────────────
 pytz==2024.1
 
-# HTTP
+# ── HTTP ──────────────────────────────────────────────────────────────────────
 requests==2.31.0
 
-# Environment
+# ── Environment ───────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 
-# Testing
+# ── Testing ───────────────────────────────────────────────────────────────────
 pytest==8.2.0
 pytest-mock==3.14.0
+
+# ── Backtesting & Analytics (optional — only needed for backtest/monte_carlo) ─
+matplotlib>=3.8.0          # Equity curve plotting (optional, graceful fallback)
+# Install all: pip install -r requirements.txt
