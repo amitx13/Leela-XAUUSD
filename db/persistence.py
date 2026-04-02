@@ -5,6 +5,10 @@ Implements Fix 3 (system_state_persistent table), C4 Fix (daily vs rolling
 state separation), B6 Fix (continuous peak_equity tracking), and G8 Fix
 (persist on every open/close/KS/regime change).
 
+V3.0: Added S8 independent position lane columns (s8_open_ticket,
+      s8_entry_price, s8_stop_price_original, s8_stop_price_current,
+      s8_trade_direction, s8_be_activated, s8_open_time_utc).
+
 Call persist_critical_state() on:
   - Every trade OPEN     (G8 Fix)
   - Every trade CLOSE
@@ -55,7 +59,11 @@ def persist_critical_state(state: dict) -> None:
             s5_compression_confirmed, s5_fired_today,
             london_session_high, london_session_low, d1_atr_14,
             ks7_pre_event_price, spread_multiplier,
-            spread_elevated_reading_count, dxy_ewma_variance
+            spread_elevated_reading_count, dxy_ewma_variance,
+            s8_fired_today, s8_open_ticket,
+            s8_entry_price, s8_stop_price_original,
+            s8_stop_price_current, s8_trade_direction,
+            s8_be_activated, s8_open_time_utc
         ) VALUES (
             :state_date, :saved_at,
             :consecutive_m5_losses, :s1_family_attempts_today,
@@ -74,7 +82,11 @@ def persist_critical_state(state: dict) -> None:
             :s5_compression_confirmed, :s5_fired_today,
             :london_session_high, :london_session_low, :d1_atr_14,
             :ks7_pre_event_price, :spread_multiplier,
-            :spread_elevated_reading_count, :dxy_ewma_variance
+            :spread_elevated_reading_count, :dxy_ewma_variance,
+            :s8_fired_today, :s8_open_ticket,
+            :s8_entry_price, :s8_stop_price_original,
+            :s8_stop_price_current, :s8_trade_direction,
+            :s8_be_activated, :s8_open_time_utc
         )
         ON CONFLICT (state_date) DO UPDATE SET
             saved_at                    = EXCLUDED.saved_at,
@@ -112,7 +124,15 @@ def persist_critical_state(state: dict) -> None:
             ks7_pre_event_price          = EXCLUDED.ks7_pre_event_price,
             spread_multiplier            = EXCLUDED.spread_multiplier,
             spread_elevated_reading_count = EXCLUDED.spread_elevated_reading_count,
-            dxy_ewma_variance            = EXCLUDED.dxy_ewma_variance
+            dxy_ewma_variance            = EXCLUDED.dxy_ewma_variance,
+            s8_fired_today               = EXCLUDED.s8_fired_today,
+            s8_open_ticket               = EXCLUDED.s8_open_ticket,
+            s8_entry_price               = EXCLUDED.s8_entry_price,
+            s8_stop_price_original       = EXCLUDED.s8_stop_price_original,
+            s8_stop_price_current        = EXCLUDED.s8_stop_price_current,
+            s8_trade_direction           = EXCLUDED.s8_trade_direction,
+            s8_be_activated              = EXCLUDED.s8_be_activated,
+            s8_open_time_utc             = EXCLUDED.s8_open_time_utc
         """,
         {
             "state_date":                  state_date_today,
@@ -155,6 +175,15 @@ def persist_critical_state(state: dict) -> None:
             "spread_multiplier":            state.get("spread_multiplier", 1.0),
             "spread_elevated_reading_count": state.get("spread_elevated_reading_count", 0),
             "dxy_ewma_variance":            state.get("dxy_ewma_variance", 0.0),
+            # ── V3.0 S8 independent position lane ───────────────────────────────
+            "s8_fired_today":               state.get("s8_fired_today", False),
+            "s8_open_ticket":               state.get("s8_open_ticket"),
+            "s8_entry_price":               state.get("s8_entry_price", 0.0),
+            "s8_stop_price_original":       state.get("s8_stop_price_original", 0.0),
+            "s8_stop_price_current":        state.get("s8_stop_price_current", 0.0),
+            "s8_trade_direction":           state.get("s8_trade_direction"),
+            "s8_be_activated":              state.get("s8_be_activated", False),
+            "s8_open_time_utc":             state.get("s8_open_time_utc"),
         }
     )
     log_event("CRITICAL_STATE_PERSISTED", date=str(state_date_today))
@@ -226,6 +255,15 @@ def restore_critical_state(state: dict) -> None:
             ("spread_multiplier", "spread_multiplier"),
             ("spread_elevated_reading_count", "spread_elevated_reading_count"),
             ("dxy_ewma_variance", "dxy_ewma_variance"),
+            # ── V3.0 S8 independent position lane ─────────────────────────────
+            ("s8_fired_today", "s8_fired_today"),
+            ("s8_open_ticket", "s8_open_ticket"),
+            ("s8_entry_price", "s8_entry_price"),
+            ("s8_stop_price_original", "s8_stop_price_original"),
+            ("s8_stop_price_current", "s8_stop_price_current"),
+            ("s8_trade_direction", "s8_trade_direction"),
+            ("s8_be_activated", "s8_be_activated"),
+            ("s8_open_time_utc", "s8_open_time_utc"),
         ):
             if col not in row:
                 continue
@@ -237,6 +275,14 @@ def restore_critical_state(state: dict) -> None:
             elif col == "s1b_pending_ticket":
                 val = int(val) if val is not None else None
             elif col in ("s1d_ema_touched_today", "s1d_fired_today"):
+                val = bool(val)
+            # ── V3.0 S8 type coercions ─────────────────────────────────────────
+            elif col == "s8_open_ticket":
+                val = int(val) if val is not None else None
+            elif col in ("s8_entry_price", "s8_stop_price_original",
+                         "s8_stop_price_current"):
+                val = float(val or 0)
+            elif col in ("s8_fired_today", "s8_be_activated"):
                 val = bool(val)
             state[key] = val
         log_event("STATE_RESTORED_FROM_TODAY", date=str(today))
@@ -273,7 +319,9 @@ def restore_critical_state(state: dict) -> None:
 def update_peak_equity(state: dict, live_equity: float | None = None) -> None:
     """
     B6 Fix + v1.1: Rolling 30-day peak from performance rows, merged with live equity.
-    KS6 triggers if equity < peak × 0.92 (peak = max(state peak, 30d DB peak, live high).
+    KS6 triggers if equity < peak × (1.0 - KS6_DRAWDOWN_LIMIT_PCT).
+    Current threshold: 20% drawdown from 30-day rolling peak.
+    equity < peak × 0.80 → emergency halt + email.
     """
     if live_equity is not None and live_equity > 0:
         if live_equity > state.get("peak_equity", 0.0):

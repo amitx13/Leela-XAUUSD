@@ -6,6 +6,8 @@ Phase 2 update:
   - Added ks7_pre_event_price for R3 direction determination
   - Bug 2 fix: all S3 sweep resets consolidated in reset_daily_counters()
   - F1-F7 state keys merged (S8, spread_multiplier, dxy_ewma_variance, etc.)
+  - V3.0 fix: S8 independent position lane keys added
+  - V3.0 fix: DI+/DI- H4 cache keys added (for S6/S7 ADX filter)
 """
 from datetime import datetime
 import pytz
@@ -110,6 +112,10 @@ def build_initial_state() -> dict:
         "tlt_slope":                    0.0,
         "last_atr_h1_raw":              0.0,   # F1-F7 Bug 1 fix: cached H1 ATR value
 
+        # ── Cached DI+/DI- values (V3.0: for S6/S7 ADX trend filter) ──────────
+        "last_di_plus_h4":              None,
+        "last_di_minus_h4":             None,
+
         # ── S1 pending STOP orders ────────────────────────────────────────────
         "s1_pending_buy_ticket":        None,
         "s1_pending_sell_ticket":       None,
@@ -147,7 +153,7 @@ def build_initial_state() -> dict:
         "s7_daily_atr":                 0.0,
         "high_corr_pairs":              [],
 
-        # ── S8 ATR Spike Trade (F7) ────────────────────────────────────────────
+        # ── S8 ATR Spike Trade (F7) — signal/arm state ─────────────────────────
         "s8_armed":                     False,
         "s8_arm_time":                  None,
         "s8_arm_candle_time":           None,
@@ -157,6 +163,17 @@ def build_initial_state() -> dict:
         "s8_spike_atr":                 0.0,
         "s8_spike_candle_idx":          None,
         "s8_fired_today":               False,
+
+        # ── S8 ATR Spike Trade — independent position lane (V3.0) ──────────────
+        # S8 does NOT occupy trend_family. It has its own open-position keys
+        # so it can coexist with S1/S4/S5 trend trades.
+        "s8_open_ticket":               None,
+        "s8_entry_price":               0.0,
+        "s8_stop_price_original":       0.0,
+        "s8_stop_price_current":        0.0,
+        "s8_trade_direction":           None,
+        "s8_be_activated":              False,
+        "s8_open_time_utc":             None,
 
         # ══════════════════════════════════════════════════════════════════════
         # PHASE 2 — NEW STATE KEYS
@@ -287,6 +304,10 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "tlt_slope":                    float,
     "last_atr_h1_raw":              float,
 
+    # Cached DI+/DI- (V3.0)
+    "last_di_plus_h4":              (float, type(None)),
+    "last_di_minus_h4":             (float, type(None)),
+
     # S1 pending
     "s1_pending_buy_ticket":        (int, type(None)),
     "s1_pending_sell_ticket":       (int, type(None)),
@@ -324,7 +345,7 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "s7_daily_atr":                 float,
     "high_corr_pairs":              list,
 
-    # S8 (F7)
+    # S8 signal/arm state (F7)
     "s8_armed":                     bool,
     "s8_arm_time":                  (datetime, type(None)),
     "s8_arm_candle_time":           (datetime, type(None)),
@@ -334,6 +355,15 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "s8_fired_today":               bool,
     "s8_spike_atr":                 float,
     "s8_spike_candle_idx":          (int, type(None)),
+
+    # S8 independent position lane (V3.0)
+    "s8_open_ticket":               (int, type(None)),
+    "s8_entry_price":               float,
+    "s8_stop_price_original":       float,
+    "s8_stop_price_current":        float,
+    "s8_trade_direction":           (str, type(None)),
+    "s8_be_activated":              bool,
+    "s8_open_time_utc":             (str, type(None)),
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
 
@@ -435,13 +465,17 @@ def reset_daily_counters(state: dict) -> None:
     # ── S7 daily guard ────────────────────────────────────────────────────────
     state["s7_fired_today"]             = False
 
-    # ── S8 daily guard ────────────────────────────────────────────────────────
+    # ── S8 daily guard + arm state (V3.0: extended reset) ─────────────────────
+    # NOTE: s8_open_ticket is NOT reset here.
+    # An S8 position can be held overnight. Only reset daily signal flags.
     state["s8_fired_today"]             = False
     state["s8_armed"]                   = False
     state["s8_arm_time"]                = None
+    state["s8_arm_candle_time"]         = None
     state["s8_spike_high"]              = 0.0
     state["s8_spike_low"]               = 0.0
     state["s8_direction"]               = None
+    state["s8_spike_candle_idx"]        = None
 
     # ── Phase 2: R3 daily reset ───────────────────────────────────────────────
     state["r3_armed"]                   = False
