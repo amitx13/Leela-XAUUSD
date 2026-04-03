@@ -62,31 +62,7 @@ __all__ = [
     "REVERSAL_FAMILY_STRATEGIES",
     "INDEPENDENT_LANE_STRATEGIES",
     "PENDING_ORDER_STRATEGIES",
-    S1LondonBrk, S1bFailedBrk, S1cStopHunt, S1dPyramid, S1ePyramid, S1fPostTk,
-    S2MeanRev, S3StopHuntRev, S4LondonPull, S5NyCompress,
-    S6AsianBrk, S7DailyStruct, S8AtrSpike, R3CalendarMomentum
+    "S1LondonBrk", "S1bFailedBrk", "S1cStopHunt", "S1dPyramid", "S1ePyramid", "S1fPostTk",
+    "S2MeanRev", "S3StopHuntRev", "S4LondonPull", "S5NyCompress",
+    "S6AsianBrk", "S7DailyStruct", "S8AtrSpike", "R3CalendarMomentum"
 ]
-
-TREND_FAMILY_STRATEGIES = [
-    "S1_LONDON_BRK", "S1B_FAILED_BRK", "S1F_POST_TK", "S1E_PYRAMID",
-    "S4_LONDON_PULL", "S5_NY_COMPRESS"
-    "S3_STOP_HUNT_REV"
-]
-
-INDEPENDENT_LANE_STRATEGIES = [
-    "S8_ATR_SPIKE", "R3_CAL_MOMENTUM"
-]
-
-PENDING_ORDER_STRATEGIES = [
-    "S1_LONDON_BRK", "S6_ASIAN_BRK", "S7_DAILY_STRUCT"
-]
-
-__all__ = [
-    "BaseStrategy",
-    "STRATEGY_REGISTRY",
-    "ALL_STRATEGIES",
-    "TREND_FAMILY_STRATEGIES", 
-    "REVERSAL_FAMILY_STRATEGIES",
-    "INDEPENDENT_LANE_STRATEGIES",
-    "PENDING_ORDER_STRATEGIES",
-] + list(STRATEGY_REGISTRY.values())

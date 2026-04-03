@@ -18,12 +18,12 @@ from typing import Optional, List, Dict, Any
 from backtest.models import (
     SimOrder, SimPosition, TradeRecord, EquityPoint, SimulatedState,
 )
-from backtest.data_feed import BarBuffer  # Import BarBuffer from original data feed
 from backtest.data_feed_enhanced import EnhancedHistoricalDataFeed
 from backtest.execution_simulator_enhanced import EnhancedExecutionSimulator
 from backtest.strategies import STRATEGY_REGISTRY, ALL_STRATEGIES
 from backtest.risk import run_all_kill_switches, check_position_limits
 from backtest.analytics import EnhancedMonteCarlo
+from backtest.results import BacktestResults
 
 logger = logging.getLogger("backtest.enhanced_engine")
 
@@ -77,7 +77,6 @@ class EnhancedBacktestEngine:
         # Initialize enhanced components
         self.data_feed = EnhancedHistoricalDataFeed(cache_dir=cache_dir)
         self.execution_sim = EnhancedExecutionSimulator(slippage_points)
-        self.bar_buffer = BarBuffer()
         
         # Initialize state
         self.state = SimulatedState(
@@ -128,7 +127,7 @@ class EnhancedBacktestEngine:
                 completed_timeframes = self._update_bar_buffer(current_time)
                 
                 # Step 2: Calculate indicators
-                indicators = self._calculate_indicators()
+                indicators = self._calculate_indicators(current_time)
                 
                 # Step 3: Update regime classification
                 regime, size_mult = self._update_regime(indicators, current_time)
@@ -176,37 +175,42 @@ class EnhancedBacktestEngine:
     
     def _update_bar_buffer(self, current_time: datetime) -> Dict[str, bool]:
         """Update bar buffer with new data."""
+        # The enhanced data feed provides all timeframes directly
+        # We don't need to use the old BarBuffer class
         completed = {}
         
         for timeframe in ["M5", "M15", "H1", "H4", "D1"]:
             bars = self.data_feed.get_bars(timeframe, current_time)
             if bars:
-                # Create a simple DataFrame from bars for BarBuffer
-                df = pd.DataFrame(bars)
-                self.bar_buffer.add_bars(timeframe, df)
                 completed[timeframe] = True
         
         return completed
     
-    def _calculate_indicators(self) -> Dict[str, Any]:
+    def _calculate_indicators(self, current_time: datetime) -> Dict[str, Any]:
         """Calculate all indicators for current time."""
         indicators = {}
         
-        # Get bar data for each timeframe
-        m5_df = self.bar_buffer.get_series("M5")
-        m15_df = self.bar_buffer.get_series("M15")
-        h1_df = self.bar_buffer.get_series("H1")
-        h4_df = self.bar_buffer.get_series("H4")
+        # Get bar data for each timeframe from enhanced data feed
+        m5_bars = self.data_feed.get_bars("M5", current_time)
+        m15_bars = self.data_feed.get_bars("M15", current_time)
+        h1_bars = self.data_feed.get_bars("H1", current_time)
+        h4_bars = self.data_feed.get_bars("H4", current_time)
+        
+        # Convert to DataFrames for indicator calculation
+        m5_df = pd.DataFrame(m5_bars) if m5_bars else pd.DataFrame()
+        m15_df = pd.DataFrame(m15_bars) if m15_bars else pd.DataFrame()
+        h1_df = pd.DataFrame(h1_bars) if h1_bars else pd.DataFrame()
+        h4_df = pd.DataFrame(h4_bars) if h4_bars else pd.DataFrame()
         
         # Calculate ATR for different timeframes
         if len(m5_df) >= 14:
-            indicators["atr_m15"] = ta.atr(m5_df["high"], m5_df["low"], m5_df["close"], length=14)
+            indicators["atr_m15"] = ta.atr(m5_df["high"], m5_df["low"], m5_df["close"], length=14).iloc[-1]
         
         if len(h1_df) >= 14:
-            indicators["atr_h1"] = ta.atr(h1_df["high"], h1_df["low"], h1_df["close"], length=14)
+            indicators["atr_h1"] = ta.atr(h1_df["high"], h1_df["low"], h1_df["close"], length=14).iloc[-1]
         
         if len(h4_df) >= 14:
-            indicators["atr_h4"] = ta.atr(h4_df["high"], h4_df["low"], h4_df["close"], length=14)
+            indicators["atr_h4"] = ta.atr(h4_df["high"], h4_df["low"], h4_df["close"], length=14).iloc[-1]
         
         # Calculate ADX/DI for trend filtering
         if len(h4_df) >= 14:
@@ -248,7 +252,7 @@ class EnhancedBacktestEngine:
         
         # Use enhanced regime classification (matches live system)
         adx_h4 = indicators.get("adx_h4", 0)
-        atr_pct_h1 = self._calculate_atr_percentile(indicators.get("atr_h1", 0))
+        atr_pct_h1 = self._calculate_atr_percentile(indicators.get("atr_h1", 0), current_time)
         
         # Apply regime logic from live system
         no_trade_thresh = self.config.get("ATR_PCT_NO_TRADE_THRESHOLD", 95)
@@ -287,19 +291,30 @@ class EnhancedBacktestEngine:
         else:
             return "WEAK_TRENDING", round(0.8 * session_mult, 3)
     
-    def _calculate_atr_percentile(self, current_atr: float) -> float:
+    def _calculate_atr_percentile(self, current_atr: float, current_time: datetime) -> float:
         """Calculate ATR percentile using EWMA weighting."""
-        atr_series = self.bar_buffer.get_series("H1")["atr"] if len(self.bar_buffer.get_series("H1")) >= 14 else None
-        if atr_series is None or len(atr_series) == 0:
+        h1_bars = self.data_feed.get_bars("H1", current_time)
+        if not h1_bars or len(h1_bars) < 14:
             return 50.0
         
-        values = atr_series.dropna().values
+        h1_df = pd.DataFrame(h1_bars)
+        # Calculate ATR values from the data
+        if len(h1_df) >= 14:
+            atr_series = ta.atr(h1_df["high"], h1_df["low"], h1_df["close"], length=14)
+            values = atr_series.dropna().values
+        else:
+            return 50.0
+        
+        if len(values) == 0:
+            return 50.0
+        
         n = len(values)
         lambda_decay = 0.94
         indices = np.arange(n)
         weights = np.power(lambda_decay, indices[::-1])
         weights = weights / weights.sum()
         
+        # Compare current ATR with historical values
         below_current = (values < current_atr).astype(float)
         return float(np.dot(weights, below_current) * 100)
     
@@ -311,11 +326,15 @@ class EnhancedBacktestEngine:
             if strategy_name in self.strategy_instances:
                 strategy = self.strategy_instances[strategy_name]
                 
-                # Get bar data for strategy
+                # Get bar data for strategy from enhanced data feed
+                m5_bars = self.data_feed.get_bars("M5", current_time)
+                m15_bars = self.data_feed.get_bars("M15", current_time)
+                h1_bars = self.data_feed.get_bars("H1", current_time)
+                
                 bar_data = {
-                    "M5": self.bar_buffer.get_series("M5"),
-                    "M15": self.bar_buffer.get_series("M15"),
-                    "H1": self.bar_buffer.get_series("H1"),
+                    "M5": pd.DataFrame(m5_bars) if m5_bars else pd.DataFrame(),
+                    "M15": pd.DataFrame(m15_bars) if m15_bars else pd.DataFrame(),
+                    "H1": pd.DataFrame(h1_bars) if h1_bars else pd.DataFrame(),
                 }
                 
                 # Evaluate strategy
@@ -336,7 +355,7 @@ class EnhancedBacktestEngine:
     
     def _process_order_fills(self, current_time: datetime, indicators: Dict[str, Any]):
         """Process order fills and create positions."""
-        current_price = self._get_current_price()
+        current_price = self._get_current_price(current_time)
         
         filled_orders = []
         remaining_orders = []
@@ -394,7 +413,7 @@ class EnhancedBacktestEngine:
     
     def _manage_positions(self, current_time: datetime, indicators: Dict[str, Any]):
         """Manage open positions (SL/TP, BE, trailing)."""
-        current_price = self._get_current_price()
+        current_price = self._get_current_price(current_time)
         
         for position in self.open_positions:
             # Check position limits
@@ -475,7 +494,7 @@ class EnhancedBacktestEngine:
     
     def _process_position_exits(self, current_time: datetime, indicators: Dict[str, Any]):
         """Process position exits."""
-        current_price = self._get_current_price()
+        current_price = self._get_current_price(current_time)
         positions_to_close = []
         
         for position in self.open_positions:
@@ -531,7 +550,7 @@ class EnhancedBacktestEngine:
         total_equity = self.state.balance
         
         # Add unrealized P&L from open positions
-        current_price = self._get_current_price()
+        current_price = self._get_current_price(current_time)
         for position in self.open_positions:
             total_equity += position.unrealized_pnl(current_price)
         
@@ -548,11 +567,11 @@ class EnhancedBacktestEngine:
         )
         self.equity_curve.append(point)
     
-    def _get_current_price(self) -> float:
-        """Get current price from bar buffer."""
-        m5_series = self.bar_buffer.get_series("M5")
-        if not m5_series.empty:
-            return m5_series["close"].iloc[-1]
+    def _get_current_price(self, current_time: datetime) -> float:
+        """Get current price from enhanced data feed."""
+        m5_bars = self.data_feed.get_bars("M5", current_time)
+        if m5_bars:
+            return m5_bars[-1]["close"]
         return 0.0
     
     def _create_position_from_order(self, order: SimOrder, fill_result: Dict[str, Any], current_time: datetime) -> SimPosition:
@@ -715,113 +734,15 @@ class EnhancedBacktestEngine:
         
         return mean_return / std_return if std_return > 0 else 0.0
     
-    def _generate_results(self) -> "BacktestResults":
+    def _generate_results(self) -> BacktestResults:
         """Generate final backtest results."""
         # Create comprehensive results object with all analytics
         return BacktestResults(
             trades=self.trades,
             equity_curve=self.equity_curve,
             initial_balance=self.initial_balance,
-            final_balance=self.state.balance,
-            total_trades=len(self.trades),
-            winning_trades=self.state.total_wins,
-            losing_trades=self.state.total_losses,
-            total_pnl=self.state.total_pnl_gross,
-            max_drawdown=self._calculate_max_drawdown(),
-            sharpe_ratio=self._calculate_sharpe_ratio(),
-            strategies_tested=self.strategies,
-            # Enhanced analytics
-            strategy_breakdown={},  # Would be populated by analytics
-            risk_metrics={},      # Would be populated by risk analytics
-            heat_maps={},         # Would be populated by heat maps
+            start_date=self.start_date,
+            end_date=self.end_date,
+            strategies=self.strategies,
         )
-
-
-class BacktestResults:
-    """Enhanced backtest results with comprehensive analytics."""
-    
-    def __init__(
-        self,
-        trades: List[TradeRecord],
-        equity_curve: List[EquityPoint],
-        initial_balance: float,
-        final_balance: float,
-        total_trades: int,
-        winning_trades: int,
-        losing_trades: int,
-        total_pnl: float,
-        max_drawdown: float,
-        sharpe_ratio: float,
-        strategies_tested: List[str],
-        # Enhanced analytics fields
-        strategy_breakdown: Optional[Dict[str, Any]] = None,
-        risk_metrics: Optional[Dict[str, Any]] = None,
-        heat_maps: Optional[Dict[str, Any]] = None,
-    ):
-        self.trades = trades
-        self.equity_curve = equity_curve
-        self.initial_balance = initial_balance
-        self.final_balance = final_balance
-        self.total_trades = total_trades
-        self.winning_trades = winning_trades
-        self.losing_trades = losing_trades
-        self.total_pnl = total_pnl
-        self.max_drawdown = max_drawdown
-        self.sharpe_ratio = sharpe_ratio
-        self.strategies_tested = strategies_tested
-        self.strategy_breakdown = strategy_breakdown
-        self.risk_metrics = risk_metrics
-        self.heat_maps = heat_maps
-    
-    def summary(self):
-        """Print comprehensive backtest summary."""
-        print("\n" + "="*60)
-        print("ENHANCED BACKTEST RESULTS")
-        print("="*60)
-        
-        print(f"Initial Balance: ${self.initial_balance:,.2f}")
-        print(f"Final Balance:   ${self.final_balance:,.2f}")
-        print(f"Total P&L:      ${self.total_pnl:,.2f}")
-        print(f"Total Trades:    {self.total_trades}")
-        print(f"Winning Trades:  {self.winning_trades}")
-        print(f"Losing Trades:   {self.losing_trades}")
-        print(f"Win Rate:        {self.winning_trades/self.total_trades*100:.1f}%" if self.total_trades > 0 else "0.0%")
-        print(f"Max Drawdown:    {self.max_drawdown:.2f}%")
-        print(f"Sharpe Ratio:    {self.sharpe_ratio:.3f}")
-        print(f"Strategies:      {', '.join(self.strategies_tested)}")
-        
-        # Enhanced analytics if available
-        if self.strategy_breakdown:
-            print("\n" + "-"*40)
-            print("STRATEGY BREAKDOWN")
-            print("-"*40)
-            for strategy, stats in self.strategy_breakdown.items():
-                if isinstance(stats, dict):
-                    print(f"\n{strategy}:")
-                    print(f"  Total Trades: {stats.get('total_trades', 0)}")
-                    print(f"  Win Rate: {stats.get('win_rate', 0):.1%}")
-                    print(f"  Total P&L: ${stats.get('total_pnl', 0):,.2f}")
-                    print(f"  Sharpe Ratio: {stats.get('sharpe_ratio', 0):.3f}")
-        
-        if self.risk_metrics:
-            print("\n" + "-"*40)
-            print("RISK METRICS")
-            print("-"*40)
-            metrics = self.risk_metrics
-            if metrics:
-                print(f"Maximum Drawdown: {metrics.get('max_drawdown_pct', 0):.2f}%")
-                print(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 0):.3f}")
-                print(f"Sortino Ratio: {metrics.get('sortino_ratio', 0):.3f}")
-                print(f"Calmar Ratio: {metrics.get('calmar_ratio', 0):.3f}")
-        
-        if self.heat_maps:
-            print("\n" + "-"*40)
-            print("HEAT MAPS")
-            print("-"*40)
-            # Would show heat map data if available
-        
-        if self.trades:
-            print(f"Average Win:     ${self.total_pnl/self.winning_trades:,.2f}" if self.winning_trades > 0 else "$0.00")
-            print(f"Average Loss:    ${abs(self.total_pnl/self.losing_trades):,.2f}" if self.losing_trades > 0 else "$0.00")
-        
-        print("="*60)
+                    

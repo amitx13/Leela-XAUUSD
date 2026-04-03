@@ -390,16 +390,7 @@ def main() -> None:
         print("\n── EXIT REASON BREAKDOWN ────────────────────────────────")
         print(exit_breakdown.to_string(index=False))
 
-    # Monte Carlo risk-of-ruin simulation
-    if args.monte_carlo:
-        if not results.trades:
-            print("\nNo trades for Monte Carlo simulation.")
-        else:
-            from backtest.monte_carlo import RiskOfRuinSimulator
-
-            sim = RiskOfRuinSimulator.from_backtest_results(results)
-            sim.run_full_report(n_simulations=args.mc_sims)
-
+    
 
 if __name__ == "__main__":
     main()
