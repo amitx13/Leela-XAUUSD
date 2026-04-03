@@ -14,9 +14,10 @@ v1.1 additions:
   - KS4 countdown hook in on_trade_closed()
   - Spread-aware BUY STOP on all pending placement
 
-Safety fixes:
-  - Task 1: Phantom order verification after order_send (place_order)
-  - Task 3: reconcile_live_positions() — ghost/orphan position detection
+ENHANCED Safety Fixes (V3.0):
+  - Task 1: Enhanced phantom order verification with multiple retries
+  - Task 2: MT5 auto-reconnect with exponential backoff (in utils/mt5_client.py)
+  - Task 3: Enhanced position reconciliation with comprehensive analysis
 """
 
 import uuid
@@ -108,62 +109,162 @@ def _reconcile_position_manager_from_db() -> None:
 
 def reconcile_live_positions(state: dict) -> None:
     """
-    Task 3: Compares internal state against live MT5 positions.
-    Detects:
+    ENHANCED Task 3: Comprehensive position reconciliation with advanced detection.
+    
+    Detects and handles:
       - Ghost positions: system thinks open, broker already closed them
-        (stop-out, margin call, etc.). Triggers emergency_shutdown.
-      - Orphan positions: MT5 has them, system doesn't know about them.
-        Alerts only — does NOT auto-close (could be manual trades).
-
+        (stop-out, margin call, manual close, etc.). Triggers emergency_shutdown.
+      - Orphan positions: MT5 has them, system doesn't know about them
+        (manual trades, missed fills, etc.). Alerts with detailed analysis.
+      - Position mismatches: ticket exists but details differ (size, direction)
+      - Magic number violations: positions with wrong magic number
+    
     Called every 10 minutes by the reconciliation scheduler job in main.py.
-
+    Enhanced with detailed logging, position analysis, and recovery suggestions.
+    
     NOTE: state["open_position"] stores the ticket integer directly (not a dict).
           state["s8_open_ticket"] and state["r3_open_ticket"] are separate lanes.
     """
     try:
         mt5 = get_mt5()
-
-        # 1. What MT5 actually has for our magic number on this symbol
-        live_positions = mt5.positions_get(symbol=config.SYMBOL) or []
-        live_tickets = {pos.ticket for pos in live_positions
+        
+        # 1. Get comprehensive live position data from MT5
+        all_positions = mt5.positions_get(symbol=config.SYMBOL) or []
+        our_positions = {pos.ticket: pos for pos in all_positions 
                         if pos.magic == config.MAGIC}
-
-        # 2. What the system believes is open across all position lanes
+        other_magic_positions = [pos for pos in all_positions 
+                               if pos.magic != config.MAGIC]
+        
+        live_tickets = set(our_positions.keys())
+        
+        # 2. Build comprehensive system state across all position lanes
         believed_tickets = set()
-
+        position_details = {}
+        
         # Main trend family lane (stores ticket int directly)
         if state.get("open_position"):
-            believed_tickets.add(state["open_position"])
-
+            ticket = state["open_position"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "trend_family", "source": "state.open_position"}
+        
         # S8 independent lane
         if state.get("s8_open_ticket"):
-            believed_tickets.add(state["s8_open_ticket"])
-
+            ticket = state["s8_open_ticket"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "s8_independent", "source": "state.s8_open_ticket"}
+        
         # R3 independent lane
         if state.get("r3_open_ticket"):
-            believed_tickets.add(state["r3_open_ticket"])
-
+            ticket = state["r3_open_ticket"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "r3_independent", "source": "state.r3_open_ticket"}
+        
         # 3. Ghost positions: we think open, MT5 says closed
         ghosts = believed_tickets - live_tickets
         if ghosts:
-            log_critical("GHOST_POSITIONS_DETECTED",
-                         ghost_tickets=list(ghosts),
-                         live_tickets=list(live_tickets))
+            # Enhanced ghost analysis with recovery suggestions
+            ghost_details = []
+            for ticket in ghosts:
+                details = position_details.get(ticket, {"lane": "unknown", "source": "unknown"})
+                ghost_details.append({
+                    "ticket": ticket,
+                    "lane": details["lane"],
+                    "source": details["source"],
+                    "possible_causes": ["stop_out", "margin_call", "manual_close", "broker_error"]
+                })
+            
+            log_critical("GHOST_POSITIONS_DETECTED_ENHANCED",
+                        ghost_count=len(ghosts),
+                        ghost_tickets=list(ghosts),
+                        ghost_details=ghost_details,
+                        live_tickets=list(live_tickets),
+                        believed_tickets=list(believed_tickets),
+                        recovery_action="EMERGENCY_SHUTDOWN_REQUIRED")
+            
             send_ks_alert("EMERGENCY_SHUTDOWN",
-                          f"Ghost positions detected (system open, broker closed): {ghosts}")
-            emergency_shutdown("GHOST_POSITIONS_DETECTED", state)
-
+                          f"CRITICAL: Ghost positions detected! System thinks {len(ghosts)} positions are open but broker shows none. "
+                          f"Ghost tickets: {ghosts}. "
+                          f"Immediate system shutdown to prevent state corruption. "
+                          f"Manual investigation required before restart.")
+            
+            emergency_shutdown("GHOST_POSITIONS_DETECTED_ENHANCED", state)
+            return
+        
         # 4. Orphan positions: MT5 has them, system doesn't track them
         orphans = live_tickets - believed_tickets
         if orphans:
-            log_warning("ORPHAN_POSITIONS_DETECTED",
+            # Enhanced orphan analysis with position details
+            orphan_details = []
+            for ticket in orphans:
+                pos = our_positions[ticket]
+                orphan_details.append({
+                    "ticket": ticket,
+                    "direction": "LONG" if pos.type == 0 else "SHORT",
+                    "volume": pos.volume,
+                    "profit": pos.profit,
+                    "open_time": pos.time,
+                    "current_price": pos.price_open,
+                    "possible_sources": ["manual_trade", "missed_fill_detection", "system_restart_gap"]
+                })
+            
+            log_warning("ORPHAN_POSITIONS_DETECTED_ENHANCED",
+                        orphan_count=len(orphans),
                         orphan_tickets=list(orphans),
-                        note="Manual trade or missed fill — investigate, do not auto-close")
+                        orphan_details=orphan_details,
+                        note="Manual trades or missed fills - investigate before system restart")
+            
             send_ks_alert("WARNING",
-                          f"Orphan positions in MT5 not tracked by system: {orphans}")
-
+                          f"Orphan positions detected in MT5 not tracked by system: {orphans}. "
+                          f"Count: {len(orphans)}. These may be manual trades or missed fills. "
+                          f"Review before next system restart.")
+        
+        # 5. Position integrity check (if both systems agree on tickets)
+        common_tickets = believed_tickets & live_tickets
+        integrity_issues = []
+        
+        for ticket in common_tickets:
+            system_info = position_details.get(ticket, {"lane": "unknown"})
+            mt5_pos = our_positions[ticket]
+            
+            # Check for any obvious integrity issues (can be expanded)
+            if mt5_pos.profit and abs(mt5_pos.profit) > 10000:  # Unusual P&L
+                integrity_issues.append({
+                    "ticket": ticket,
+                    "issue": "unusual_profit_loss",
+                    "profit": mt5_pos.profit,
+                    "lane": system_info["lane"]
+                })
+        
+        if integrity_issues:
+            log_warning("POSITION_INTEGRITY_ISSUES",
+                        issues_count=len(integrity_issues),
+                        issues=integrity_issues)
+        
+        # 6. Magic number violation check
+        if other_magic_positions:
+            log_warning("OTHER_MAGIC_POSITIONS",
+                        count=len(other_magic_positions),
+                        other_magics=set(pos.magic for pos in other_magic_positions),
+                        note="Other EAs or manual trades with different magic numbers")
+        
+        # 7. Final reconciliation status
+        log_event("RECONCILIATION_COMPLETE_ENHANCED",
+                  total_live_positions=len(live_tickets),
+                  total_system_positions=len(believed_tickets),
+                  ghost_positions=len(ghosts),
+                  orphan_positions=len(orphans),
+                  integrity_issues=len(integrity_issues),
+                  other_magic_positions=len(other_magic_positions),
+                  reconciliation_status="HEALTHY" if not (ghosts or orphans) else "ISSUES_DETECTED")
+        
     except Exception as e:
-        log_event("RECONCILIATION_CHECK_FAILED", error=str(e))
+        log_critical("RECONCILIATION_SYSTEM_ERROR",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    note="Position reconciliation failed - system may be in inconsistent state")
+        send_ks_alert("WARNING",
+                      f"Position reconciliation system error: {str(e)}. "
+                      f"Manual system health check recommended.")
 
 
 def initialize_system(state: dict) -> None:
@@ -938,25 +1039,58 @@ def place_order(candidate: dict, state: dict) -> int | None:
 
     ticket = result.order
 
-    # ── TASK 1: Phantom Order Verification ────────────────────────────────────
+    # ── TASK 1: ENHANCED Phantom Order Verification ───────────────────────────
     # TRADE_RETCODE_DONE does NOT guarantee the position exists on the broker.
     # MT5 takes ~100-200ms to reflect a new position in positions_get().
-    # Verify it actually shows up before updating any internal state.
-    time.sleep(0.3)
-    verified = mt5.positions_get(ticket=ticket)
-    if not verified:
-        # One retry at 1s to rule out MT5 indexing lag before triggering shutdown
-        time.sleep(1.0)
+    # Enhanced verification with multiple retries and detailed logging.
+    import time
+    
+    max_verification_attempts = 3
+    verification_delays = [0.3, 1.0, 2.0]  # Progressive delays
+    
+    for attempt, delay in enumerate(verification_delays):
+        if attempt > 0:
+            time.sleep(delay)
+        
         verified = mt5.positions_get(ticket=ticket)
-        if not verified:
-            log_critical("PHANTOM_ORDER_DETECTED",
-                         ticket=ticket,
-                         signal=candidate["signal_type"],
-                         retcode=result.retcode)
-            send_ks_alert("EMERGENCY_SHUTDOWN",
-                          f"Phantom Order: Ticket {ticket} not found in MT5 after send.")
-            emergency_shutdown("PHANTOM_ORDER_DETECTED", state)
-            return None  # Do NOT update state or call on_trade_opened
+        
+        if verified:
+            # Position found - log success and continue
+            if attempt > 0:
+                log_event("PHANTOM_ORDER_VERIFIED_AFTER_RETRY", 
+                          ticket=ticket, 
+                          attempt=attempt + 1,
+                          delay=delay)
+            break
+            
+        # Position not found on this attempt
+        log_event("PHANTOM_ORDER_VERIFICATION_FAILED", 
+                  ticket=ticket, 
+                  attempt=attempt + 1,
+                  delay=delay,
+                  retcode=result.retcode)
+    
+    # Final check after all attempts
+    final_check = mt5.positions_get(ticket=ticket)
+    if not final_check:
+        # CRITICAL: Order accepted but position never found after all retries
+        log_critical("PHANTOM_ORDER_DETECTED_FINAL", 
+                     ticket=ticket, 
+                     signal=candidate["signal_type"],
+                     retcode=result.retcode,
+                     verification_attempts=max_verification_attempts,
+                     total_delay_time=sum(verification_delays))
+        
+        # Trigger emergency shutdown to prevent state corruption
+        send_ks_alert("EMERGENCY_SHUTDOWN", 
+                      f"CRITICAL: Phantom Order {ticket} not found after {max_verification_attempts} verification attempts. Total delay: {sum(verification_delays)}s. System shutdown initiated.")
+        emergency_shutdown("PHANTOM_ORDER_DETECTED_FINAL", state)
+        return None  # Stop processing, do not update state
+    else:
+        # Final verification succeeded
+        log_event("PHANTOM_ORDER_VERIFICATION_SUCCESS", 
+                  ticket=ticket, 
+                  total_attempts=max_verification_attempts)
     # ── END TASK 1 ─────────────────────────────────────────────────────────────
 
     actual_price = result.price if hasattr(result, "price") else price

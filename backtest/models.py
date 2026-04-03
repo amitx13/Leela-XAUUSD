@@ -119,62 +119,143 @@ class EquityPoint:
 @dataclass
 class SimulatedState:
     """
-    Aggregated simulation state passed through the backtest loop.
-
-    Mirrors the live system's `state` dict but as a structured object
-    for clarity. The engine converts this to a dict when needed by
-    strategy evaluation functions.
+    ENHANCED backtest state matching live system state.py exactly.
+    
+    Tracks all strategy state, risk management, and position data.
+    Mirrors the live system's state structure for perfect parity.
     """
+    # Account metrics
     balance: float = 10000.0
     equity: float = 10000.0
     peak_equity: float = 10000.0
 
-    # Regime
+    # Regime state (from live regime_engine.py)
     current_regime: str = "NO_TRADE"
     size_multiplier: float = 0.0
     consecutive_regime_readings: int = 0
     pending_regime_state: Optional[str] = None
-
-    # ATR / ADX cached values
     last_adx_h4: float = 0.0
-    last_atr_pct_h1: float = 50.0
-    last_atr_h1_raw: float = 20.0
-    last_atr_m15: float = 5.0
-
-    # Session tracking
+    last_atr_pct_h1: float = 0.0
+    last_atr_h1_raw: float = 0.0
+    last_atr_m15: float = 0.0
+    last_di_plus_h4: Optional[float] = None  # V3.0: ADX/DI cache
+    last_di_minus_h4: Optional[float] = None  # V3.0: ADX/DI cache
     current_session: str = "OFF_HOURS"
 
-    # Strategy counters (daily reset)
+    # S1 family state (all strategies)
     s1_family_attempts_today: int = 0
     s1f_attempts_today: int = 0
-    s7_placed_today: bool = False
+    s1b_pending_ticket: Optional[int] = None
+    s1d_ema_touched_today: bool = False
+    s1d_fired_today: bool = False
+    s1e_pyramid_done: bool = False
+    s1f_post_tk_active: bool = False
+    s3_sweep_candle_time: Optional[datetime] = None
+    s3_sweep_low: float = 0.0
+    s3_fired_today: bool = False
+    s3_sweep_direction: Optional[str] = None
+    s4_fired_today: bool = False
+    s5_fired_today: bool = False
     s6_placed_today: bool = False
+    s7_placed_today: bool = False
+    s8_fired_today: bool = False
+    s8_armed: bool = False
+    s8_arm_time: Optional[datetime] = None
+    s8_spike_high: float = 0.0
+    s8_spike_low: float = 0.0
+    s8_spike_direction: Optional[str] = None
+    s8_confirmation_passed: bool = False
     s2_fired_today: bool = False
 
-    # Position management
-    trend_family_strategy: Optional[str] = None
+    # R3 state (independent lane)
+    r3_armed: bool = False
+    r3_arm_time: Optional[datetime] = None
+    r3_direction: Optional[str] = None
+    r3_fired_today: bool = False
+    ks7_pre_event_price: float = 0.0
 
-    # Daily loss tracking
+    # Position state (enhanced for independent lanes)
+    trend_family_occupied: bool = False
+    trend_family_strategy: Optional[str] = None
+    reversal_family_occupied: bool = False
+    open_position: Optional[int] = None  # Main trend family ticket
+    entry_price: float = 0.0
+    stop_price_original: float = 0.0
+    stop_price_current: float = 0.0
+    original_lot_size: float = 0.0
+    open_trade_id: Optional[str] = None
+    open_campaign_id: Optional[str] = None
+    last_s1_direction: Optional[str] = None
+    last_s1_max_r: float = 0.0
+    position_partial_done: bool = False
+    position_be_activated: bool = False
+    position_pyramid_done: bool = False
+    position_m5_count: int = 0
+
+    # Independent position lanes (V3.0)
+    s8_open_ticket: Optional[int] = None
+    s8_entry_price: float = 0.0
+    s8_stop_price_original: float = 0.0
+    s8_stop_price_current: float = 0.0
+    s8_trade_direction: Optional[str] = None
+    s8_be_activated: bool = False
+    s8_open_time_utc: Optional[str] = None
+
+    r3_open_ticket: Optional[int] = None
+    r3_open_time: Optional[datetime] = None
+    r3_entry_price: float = 0.0
+    r3_stop_price: float = 0.0
+    r3_tp_price: float = 0.0
+
+    # Pending orders (all strategies)
+    s1_pending_buy_ticket: Optional[int] = None
+    s1_pending_sell_ticket: Optional[int] = None
+    s6_pending_buy_ticket: Optional[int] = None
+    s6_pending_sell_ticket: Optional[int] = None
+    s7_pending_buy_ticket: Optional[int] = None
+    s7_pending_sell_ticket: Optional[int] = None
+
+    # Risk management state
+    trading_enabled: bool = True
+    shutdown_reason: Optional[str] = None
+    ks4_reduced_trades_remaining: int = 0
+    failed_breakout_flag: bool = False
+    failed_breakout_direction: Optional[str] = None
+    stop_hunt_detected: bool = False
+    ks7_active: bool = False
+    ks7_pre_event_atr: float = 0.0
+
+    # Daily tracking
     daily_pnl: float = 0.0
     daily_trades: int = 0
+    daily_commission_paid: float = 0.0
+    consecutive_m5_losses: int = 0
     consecutive_losses: int = 0
 
-    # Range data for S1
+    # Range and structural data
     range_high: float = 0.0
     range_low: float = 0.0
     range_size: float = 0.0
     range_computed: bool = False
-
-    # S7 prev day data
     s7_prev_day_high: float = 0.0
     s7_prev_day_low: float = 0.0
+
+    # Performance tracking
+    total_closed_trades: int = 0
+    total_wins: int = 0
+    total_losses: int = 0
+    total_pnl_gross: float = 0.0
+    total_commission: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dict for compatibility with strategy evaluation functions."""
         return {
+            # Account
             "balance": self.balance,
             "equity": self.equity,
             "peak_equity": self.peak_equity,
+            
+            # Regime
             "current_regime": self.current_regime,
             "size_multiplier": self.size_multiplier,
             "consecutive_regime_readings": self.consecutive_regime_readings,
@@ -183,20 +264,111 @@ class SimulatedState:
             "last_atr_pct_h1": self.last_atr_pct_h1,
             "last_atr_h1_raw": self.last_atr_h1_raw,
             "last_atr_m15": self.last_atr_m15,
+            "last_di_plus_h4": self.last_di_plus_h4,
+            "last_di_minus_h4": self.last_di_minus_h4,
             "current_session": self.current_session,
+            
+            # S1 family
             "s1_family_attempts_today": self.s1_family_attempts_today,
             "s1f_attempts_today": self.s1f_attempts_today,
-            "s7_placed_today": self.s7_placed_today,
+            "s1b_pending_ticket": self.s1b_pending_ticket,
+            "s1d_ema_touched_today": self.s1d_ema_touched_today,
+            "s1d_fired_today": self.s1d_fired_today,
+            "s1e_pyramid_done": self.s1e_pyramid_done,
+            "s1f_post_tk_active": self.s1f_post_tk_active,
+            "s3_sweep_candle_time": self.s3_sweep_candle_time,
+            "s3_sweep_low": self.s3_sweep_low,
+            "s3_fired_today": self.s3_fired_today,
+            "s3_sweep_direction": self.s3_sweep_direction,
+            "s4_fired_today": self.s4_fired_today,
+            "s5_fired_today": self.s5_fired_today,
             "s6_placed_today": self.s6_placed_today,
+            "s7_placed_today": self.s7_placed_today,
+            "s8_fired_today": self.s8_fired_today,
+            "s8_armed": self.s8_armed,
+            "s8_arm_time": self.s8_arm_time,
+            "s8_spike_high": self.s8_spike_high,
+            "s8_spike_low": self.s8_spike_low,
+            "s8_spike_direction": self.s8_spike_direction,
+            "s8_confirmation_passed": self.s8_confirmation_passed,
             "s2_fired_today": self.s2_fired_today,
+            
+            # R3
+            "r3_armed": self.r3_armed,
+            "r3_arm_time": self.r3_arm_time,
+            "r3_direction": self.r3_direction,
+            "r3_fired_today": self.r3_fired_today,
+            "ks7_pre_event_price": self.ks7_pre_event_price,
+            
+            # Position state
+            "trend_family_occupied": self.trend_family_occupied,
             "trend_family_strategy": self.trend_family_strategy,
+            "reversal_family_occupied": self.reversal_family_occupied,
+            "open_position": self.open_position,
+            "entry_price": self.entry_price,
+            "stop_price_original": self.stop_price_original,
+            "stop_price_current": self.stop_price_current,
+            "original_lot_size": self.original_lot_size,
+            "open_trade_id": self.open_trade_id,
+            "open_campaign_id": self.open_campaign_id,
+            "last_s1_direction": self.last_s1_direction,
+            "last_s1_max_r": self.last_s1_max_r,
+            "position_partial_done": self.position_partial_done,
+            "position_be_activated": self.position_be_activated,
+            "position_pyramid_done": self.position_pyramid_done,
+            "position_m5_count": self.position_m5_count,
+            
+            # Independent lanes
+            "s8_open_ticket": self.s8_open_ticket,
+            "s8_entry_price": self.s8_entry_price,
+            "s8_stop_price_original": self.s8_stop_price_original,
+            "s8_stop_price_current": self.s8_stop_price_current,
+            "s8_trade_direction": self.s8_trade_direction,
+            "s8_be_activated": self.s8_be_activated,
+            "s8_open_time_utc": self.s8_open_time_utc,
+            "r3_open_ticket": self.r3_open_ticket,
+            "r3_open_time": self.r3_open_time,
+            "r3_entry_price": self.r3_entry_price,
+            "r3_stop_price": self.r3_stop_price,
+            "r3_tp_price": self.r3_tp_price,
+            
+            # Pending orders
+            "s1_pending_buy_ticket": self.s1_pending_buy_ticket,
+            "s1_pending_sell_ticket": self.s1_pending_sell_ticket,
+            "s6_pending_buy_ticket": self.s6_pending_buy_ticket,
+            "s6_pending_sell_ticket": self.s6_pending_sell_ticket,
+            "s7_pending_buy_ticket": self.s7_pending_buy_ticket,
+            "s7_pending_sell_ticket": self.s7_pending_sell_ticket,
+            
+            # Risk management
+            "trading_enabled": self.trading_enabled,
+            "shutdown_reason": self.shutdown_reason,
+            "ks4_reduced_trades_remaining": self.ks4_reduced_trades_remaining,
+            "failed_breakout_flag": self.failed_breakout_flag,
+            "failed_breakout_direction": self.failed_breakout_direction,
+            "stop_hunt_detected": self.stop_hunt_detected,
+            "ks7_active": self.ks7_active,
+            "ks7_pre_event_atr": self.ks7_pre_event_atr,
+            
+            # Daily tracking
             "daily_pnl": self.daily_pnl,
             "daily_trades": self.daily_trades,
+            "daily_commission_paid": self.daily_commission_paid,
+            "consecutive_m5_losses": self.consecutive_m5_losses,
             "consecutive_losses": self.consecutive_losses,
+            
+            # Range data
             "range_high": self.range_high,
             "range_low": self.range_low,
             "range_size": self.range_size,
             "range_computed": self.range_computed,
             "s7_prev_day_high": self.s7_prev_day_high,
             "s7_prev_day_low": self.s7_prev_day_low,
+            
+            # Performance
+            "total_closed_trades": self.total_closed_trades,
+            "total_wins": self.total_wins,
+            "total_losses": self.total_losses,
+            "total_pnl_gross": self.total_pnl_gross,
+            "total_commission": self.total_commission,
         }
