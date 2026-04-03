@@ -13,6 +13,10 @@ v1.1 additions:
   - Change 56: P&L correlation check every 10 closed trades
   - KS4 countdown hook in on_trade_closed()
   - Spread-aware BUY STOP on all pending placement
+
+Safety fixes:
+  - Task 1: Phantom order verification after order_send (place_order)
+  - Task 3: reconcile_live_positions() — ghost/orphan position detection
 """
 
 import uuid
@@ -96,6 +100,70 @@ def _reconcile_position_manager_from_db() -> None:
             )
         except (TypeError, ValueError) as e:
             log_warning("PM_RECONCILE_ROW_SKIPPED", error=str(e), row=r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 3: LIVE POSITION RECONCILIATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reconcile_live_positions(state: dict) -> None:
+    """
+    Task 3: Compares internal state against live MT5 positions.
+    Detects:
+      - Ghost positions: system thinks open, broker already closed them
+        (stop-out, margin call, etc.). Triggers emergency_shutdown.
+      - Orphan positions: MT5 has them, system doesn't know about them.
+        Alerts only — does NOT auto-close (could be manual trades).
+
+    Called every 10 minutes by the reconciliation scheduler job in main.py.
+
+    NOTE: state["open_position"] stores the ticket integer directly (not a dict).
+          state["s8_open_ticket"] and state["r3_open_ticket"] are separate lanes.
+    """
+    try:
+        mt5 = get_mt5()
+
+        # 1. What MT5 actually has for our magic number on this symbol
+        live_positions = mt5.positions_get(symbol=config.SYMBOL) or []
+        live_tickets = {pos.ticket for pos in live_positions
+                        if pos.magic == config.MAGIC}
+
+        # 2. What the system believes is open across all position lanes
+        believed_tickets = set()
+
+        # Main trend family lane (stores ticket int directly)
+        if state.get("open_position"):
+            believed_tickets.add(state["open_position"])
+
+        # S8 independent lane
+        if state.get("s8_open_ticket"):
+            believed_tickets.add(state["s8_open_ticket"])
+
+        # R3 independent lane
+        if state.get("r3_open_ticket"):
+            believed_tickets.add(state["r3_open_ticket"])
+
+        # 3. Ghost positions: we think open, MT5 says closed
+        ghosts = believed_tickets - live_tickets
+        if ghosts:
+            log_critical("GHOST_POSITIONS_DETECTED",
+                         ghost_tickets=list(ghosts),
+                         live_tickets=list(live_tickets))
+            send_ks_alert("EMERGENCY_SHUTDOWN",
+                          f"Ghost positions detected (system open, broker closed): {ghosts}")
+            emergency_shutdown("GHOST_POSITIONS_DETECTED", state)
+
+        # 4. Orphan positions: MT5 has them, system doesn't track them
+        orphans = live_tickets - believed_tickets
+        if orphans:
+            log_warning("ORPHAN_POSITIONS_DETECTED",
+                        orphan_tickets=list(orphans),
+                        note="Manual trade or missed fill — investigate, do not auto-close")
+            send_ks_alert("WARNING",
+                          f"Orphan positions in MT5 not tracked by system: {orphans}")
+
+    except Exception as e:
+        log_event("RECONCILIATION_CHECK_FAILED", error=str(e))
 
 
 def initialize_system(state: dict) -> None:
@@ -650,7 +718,7 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
     # prev_day_high/low are top-level in s7result ✅
     state["s7_prev_day_high"] = s7result.get("prev_day_high", 0.0)
     state["s7_prev_day_low"]  = s7result.get("prev_day_low",  0.0)
-    
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PENDING FILL HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -736,6 +804,9 @@ def place_order(candidate: dict, state: dict) -> int | None:
 
     v1.1: BUY STOP price = entry + current_spread_pts (§3.5).
           SELL STOP left unadjusted (fills on bid).
+
+    Task 1: Phantom order verification — after TRADE_RETCODE_DONE, confirm
+            the position actually exists in MT5 before updating any state.
     """
     mt5  = get_mt5()
     tick = mt5.symbol_info_tick(config.SYMBOL)
@@ -865,7 +936,29 @@ def place_order(candidate: dict, state: dict) -> int | None:
                     comment=getattr(result, "comment", ""))
         return None
 
-    ticket       = result.order
+    ticket = result.order
+
+    # ── TASK 1: Phantom Order Verification ────────────────────────────────────
+    # TRADE_RETCODE_DONE does NOT guarantee the position exists on the broker.
+    # MT5 takes ~100-200ms to reflect a new position in positions_get().
+    # Verify it actually shows up before updating any internal state.
+    time.sleep(0.3)
+    verified = mt5.positions_get(ticket=ticket)
+    if not verified:
+        # One retry at 1s to rule out MT5 indexing lag before triggering shutdown
+        time.sleep(1.0)
+        verified = mt5.positions_get(ticket=ticket)
+        if not verified:
+            log_critical("PHANTOM_ORDER_DETECTED",
+                         ticket=ticket,
+                         signal=candidate["signal_type"],
+                         retcode=result.retcode)
+            send_ks_alert("EMERGENCY_SHUTDOWN",
+                          f"Phantom Order: Ticket {ticket} not found in MT5 after send.")
+            emergency_shutdown("PHANTOM_ORDER_DETECTED", state)
+            return None  # Do NOT update state or call on_trade_opened
+    # ── END TASK 1 ─────────────────────────────────────────────────────────────
+
     actual_price = result.price if hasattr(result, "price") else price
     slippage_pts = abs(actual_price - price) / point
     commission   = config.COMMISSION_PER_LOT_PER_SIDE * candidate["lot_size"]
@@ -1095,7 +1188,7 @@ def on_trade_opened(
               price=round(actual_price, 3), lots=candidate["lot_size"])
 
 
-# ──────────────────────────────────────────────────────────────────────��──────
+# ─────────────────────────────────────────────────────────────────────────────
 # TRADE CLOSE — KS4 countdown + Change 56 correlation check
 # ─────────────────────────────────────────────────────────────────────────────
 
