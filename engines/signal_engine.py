@@ -45,7 +45,7 @@ from engines.risk_engine import (
     calculate_lot_size, calculate_conviction_level,
     can_s1_family_fire, can_s1f_fire, can_s2_fire,
     can_m5_reentry_fire, run_pre_trade_kill_switches,
-    calculate_r_multiple,
+    calculate_r_multiple, calculate_atr_trail,
     # ── CHANGE 3: added reversal family and Phase 1 strategy gates ───────────
     can_reversal_family_fire, can_s3_fire, can_s6_fire, can_s7_fire,
 )
@@ -1029,22 +1029,26 @@ def evaluate_s1f_signal(state: dict) -> dict | None:
     if not direction:
         return None
 
-    # LOOP-9 FIX: Validate direction against current price action.
+    # CHANGE 3.5 / LOOP-9 FIX: H1 EMA20 direction validation.
+    # H1 = macro safety gate (direction), M5 = entry timing. Both needed.
     # last_s1_direction persists even after S1 closes. If S1 was LONG that stopped out
     # and market reversed, S1f would still try LONG — trading against the trend.
     ema20_h1 = get_ema20_h1()
-    if ema20_h1:
+    if ema20_h1 is not None:
         mt5_s1f = get_mt5()
         tick_s1f = mt5_s1f.symbol_info_tick(config.SYMBOL)
-        if tick_s1f:
-            if direction == "LONG" and tick_s1f.bid < ema20_h1:
-                log_event("S1F_DIRECTION_STALE_MARKET_REVERSED",
-                          direction=direction, bid=round(tick_s1f.bid, 3),
+        if tick_s1f is not None:
+            current_mid = (tick_s1f.ask + tick_s1f.bid) / 2
+            if direction == "LONG" and current_mid < ema20_h1:
+                log_event("S1F_REJECTED_H1_REVERSAL",
+                          direction=direction,
+                          price=round(current_mid, 3),
                           ema20_h1=round(ema20_h1, 3))
                 return None
-            if direction == "SHORT" and tick_s1f.ask > ema20_h1:
-                log_event("S1F_DIRECTION_STALE_MARKET_REVERSED",
-                          direction=direction, ask=round(tick_s1f.ask, 3),
+            elif direction == "SHORT" and current_mid > ema20_h1:
+                log_event("S1F_REJECTED_H1_REVERSAL",
+                          direction=direction,
+                          price=round(current_mid, 3),
                           ema20_h1=round(ema20_h1, 3))
                 return None
 
@@ -1223,8 +1227,11 @@ def evaluate_s3_signal(state: dict) -> dict | None:
     Max 1 S3 per session. Reversal family blocks S1b same day and vice versa.
     """
     # ── Gates ────────────────────────────────────────────────────────────────
+    # CHANGE 3.3: Allow UNSTABLE — S3 is a stop-hunt reversal and UNSTABLE
+    # (85-95th ATR percentile) is prime stop-hunting territory.
+    # Size is already reduced to 0.4× by regime multiplier.
     regime = get_safe_regime(state)
-    if regime in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
+    if regime == RegimeState.NO_TRADE:
         return None
 
     if state.get("s3_fired_today", False):
@@ -1734,11 +1741,18 @@ def evaluate_s8_signal(state: dict) -> dict | None:
     if state.get("s8_fired_today"):
         return None
 
-    # S8 competes with S1 — don't fire when S1 family is active
-    if state.get("trend_family_occupied"):
+    # S8 independent lane — blocked when already open, not by trend_family
+    if state.get("s8_open_ticket"):
         return None
 
-    # Don't fire if S1 pending orders are active
+    # Regime gate — block NO_TRADE only. UNSTABLE allowed because
+    # 0.4× regime multiplier × 0.5× S8 lot = 0.2× effective risk.
+    regime = get_safe_regime(state)
+    if regime == RegimeState.NO_TRADE:
+        return None
+
+    # Don't fire if S1 pending orders are active (prevents S8 market fill +
+    # S1 pending fill creating two simultaneous positions)
     if state.get("s1_pending_buy_ticket") or state.get("s1_pending_sell_ticket"):
         return None
 
@@ -1905,17 +1919,27 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
     # A limit order at midpoint may never fill if momentum continues.
     mt5_s8 = get_mt5()
     tick_s8 = mt5_s8.symbol_info_tick(config.SYMBOL)
-    stop_dist = float(state.get("s8_spike_atr", 0)) * 0.5  # 0.5× ATR stop
+    atr_stop_buffer = float(state.get("s8_spike_atr", 0)) * 0.5
     size_mult = 0.5  # 0.5× base lot (tight stops)
 
     if direction == "long":
         entry = tick_s8.ask if tick_s8 else spike_midpoint
-        stop = spike_low - stop_dist
+        stop = spike_low - atr_stop_buffer
     else:
         entry = tick_s8.bid if tick_s8 else spike_midpoint
-        stop = spike_high + stop_dist
+        stop = spike_high + atr_stop_buffer
 
-    lots = calculate_lot_size(stop_dist, state["size_multiplier"] * size_mult, state)
+    # CRITICAL FIX (Change 3.2): Use actual distance from entry to stop, NOT just
+    # the ATR buffer. Entry is market price at confirmation, which can be far from
+    # the spike extreme. Using atr_stop_buffer alone would calculate lots for 5pt
+    # risk when actual risk is 25pts → 5× oversize.
+    # Floor: never calculate on <5-point stop (prevents lot explosion).
+    actual_stop_dist = max(
+        abs(entry - stop),
+        5.0 * config.CONTRACT_SPEC.get("point", 0.01)
+    )
+
+    lots = calculate_lot_size(actual_stop_dist, state["size_multiplier"] * size_mult, state)
 
     candidate = _build_candidate(
         signal_type=SignalType.S8_ATR_SPIKE,
@@ -1947,6 +1971,116 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
               spike_midpoint=round(spike_midpoint, 3))
 
     return candidate
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S8 POSITION MANAGEMENT (Change 3.8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _s8_modify_stop(ticket: int, new_stop: float, reason: str, state: dict) -> bool:
+    """
+    Inline stop modification for S8 — bypasses shared modify_stop()
+    which reads S1-specific state keys (last_s1_direction, stop_price_current).
+    Using modify_stop() for S8 would read wrong direction and wrong stop.
+    S8 MUST use its own inline modifier.
+    """
+    mt5_mod = get_mt5()
+    pos = next(
+        (p for p in (mt5_mod.positions_get(symbol=config.SYMBOL) or [])
+         if p.ticket == ticket and p.magic == config.MAGIC),
+        None
+    )
+    if not pos:
+        return False
+    request = {
+        "action":   mt5_mod.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "symbol":   config.SYMBOL,
+        "sl":       new_stop,
+        "tp":       pos.tp,
+        "magic":    config.MAGIC,
+    }
+    result = mt5_mod.order_send(request)
+    if result and result.retcode == mt5_mod.TRADE_RETCODE_DONE:
+        log_event(reason, ticket=ticket, new_stop=round(new_stop, 3))
+        return True
+    log_event(f"{reason}_FAILED", ticket=ticket,
+              retcode=result.retcode if result else "NO_RESULT")
+    return False
+
+
+def manage_s8_position(state: dict) -> None:
+    """
+    S8 position management — runs every M5 bar.
+    Independent from trend family management.
+    Simplified: BE at 1.5R + ATR trail only.
+    No partial exit (0.5x lot too small to split).
+    No momentum cycle exit (wrong pattern for spikes).
+    """
+    ticket = state.get("s8_open_ticket")
+    if not ticket:
+        return
+
+    mt5_s8 = get_mt5()
+    positions = mt5_s8.positions_get(symbol=config.SYMBOL) or []
+    positions = [p for p in positions if p.ticket == ticket and p.magic == config.MAGIC]
+
+    # ── Position closed by SL/TP on broker side? ──────────────────────────────
+    if not positions:
+        log_event("S8_POSITION_CLOSED_BROKER", ticket=ticket)
+        deals = mt5_s8.history_deals_get(position=ticket) or []
+        exit_price = state.get("s8_entry_price", 0.0)
+        for d in deals:
+            if d.entry == mt5_s8.DEAL_ENTRY_OUT:
+                exit_price = d.price
+                break
+        # Deferred import to avoid circular dependency
+        from engines.execution_engine import on_trade_closed
+        on_trade_closed(ticket, exit_price, "S8_BROKER_CLOSE", state)
+        return
+
+    pos       = positions[0]
+    entry     = state["s8_entry_price"]
+    stop_orig = state["s8_stop_price_original"]
+    direction = state["s8_trade_direction"]
+
+    # ── BE Activation at 1.5R ─────────────────────────────────────────────────
+    if not state["s8_be_activated"]:
+        r_now = calculate_r_multiple(entry, pos.price_current, stop_orig, direction)
+        if r_now >= config.BE_ACTIVATION_R:    # 1.5
+            success = _s8_modify_stop(ticket, entry, "S8_BE_ACTIVATED", state)
+            if success:
+                state["s8_be_activated"]        = True
+                state["s8_stop_price_current"]  = entry
+                log_event("S8_BE_ACTIVATED",
+                          r_now=round(r_now, 2), ticket=ticket)
+        return    # Don't trail until BE is activated
+
+    # ── ATR Trail (only after BE) ─────────────────────────────────────────────
+    new_trail = calculate_atr_trail(pos.price_current, direction)
+    if new_trail is None:
+        return
+    current_stop = state["s8_stop_price_current"]
+
+    if direction == "LONG" and new_trail > current_stop:
+        success = _s8_modify_stop(ticket, new_trail, "S8_ATR_TRAIL", state)
+        if success:
+            state["s8_stop_price_current"] = new_trail
+    elif direction == "SHORT" and new_trail < current_stop:
+        success = _s8_modify_stop(ticket, new_trail, "S8_ATR_TRAIL", state)
+        if success:
+            state["s8_stop_price_current"] = new_trail
+
+
+def _on_s8_closed(state: dict) -> None:
+    """Clean up all S8 position state. Does NOT reset s8_fired_today."""
+    state["s8_open_ticket"]         = None
+    state["s8_entry_price"]         = 0.0
+    state["s8_stop_price_original"] = 0.0
+    state["s8_stop_price_current"]  = 0.0
+    state["s8_trade_direction"]     = None
+    state["s8_be_activated"]        = False
+    state["s8_open_time_utc"]       = None
 
 
 def check_partial_exit_condition(state: dict) -> bool:

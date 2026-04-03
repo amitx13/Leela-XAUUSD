@@ -553,11 +553,14 @@ def check_ks5_weekly_loss(state: dict) -> tuple[bool, str]:
 def check_ks6_drawdown(state: dict) -> tuple[bool, str]:
     """
     KS6 — Drawdown circuit breaker.
-    equity < peak_equity × 0.92 → full system halt + email.
-    Written review required before restart.
+    CHANGE 7.1 docstring fix:
+    # KS6: equity < peak × (1.0 - KS6_DRAWDOWN_LIMIT_PCT)
+    # Current threshold: 20% drawdown from 30-day rolling peak
+    # equity < peak × 0.80 → emergency halt + email
 
     peak_equity is updated continuously in heartbeat (B6 Fix).
     v1.1: peak_equity uses 30-day rolling peak (not all-time) — see persistence.py.
+    Written review required before restart.
     """
     mt5  = get_mt5()
     info = mt5.account_info()
@@ -567,22 +570,25 @@ def check_ks6_drawdown(state: dict) -> tuple[bool, str]:
 
     equity     = float(info.equity)
     peak       = state["peak_equity"]
+    threshold  = 1.0 - config.KS6_DRAWDOWN_LIMIT_PCT   # 0.80 at 20% limit
 
 
-    if peak > 0 and equity < peak * (1.0 - config.KS6_DRAWDOWN_LIMIT_PCT):
+    if peak > 0 and equity < peak * threshold:
         if state["trading_enabled"]:
             state["trading_enabled"] = False
             state["shutdown_reason"] = "KS6_DRAWDOWN_CIRCUIT_BREAKER"
             persist_critical_state(state)
             from utils.alerts import send_ks_alert
             send_ks_alert("KS6", (
-                f"Equity={equity:.2f} < peak×0.92={peak*0.92:.2f} "
+                f"Equity={equity:.2f} < peak×{threshold:.2f}={peak*threshold:.2f} "
                 f"(peak={peak:.2f}). "
+                f"KS6: {config.KS6_DRAWDOWN_LIMIT_PCT*100:.0f}% drawdown from 30-day peak. "
                 f"Full halt. Written review required before restart."
             ))
             log_event("KS6_FIRED",
                       equity=round(equity, 2),
                       peak=round(peak, 2),
+                      threshold=round(threshold, 3),
                       drawdown=round(1.0 - equity/peak, 4))
         return False, "KS6_DRAWDOWN_CIRCUIT_BREAKER"
     return True, "OK"
@@ -869,15 +875,16 @@ def can_s6_fire(state: dict) -> tuple[bool, str]:
     Gate for S6 — Asian Range Breakout (pending orders placed at 05:30 UTC).
 
     s6_fired_today: set True when both pending orders are placed.
-    Regime gate: NO_TRADE blocks (high ATR = breakout likely to fail).
+    CHANGE 3.4: UNSTABLE also blocks S6 — Asian ranges are noisy in UNSTABLE,
+    breakout levels unreliable. NO_TRADE blocks as before.
     Session check not needed here — S6 fires at fixed 05:30 UTC regardless
     of session label (asian_range_job handles the UTC schedule).
     """
     if state.get("s6_fired_today"):
         return False, "S6_ALREADY_FIRED_TODAY"
     regime = get_safe_regime(state)
-    if regime == RegimeState.NO_TRADE:
-        return False, "REGIME_NO_TRADE_S6_BLOCKED"
+    if regime in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
+        return False, f"REGIME_BLOCKS_S6_{regime.value}"
 
 
     permitted, reason = run_pre_trade_kill_switches(state)
