@@ -485,10 +485,41 @@ def place_s6_pending_orders(state: dict, s6result: dict) -> None:
     expiry_ts  = int(datetime.fromisoformat(expiry_iso).timestamp()) if expiry_iso else \
                  int(datetime.now(pytz.utc).replace(hour=8, minute=0, second=0, microsecond=0).timestamp())
 
-    orders = [
-        (mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s6_pending_buy_ticket"),
-        (mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s6_pending_sell_ticket"),
-    ]
+    # CHANGE 3.6: H4 DI-based trend filter using cached state values.
+    # Prerequisite: Change 9.1 caches DI+/DI- in state during regime job.
+    # In strong H4 trends, skip the counter-trend leg at placement time.
+    place_buy_s6  = buy_c  is not None
+    place_sell_s6 = sell_c is not None
+
+    adx_s6     = state.get("last_adx_h4")
+    di_plus_s6  = state.get("last_di_plus_h4")
+    di_minus_s6 = state.get("last_di_minus_h4")
+
+    if (adx_s6 is not None and adx_s6 > 25
+            and di_plus_s6 is not None and di_minus_s6 is not None):
+        if di_minus_s6 > 0:
+            di_ratio_s6 = di_plus_s6 / di_minus_s6
+        else:
+            di_ratio_s6 = 999.0
+
+        if di_ratio_s6 > 1.3:
+            place_sell_s6 = False
+            log_event("S6_SELL_FILTERED_STRONG_UPTREND",
+                      adx=round(adx_s6, 1), di_ratio=round(di_ratio_s6, 2))
+        elif di_ratio_s6 < (1.0 / 1.3):    # ~0.769
+            place_buy_s6 = False
+            log_event("S6_BUY_FILTERED_STRONG_DOWNTREND",
+                      adx=round(adx_s6, 1), di_ratio=round(di_ratio_s6, 2))
+
+    orders = []
+    if place_buy_s6:
+        orders.append((mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s6_pending_buy_ticket"))
+    if place_sell_s6:
+        orders.append((mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s6_pending_sell_ticket"))
+
+    if not orders:
+        log_event("S6_BOTH_LEGS_FILTERED_AT_PLACEMENT")
+        return
 
     for order_type, price, sl, lots, direction, ticket_key in orders:
         place_price = round(price + spread_price, 3) if order_type == mt5.ORDER_TYPE_BUY_STOP else price
@@ -553,10 +584,40 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
 
     spread_price = tick.ask - tick.bid
 
-    orders = [
-        (mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s7_pending_buy_ticket"),
-        (mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s7_pending_sell_ticket"),
-    ]
+    # CHANGE 3.7: H4 DI-based trend filter (identical to S6 Change 3.6).
+    # S7 daily structure breakouts in strong trends should skip counter-trend leg.
+    place_buy_s7  = buy_c  is not None
+    place_sell_s7 = sell_c is not None
+
+    adx_s7     = state.get("last_adx_h4")
+    di_plus_s7  = state.get("last_di_plus_h4")
+    di_minus_s7 = state.get("last_di_minus_h4")
+
+    if (adx_s7 is not None and adx_s7 > 25
+            and di_plus_s7 is not None and di_minus_s7 is not None):
+        if di_minus_s7 > 0:
+            di_ratio_s7 = di_plus_s7 / di_minus_s7
+        else:
+            di_ratio_s7 = 999.0
+
+        if di_ratio_s7 > 1.3:
+            place_sell_s7 = False
+            log_event("S7_SELL_FILTERED_STRONG_UPTREND",
+                      adx=round(adx_s7, 1), di_ratio=round(di_ratio_s7, 2))
+        elif di_ratio_s7 < (1.0 / 1.3):    # ~0.769
+            place_buy_s7 = False
+            log_event("S7_BUY_FILTERED_STRONG_DOWNTREND",
+                      adx=round(adx_s7, 1), di_ratio=round(di_ratio_s7, 2))
+
+    orders = []
+    if place_buy_s7:
+        orders.append((mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s7_pending_buy_ticket"))
+    if place_sell_s7:
+        orders.append((mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s7_pending_sell_ticket"))
+
+    if not orders:
+        log_event("S7_BOTH_LEGS_FILTERED_AT_PLACEMENT")
+        return
 
     for order_type, price, sl, lots, direction, ticket_key in orders:
         place_price = round(price + spread_price, 3) if order_type == mt5.ORDER_TYPE_BUY_STOP else price
@@ -1002,6 +1063,26 @@ def on_trade_opened(
 
     if signal in ("S2_MEAN_REV", "S6_ASIAN_BRK", "S7_DAILY_STRUCT"):
         state["trend_family_strategy"] = signal
+
+    # CHANGE 5.3: S6/S7 Cross-Cancellation on fill.
+    # When S6 or S7 fills, cancel all other S6/S7 pending orders immediately.
+    # Prevents position collision (two fills → open_position overwrite).
+    # This is belt-and-suspenders with the fill detection in main.py.
+    if signal in ("S6_ASIAN_BRK", "S7_DAILY_STRUCT"):
+        mt5_cancel = get_mt5()
+        for key in ("s6_pending_buy_ticket", "s6_pending_sell_ticket",
+                    "s7_pending_buy_ticket", "s7_pending_sell_ticket"):
+            pending_ticket = state.get(key)
+            if pending_ticket and pending_ticket != ticket:
+                try:
+                    mt5_cancel.order_delete(pending_ticket)
+                    log_event("S6_S7_CROSS_CANCEL",
+                              cancelled_ticket=pending_ticket,
+                              filled_strategy=signal,
+                              cancelled_key=key)
+                except Exception:
+                    pass
+                state[key] = None
 
     pm_on_fill(signal, ticket, candidate["direction"], float(candidate["lot_size"]))
 

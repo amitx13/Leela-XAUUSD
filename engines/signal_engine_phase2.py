@@ -96,13 +96,41 @@ def _can_r3_fire(state: dict) -> tuple[bool, str]:
     R3 — independent family. No trend_family_occupied check.
     Can coexist with an active S1, S2, S4, or S5 position.
     One R3 per day maximum.
+    CHANGE 4.1: Block NO_TRADE regime — in >95th percentile ATR, post-event
+    moves are indistinguishable from noise.
     """
     if state.get("r3_fired_today"):
         return False, "R3_ALREADY_FIRED_TODAY"
     if not state.get("trading_enabled", True):
         return False, "TRADING_DISABLED"
+    # CHANGE 4.1: Block NO_TRADE regime
+    regime = get_safe_regime(state)
+    if regime == RegimeState.NO_TRADE:
+        return False, "REGIME_NO_TRADE"
     # R3 does NOT check trend_family_occupied — it's fully independent.
     # It DOES go through KS3/KS5/KS6/KS7 checks.
+    permitted, reason = run_pre_trade_kill_switches(state)
+    if not permitted:
+        return False, reason
+    return True, "PERMITTED"
+
+
+def _can_trend_family_fire(state: dict) -> tuple[bool, str]:
+    """
+    CHANGE 3.9: Shared gate for S4/S5 — checks trend family occupancy +
+    regime + kill switches, but NOT s1_family_attempts_today.
+    S4 and S5 should not be limited by S1/S1B attempt count.
+    S1 and S1b continue using can_s1_family_fire() unchanged.
+    """
+    if not state.get("trading_enabled", True):
+        return False, "TRADING_DISABLED"
+    if state.get("trend_family_occupied"):
+        return False, "TREND_FAMILY_OCCUPIED"
+    regime = get_safe_regime(state)
+    if regime == RegimeState.NO_TRADE:
+        return False, "REGIME_NO_TRADE"
+    if not regime.allows_s1:
+        return False, f"REGIME_BLOCKS_TREND_{regime.value}"
     permitted, reason = run_pre_trade_kill_switches(state)
     if not permitted:
         return False, reason
@@ -112,14 +140,15 @@ def _can_r3_fire(state: dict) -> tuple[bool, str]:
 def _can_s4_fire(state: dict) -> tuple[bool, str]:
     """
     S4 — trend family. Requires first EMA20 touch of London session.
-    Reuses can_s1_family_fire for the trend family occupancy check.
+    CHANGE 3.9: Uses _can_trend_family_fire instead of can_s1_family_fire
+    so S4 is not blocked by s1_family_attempts_today counter.
     """
     if state.get("s4_fired_today"):
         return False, "S4_ALREADY_FIRED_TODAY"
     if not state.get("s4_ema_touched"):
         return False, "S4_EMA_NOT_TOUCHED_YET"
-    # Trend family gate (same as S1)
-    permitted, reason = can_s1_family_fire(state)
+    # CHANGE 3.9: Use _can_trend_family_fire — NOT can_s1_family_fire
+    permitted, reason = _can_trend_family_fire(state)
     if not permitted:
         return False, reason
     return True, "PERMITTED"
@@ -128,13 +157,15 @@ def _can_s4_fire(state: dict) -> tuple[bool, str]:
 def _can_s5_fire(state: dict) -> tuple[bool, str]:
     """
     S5 — trend family. Requires London compression confirmed at noon.
+    CHANGE 3.9: Uses _can_trend_family_fire instead of can_s1_family_fire
+    so S5 is not blocked by s1_family_attempts_today counter.
     """
     if state.get("s5_fired_today"):
         return False, "S5_ALREADY_FIRED_TODAY"
     if not state.get("s5_compression_confirmed"):
         return False, "S5_NO_COMPRESSION_THIS_SESSION"
-    # Trend family gate (same as S1)
-    permitted, reason = can_s1_family_fire(state)
+    # CHANGE 3.9: Use _can_trend_family_fire — NOT can_s1_family_fire
+    permitted, reason = _can_trend_family_fire(state)
     if not permitted:
         return False, reason
     return True, "PERMITTED"

@@ -367,6 +367,47 @@ def get_adx_h4(period: int = 14) -> float | None:
     return adx_val
 
 
+def get_adx_h4_full(period: int = 14) -> tuple[float | None, float | None, float | None]:
+    """
+    CHANGE 9.1: Returns (adx, di_plus, di_minus) from H4 bars in a single fetch.
+    Called from regime_job() to cache DI+/DI- in STATE for S6/S7 ADX trend filter.
+    Avoids double-fetching H4 bars (get_adx_h4 + separate DI fetch).
+    """
+    mt5 = get_mt5()
+    bars = mt5.copy_rates_from_pos(config.SYMBOL, mt5.TIMEFRAME_H4, 0, 100)
+
+    if bars is None or len(bars) < period * 2:
+        log_warning("ADX_H4_FULL_INSUFFICIENT_DATA",
+                    bars_received=len(bars) if bars else 0)
+        return None, None, None
+
+    df = pd.DataFrame(bars)
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=period)
+
+    if adx_df is None or adx_df.empty:
+        return None, None, None
+
+    col_adx = f"ADX_{period}"
+    col_dmp = f"DMP_{period}"
+    col_dmn = f"DMN_{period}"
+
+    if col_adx not in adx_df.columns:
+        return None, None, None
+
+    adx_val = adx_df[col_adx].iloc[-1]
+    if pd.isna(adx_val):
+        return None, None, None
+
+    di_plus  = adx_df[col_dmp].iloc[-1] if col_dmp in adx_df.columns else None
+    di_minus = adx_df[col_dmn].iloc[-1] if col_dmn in adx_df.columns else None
+
+    return (
+        float(adx_val),
+        float(di_plus)  if di_plus  is not None and not pd.isna(di_plus)  else None,
+        float(di_minus) if di_minus is not None and not pd.isna(di_minus) else None,
+    )
+
+
 def get_adx_h4_slope(period: int = 14) -> tuple[float | None, bool]:
     """
     Returns (current_adx, is_increasing) using last 2 fully closed H4 bars.
@@ -884,7 +925,8 @@ def regime_job(state: dict) -> None:
 
 
     # ── Step 1: indicators ───────────────────────────────────────────────────
-    adx_h4     = get_adx_h4()
+    # CHANGE 9.1: Use get_adx_h4_full() to also capture DI+/DI- for S6/S7 filter
+    adx_h4, di_plus_h4, di_minus_h4 = get_adx_h4_full()
     atr_pct_h1 = get_atr_percentile_h1()
 
 
@@ -947,6 +989,11 @@ def regime_job(state: dict) -> None:
     state["macro_boost"]          = dxy_corr_50 < config.DXY_CORR_SUPER_THRESHOLD
     state["last_adx_h4"]          = adx_h4
     state["last_atr_pct_h1"]      = atr_pct_h1
+    # CHANGE 9.1: Cache DI+/DI- for S6/S7 ADX trend filter
+    if di_plus_h4 is not None:
+        state["last_di_plus_h4"]  = di_plus_h4
+    if di_minus_h4 is not None:
+        state["last_di_minus_h4"] = di_minus_h4
     # F8 fix: also store raw ATR for portfolio risk (avoid re-fetching every M15 candle)
     # BUG-6 FIX: was referencing nonexistent local `df`. Now calls data_engine.
     from engines.data_engine import get_atr14_h1_rma as _get_raw_atr

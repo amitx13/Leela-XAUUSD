@@ -76,6 +76,7 @@ from engines.signal_engine import (
     evaluate_s6_signal,
     evaluate_s7_signal,
     evaluate_s8_signal,       # FIX: was missing — S8 never fired
+    manage_s8_position,       # CHANGE 6.1: S8 position management
     detect_stop_hunt,
     auto_reset_s1b_counter,
     check_and_fire_london_time_kill,
@@ -560,26 +561,30 @@ def m5_mgmt_job() -> None:
     _check_for_s6_pending_fill()
     _check_for_s7_pending_fill()
 
-    # ── 4.5 S8: ATR Spike — evaluate and dispatch ─────────────────────────────
-    # Runs only when trend family is free and S8 has not fired today.
-    # Full KS gate (KS3/KS5/KS6/KS7) applied before dispatch.
-    if (not STATE.get("trend_family_occupied")
-            and not STATE.get("s8_fired_today")
-            and not STATE.get("s1_pending_buy_ticket")
-            and not STATE.get("s1_pending_sell_ticket")):
+    # ── 4.5 S8: Independent position lane (Change 6.2) ───────────────────────
+    # Management takes priority over evaluation (elif ensures mutual exclusion).
+    # Gate is now s8_open_ticket (not trend_family_occupied — S8 is independent).
+    if STATE.get("s8_open_ticket"):
+        _safe_execute("s8_mgmt", manage_s8_position, STATE)
+    elif not STATE.get("s8_fired_today"):
         s8_candidate = evaluate_s8_signal(STATE)
         if s8_candidate:
-            # Run full pre-trade kill switch stack before dispatching
             ks_permitted, ks_reason = run_pre_trade_kill_switches(STATE)
             if ks_permitted:
                 STARVATION_TRACKER.record_evaluation()
                 STARVATION_TRACKER.record_signal()
-                _dispatch_candidate(s8_candidate)
+                if not PAPER_MODE:
+                    s8_ticket = place_order(s8_candidate, STATE)
+                    if s8_ticket:
+                        log_event("S8_ORDER_PLACED", ticket=s8_ticket)
+                else:
+                    log_event("PAPER_MODE_S8_SIGNAL",
+                              direction=s8_candidate.get("direction"))
             else:
                 STARVATION_TRACKER.record_block(
                     s8_candidate["signal_type"], "kill_switch", ks_reason
                 )
-                log_event("S8_BLOCKED_BY_KILL_SWITCH", reason=ks_reason)
+                log_event("S8_BLOCKED_BY_KS", reason=ks_reason)
 
     # ── ★ 5. R3: Attempt to arm on this M5 close ─────────────────────────────
     if not STATE.get("r3_fired_today"):
@@ -1166,7 +1171,86 @@ def _execute_generic_market_close(ticket: int | None, reason: str) -> None:
         retcode = result.retcode if result else "NONE"
         log_warning("GENERIC_MARKET_CLOSE_FAILED",
                     ticket=ticket, reason=reason, retcode=retcode)
-        
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 6.4 — FRIDAY CLOSE JOB (Friday 20:30 UTC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def friday_close_job() -> None:
+    """
+    CHANGE 6.4: Close all positions and cancel all pending orders before weekend.
+    Friday 20:30 UTC (Saturday 02:00 IST).
+    XAUUSD weekend gaps can be 50-200pts on geopolitical events.
+    Trailing stops don't update while bot is offline.
+    """
+    log_event("FRIDAY_CLOSE_INITIATED",
+              time=datetime.now(pytz.utc).strftime("%Y-%m-%d %H:%M UTC"))
+
+    # 1. Close trend family position
+    if STATE.get("open_position"):
+        _safe_execute("friday_close_trend",
+                      _execute_generic_market_close,
+                      STATE["open_position"],
+                      "FRIDAY_WEEKEND_CLOSE")
+
+    # 2. Close R3 position
+    if STATE.get("r3_open_ticket"):
+        _safe_execute("friday_close_r3", execute_r3_hard_exit, STATE)
+
+    # 3. Close S8 position
+    if STATE.get("s8_open_ticket"):
+        _safe_execute("friday_close_s8", _execute_s8_friday_close, STATE)
+
+    # 4. Cancel all pending orders
+    _safe_execute("friday_cancel_pending", cancel_all_pending_orders)
+
+    log_event("FRIDAY_CLOSE_COMPLETE")
+
+
+def _execute_s8_friday_close(state: dict) -> None:
+    """
+    Close S8 position at market for Friday weekend shutdown.
+    Uses market order — S8 is too small to split or partially close.
+    """
+    ticket = state.get("s8_open_ticket")
+    if not ticket:
+        return
+
+    from utils.mt5_client import get_mt5
+    mt5_close = get_mt5()
+    positions = mt5_close.positions_get(symbol=config.SYMBOL) or []
+    pos = next(
+        (p for p in positions if p.ticket == ticket and p.magic == config.MAGIC),
+        None
+    )
+    if not pos:
+        # Position already closed by SL/TP — clean up state
+        from engines.signal_engine import _on_s8_closed
+        _on_s8_closed(state)
+        return
+
+    close_type = (mt5_close.ORDER_TYPE_SELL if pos.type == 0
+                  else mt5_close.ORDER_TYPE_BUY)
+    result = mt5_close.order_send({
+        "action":    mt5_close.TRADE_ACTION_DEAL,
+        "symbol":    config.SYMBOL,
+        "volume":    pos.volume,
+        "type":      close_type,
+        "position":  ticket,
+        "deviation": config.ORDER_DEVIATION_POINTS,
+        "magic":     config.MAGIC,
+        "comment":   "S8_FRIDAY_CLOSE",
+    })
+    if result and result.retcode == mt5_close.TRADE_RETCODE_DONE:
+        on_trade_closed(ticket, result.price, "S8_FRIDAY_CLOSE", state)
+        log_event("S8_FRIDAY_CLOSE_DONE", ticket=ticket,
+                  price=round(result.price, 3))
+    else:
+        retcode = result.retcode if result else "NONE"
+        log_warning("S8_FRIDAY_CLOSE_FAILED", ticket=ticket, retcode=retcode)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHEDULER SETUP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1281,6 +1365,17 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=CronTrigger(hour=5, minute=30, timezone=tz_utc),
         id="s6_asian_range",
         name="Asian Range S6 Orders",
+        coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    # Job 12: Friday close — Friday 20:30 UTC (CHANGE 6.4)
+    # Closes all positions before weekend gap risk.
+    # XAUUSD weekend gaps 50-200pts; trailing stops don't update offline.
+    scheduler.add_job(
+        func=lambda: _safe_execute("friday_close", friday_close_job),
+        trigger=CronTrigger(day_of_week="fri", hour=20, minute=30, timezone=tz_utc),
+        id="friday_close",
+        name="Friday Weekend Close 20:30 UTC",
         coalesce=True, max_instances=1, replace_existing=True,
     )
 
