@@ -95,6 +95,7 @@ from engines.execution_engine import (
     pre_session_checklist,
     on_trade_closed,
     modify_stop,
+    reconcile_live_positions,  # ENHANCED: Add reconciliation function import
 )
 from state import reset_daily_counters   # BUG-1 FIX: use state.py version (resets Phase 2 + S8 daily flags)
 from engines.portfolio_risk import check_portfolio_risk, run_correlation_check
@@ -1377,6 +1378,20 @@ def build_scheduler() -> BackgroundScheduler:
         id="friday_close",
         name="Friday Weekend Close 20:30 UTC",
         coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    # Job 13: ENHANCED Position Reconciliation — every 10 minutes
+    # Critical safety check: compares system state against live MT5 positions
+    # Detects ghost positions (system open, broker closed) and orphan positions
+    scheduler.add_job(
+        func=lambda: _safe_execute("reconciliation", 
+                                   lambda: reconcile_live_positions(STATE)),
+        trigger=IntervalTrigger(minutes=10),  # Run every 10 minutes
+        id="reconciliation",
+        name="Enhanced Position Reconciliation (State vs MT5)",
+        coalesce=True, 
+        max_instances=1, 
+        replace_existing=True
     )
 
     return scheduler
