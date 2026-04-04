@@ -10,7 +10,7 @@ from .base_strategy import BaseStrategy, StrategyResult
 from ..models import SimOrder, SimulatedState
 
 
-class R3CalMomentum(BaseStrategy):
+class R3CalendarMomentum(BaseStrategy):
     """R3 Calendar Momentum Strategy."""
 
     def get_strategy_name(self) -> str:
