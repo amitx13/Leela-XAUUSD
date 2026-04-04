@@ -42,6 +42,14 @@ Fixes applied (v5 — 0-trades root cause):
      ORDER_NOT_FOUND immediately, silently blocking all fills                  [BUG-FILL-META]
  25. _update_session() + _update_regime() bootstrapped before main loop so
      initial regime is never stuck on NO_TRADE/OFF_HOURS default               [BUG-REGIME-STARTUP]
+
+Fixes applied (v6 — missing SimulatedState fields):
+ 26. trend_trade_direction set on OPEN / cleared on CLOSE in
+     _update_position_state() so S1d/S1e pyramid strategies can read the
+     direction of the currently open trend-family position                     [BUG-TTD]
+ 27. s1d_pyramid_count, s1e_pyramid_count, s1f_reentered_today,
+     s1f_killed_position_profitable, s1f_original_size added to daily
+     reset in _check_daily_reset()                                             [BUG-DAILY-RESET]
 """
 
 import sys
@@ -284,6 +292,11 @@ class EnhancedBacktestEngine:
             self.state.s1e_pyramid_done          = False
             self.state.s1f_post_tk_active        = False
             self.state.s1b_pending_ticket        = None
+            self.state.s1d_pyramid_count         = 0
+            self.state.s1e_pyramid_count         = 0
+            self.state.s1f_reentered_today       = False
+            self.state.s1f_killed_position_profitable = False
+            self.state.s1f_original_size         = 0.0
             self.state.s2_fired_today            = False
             self.state.s3_fired_today            = False
             self.state.s3_sweep_candle_time      = None
@@ -850,6 +863,7 @@ class EnhancedBacktestEngine:
             if action == "OPEN":
                 self.state.trend_family_occupied  = True
                 self.state.trend_family_strategy  = position.strategy
+                self.state.trend_trade_direction  = position.direction  # BUG-TTD FIX
                 self.state.open_position          = position.strategy
                 self.state.entry_price            = position.entry_price
                 self.state.stop_price_original    = position.stop_price_original
@@ -860,6 +874,7 @@ class EnhancedBacktestEngine:
             else:
                 self.state.trend_family_occupied  = False
                 self.state.trend_family_strategy  = None
+                self.state.trend_trade_direction  = None               # BUG-TTD FIX
                 self.state.open_position          = None
                 self.state.entry_price            = 0.0
                 self.state.stop_price_original    = 0.0
