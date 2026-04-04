@@ -2,6 +2,7 @@
 S4 London Pullback Strategy
 
 Trades pullbacks during London session after initial breakout.
+FIX: s4_fired_today guard added — only one pullback entry per day.
 """
 
 from datetime import datetime, timedelta
@@ -32,6 +33,10 @@ class S4LondonPull(BaseStrategy):
 
         can_fire, reason = self.can_fire(state, current_time)
         if not can_fire:
+            return StrategyResult(orders, signals, state_updates)
+
+        # FIX Bug-S4a: one pullback entry per day
+        if state.s4_fired_today:
             return StrategyResult(orders, signals, state_updates)
 
         session = state.current_session
@@ -91,6 +96,8 @@ class S4LondonPull(BaseStrategy):
                 tag="s4_london_pullback"
             )
             orders.append(order)
+            # FIX Bug-S4a: set flag immediately in state_updates
+            state_updates["s4_fired_today"] = True
             signals.append({
                 "type":      "S4_PULLBACK_PLACED",
                 "direction": direction,
@@ -106,7 +113,7 @@ class S4LondonPull(BaseStrategy):
         return StrategyResult(orders, signals, state_updates)
 
     def _check_daily_limit(self, state: SimulatedState) -> bool:
-        return False
+        return state.s4_fired_today
 
     def reset_daily_counters(self, state: SimulatedState):
-        pass
+        state.s4_fired_today = False

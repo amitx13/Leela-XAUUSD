@@ -22,6 +22,14 @@ Fixes applied (v2 — full review pass):
  15. Partial exit logic added to _manage_positions()                           [BUG #14]
  16. exit_time uses simulation current_time, not datetime.utcnow()
  17. Session classification uses utils.session.get_session_for_datetime()
+
+Fixes applied (v3 — 0-trades diagnosis):
+ 18. S1 counter race: s1_family_attempts_today written via setattr BEFORE next
+     strategy loop iteration, not deferred via state_updates dict              [BUG-S1a]
+ 19. S6/S7 placed-today flags set BEFORE evaluate() is called, not AFTER the
+     full strategy loop (loop-end block could never block same-day repeats)    [BUG-S6S7]
+ 20. MARKET orders fill immediately on same bar at bar close (was silently
+     dropped when check_fill returned filled=False for MARKET type)            [BUG-FILL]
 """
 
 import sys
@@ -57,16 +65,11 @@ except ImportError:
     config = None  # type: ignore
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOCAL UTIL — compute_atr_percentile (was incorrectly imported from data_feed)
-# BUG #10 FIX: function does not exist in data_feed.py; defined here.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# LOCAL UTIL
+# ---------------------------------------------------------------------------
 
 def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
-    """
-    Return the percentile rank (0–100) of current_atr within atr_series.
-    Used to classify volatility regime.
-    """
     vals = atr_series.dropna().values
     if len(vals) == 0:
         return 50.0
@@ -74,24 +77,14 @@ def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
     return float(below / len(vals) * 100.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 
 class EnhancedBacktestEngine:
     """
     Enhanced backtest engine with all 13 strategies and advanced features.
-
-    Features:
-    - Modular strategy system (all 13 strategies)
-    - BarBuffer-driven loop — indicators only update on real TF completions
-    - Enhanced regime classification (matches live system, incl. SUPER_TRENDING)
-    - Independent position lanes (S8, R3)
-    - Advanced risk management (all kill switches)
-    - Position reconciliation and phantom order detection
-    - Multi-timeframe support (M5, M15, H1, H4, D1)
-    - Partial exit support (1R partial close)
     """
 
     def __init__(
@@ -111,36 +104,30 @@ class EnhancedBacktestEngine:
         self.strategies      = strategies if strategies else ALL_STRATEGIES
         self.cache_dir       = cache_dir
 
-        # Merge config overrides
         self.config: Dict[str, Any] = {**config.__dict__} if config else {}
         if config_override:
             self.config.update(config_override)
 
-        # --- components ---
         self.data_feed     = EnhancedHistoricalDataFeed(cache_dir=cache_dir)
         self.bar_buffer    = BarBuffer()
         self.execution_sim = EnhancedExecutionSimulator(slippage_points)
 
-        # --- state ---
         self.state = SimulatedState(
             balance=initial_balance,
             equity=initial_balance,
             peak_equity=initial_balance,
         )
 
-        # --- strategy instances ---
         self.strategy_instances: Dict[str, Any] = {}
         for name in self.strategies:
             if name in STRATEGY_REGISTRY:
                 self.strategy_instances[name] = STRATEGY_REGISTRY[name](self.config)
 
-        # --- tracking ---
         self.trades:         List[TradeRecord]  = []
         self.equity_curve:   List[EquityPoint]  = []
         self.open_positions: List[SimPosition]  = []
         self.pending_orders: List[SimOrder]     = []
 
-        # --- indicator cache ---
         self._last_adx_h4:     float           = 25.0
         self._last_atr_pct_h1: float           = 50.0
         self._last_atr_h1_raw: float           = 20.0
@@ -149,20 +136,18 @@ class EnhancedBacktestEngine:
         self._last_rsi_h1:     Optional[float] = None
         self._last_daily_atr:  Optional[float] = None
 
-        # --- day / session tracking ---
         self._current_day:        Optional[int] = None
-        self._last_session_hour:  int           = -1   # BUG #7 FIX: cache session per-hour
+        self._last_session_hour:  int           = -1
 
         logger.info("Enhanced backtest engine initialised")
         logger.info(f"Strategies : {self.strategies}")
         logger.info(f"Period     : {start_date} to {end_date}")
 
     # ================================================================== #
-    # PUBLIC — MAIN RUN                                                   #
+    # PUBLIC
     # ================================================================== #
 
     def run(self) -> BacktestResults:
-        """Run the enhanced backtest. Drives loop from real M5 bar events."""
         logger.info("Starting enhanced backtest run")
 
         self.data_feed.load_data(
@@ -177,18 +162,15 @@ class EnhancedBacktestEngine:
         total_bars   = len(m5_df)
         log_interval = max(total_bars // 20, 1)
 
-        # Record initial equity
         self.equity_curve.append(EquityPoint(
             timestamp=self.start_date,
             equity=self.initial_balance,
         ))
 
-        # ── MAIN LOOP: iterate M5 bars via BarBuffer ──────────────────── #
-        for bar_num, (_, row) in enumerate(m5_df.iterrows()):   # BUG #12 FIX: enumerate
+        for bar_num, (_, row) in enumerate(m5_df.iterrows()):
             bar          = row.to_dict()
             current_time = bar["time"]
 
-            # Progress logging
             if (bar_num + 1) % log_interval == 0:
                 pct = ((bar_num + 1) / total_bars) * 100
                 logger.info(
@@ -197,18 +179,14 @@ class EnhancedBacktestEngine:
                     f"| Trades: {len(self.trades)}"
                 )
 
-            # Step 1 — feed bar into BarBuffer; get higher-TF completions
             completed = self.bar_buffer.add_m5(bar)
 
-            # Step 2 — daily reset
             self._check_daily_reset(current_time)
 
-            # Step 3 — session (cached per-hour)                       BUG #7 FIX
             if current_time.hour != self._last_session_hour:
                 self._update_session(current_time)
                 self._last_session_hour = current_time.hour
 
-            # Step 4 — indicators only when their TF bar completes
             if completed.get("H1"):
                 self._update_h1_indicators()
             if completed.get("H4"):
@@ -218,11 +196,9 @@ class EnhancedBacktestEngine:
             if completed.get("M15"):
                 self._update_m15_indicators()
 
-            # Step 5 — regime (every M15 or on H4 completion)
             if completed.get("M15") or completed.get("H4"):
                 self._update_regime(current_time)
 
-            # Step 6 — process kill switches
             kill_results = run_all_kill_switches(
                 self.state, current_time,
                 self.data_feed.get_upcoming_events(current_time),
@@ -230,27 +206,18 @@ class EnhancedBacktestEngine:
             for key, value in kill_results.get("state_updates", {}).items():
                 setattr(self.state, key, value)
 
-            # Step 7 — process pending order fills
             self._process_pending_orders(bar, current_time)
-
-            # Step 8 — manage open positions
             self._manage_positions(bar, current_time)
 
-            # Step 9 — compute Asian range after 07:00 UTC
             if completed.get("M15"):
                 self._update_range_data(current_time)
 
-            # Step 10 — evaluate strategies on every M15
             if completed.get("M15") and kill_results.get("trading_enabled", True):
                 self._evaluate_strategies(current_time)
 
-            # Step 11 — record equity curve on every M15
             if completed.get("M15"):
                 self._record_equity(current_time, bar["close"])
 
-        # ── END OF LOOP ───────────────────────────────────────────────── #
-
-        # Force-close any remaining open positions at last bar close
         if self.open_positions:
             last_bar = self.bar_buffer.get_last_bar("M5")
             if last_bar:
@@ -258,7 +225,6 @@ class EnhancedBacktestEngine:
                     last_bar["close"], last_bar["time"], "BACKTEST_END"
                 )
 
-        # BUG #13 FIX: reconcile positions at end
         self._reconcile_positions()
 
         logger.info(
@@ -276,18 +242,12 @@ class EnhancedBacktestEngine:
         )
 
     # ================================================================== #
-    # INTERNAL — SESSION / REGIME / INDICATORS                           #
+    # SESSION / REGIME / INDICATORS
     # ================================================================== #
 
     def _check_daily_reset(self, current_time: datetime) -> None:
-        """
-        Reset ALL daily-scoped flags at midnight UTC.
-        BUG #2 FIX: now resets every flag that SimulatedState tracks per-day,
-        matching live system on_new_day() behaviour exactly.
-        """
         day = current_time.timetuple().tm_yday
         if self._current_day is not None and day != self._current_day:
-            # ── S1 family ──
             self.state.s1_family_attempts_today  = 0
             self.state.s1f_attempts_today        = 0
             self.state.s1d_ema_touched_today     = False
@@ -295,14 +255,11 @@ class EnhancedBacktestEngine:
             self.state.s1e_pyramid_done          = False
             self.state.s1f_post_tk_active        = False
             self.state.s1b_pending_ticket        = None
-            # ── S2 ──
             self.state.s2_fired_today            = False
-            # ── S3 ──
             self.state.s3_fired_today            = False
             self.state.s3_sweep_candle_time      = None
             self.state.s3_sweep_low              = 0.0
             self.state.s3_sweep_direction        = None
-            # ── S4 / S5 / S6 / S7 / S8 ──
             self.state.s4_fired_today            = False
             self.state.s5_fired_today            = False
             self.state.s6_placed_today           = False
@@ -314,57 +271,45 @@ class EnhancedBacktestEngine:
             self.state.s8_spike_low              = 0.0
             self.state.s8_spike_direction        = None
             self.state.s8_confirmation_passed    = False
-            # ── R3 ──
             self.state.r3_fired_today            = False
-            # ── Risk ──
             self.state.stop_hunt_detected        = False
             self.state.failed_breakout_flag      = False
             self.state.failed_breakout_direction = None
             self.state.consecutive_m5_losses     = 0
-            # ── Daily P&L / counters ──
             self.state.daily_pnl                 = 0.0
             self.state.daily_trades              = 0
             self.state.daily_commission_paid     = 0.0
-            # ── Range ──
             self.state.range_computed            = False
-            # ── Session reset (force re-evaluate at midnight) ──
             self._last_session_hour              = -1
-
             logger.debug(f"Full daily reset at {current_time.date()}")
-
         self._current_day = day
 
     def _update_session(self, current_time: datetime) -> None:
-        """Update session using the same util as the live system."""
         from utils.session import get_session_for_datetime
         self.state.current_session = get_session_for_datetime(current_time)
 
     def _update_h1_indicators(self) -> None:
-        h1_df = self.bar_buffer.get_series("H1", count=200)   # BUG #6 FIX: cap series
+        h1_df = self.bar_buffer.get_series("H1", count=200)
         if len(h1_df) < 20:
             return
-
         atr_mode   = self.config.get("ATR_MAMODE", "RMA")
         atr_period = self.config.get("ATR_PERIOD", 14)
-
         atr_series = ta.atr(h1_df["high"], h1_df["low"], h1_df["close"],
                             length=atr_period, mamode=atr_mode)
         if atr_series is not None and not atr_series.empty:
             vals = atr_series.dropna()
             if len(vals) > 0:
-                self._last_atr_h1_raw       = float(vals.iloc[-1])
-                self.state.last_atr_h1_raw  = self._last_atr_h1_raw
-                self._last_atr_pct_h1       = compute_atr_percentile(   # BUG #10 FIX
+                self._last_atr_h1_raw      = float(vals.iloc[-1])
+                self.state.last_atr_h1_raw = self._last_atr_h1_raw
+                self._last_atr_pct_h1      = compute_atr_percentile(
                     atr_series, self._last_atr_h1_raw
                 )
-                self.state.last_atr_pct_h1  = self._last_atr_pct_h1
-
+                self.state.last_atr_pct_h1 = self._last_atr_pct_h1
         ema = ta.ema(h1_df["close"], length=20)
         if ema is not None and not ema.empty:
             v = ema.dropna()
             if len(v) > 0:
                 self._last_ema20_h1 = float(v.iloc[-1])
-
         rsi = ta.rsi(h1_df["close"], length=14)
         if rsi is not None and not rsi.empty:
             v = rsi.dropna()
@@ -372,18 +317,15 @@ class EnhancedBacktestEngine:
                 self._last_rsi_h1 = float(v.iloc[-1])
 
     def _update_h4_indicators(self) -> None:
-        h4_df = self.bar_buffer.get_series("H4", count=100)   # BUG #6 FIX: cap series
+        h4_df = self.bar_buffer.get_series("H4", count=100)
         if len(h4_df) < 30:
             return
-
         adx_df = ta.adx(h4_df["high"], h4_df["low"], h4_df["close"], length=14)
         if adx_df is not None and "ADX_14" in adx_df.columns:
             v = adx_df["ADX_14"].dropna()
             if len(v) > 0:
                 self._last_adx_h4      = float(v.iloc[-1])
                 self.state.last_adx_h4 = self._last_adx_h4
-
-            # BUG #1 FIX: update DI+ / DI- in state
             if "DMP_14" in adx_df.columns:
                 v_dmp = adx_df["DMP_14"].dropna()
                 if len(v_dmp) > 0:
@@ -394,10 +336,9 @@ class EnhancedBacktestEngine:
                     self.state.last_di_minus_h4 = float(v_dmn.iloc[-1])
 
     def _update_d1_indicators(self) -> None:
-        d1_df = self.bar_buffer.get_series("D1", count=50)    # BUG #6 FIX: cap series
+        d1_df = self.bar_buffer.get_series("D1", count=50)
         if len(d1_df) < 16:
             return
-
         atr_mode = self.config.get("ATR_MAMODE", "RMA")
         atr_s    = ta.atr(d1_df["high"], d1_df["low"], d1_df["close"],
                           length=14, mamode=atr_mode)
@@ -407,10 +348,9 @@ class EnhancedBacktestEngine:
                 self._last_daily_atr = float(v.iloc[-1])
 
     def _update_m15_indicators(self) -> None:
-        m15_df = self.bar_buffer.get_series("M15", count=100) # BUG #6 FIX: cap series
+        m15_df = self.bar_buffer.get_series("M15", count=100)
         if len(m15_df) < 20:
             return
-
         atr_mode = self.config.get("ATR_MAMODE", "RMA")
         atr_s    = ta.atr(m15_df["high"], m15_df["low"], m15_df["close"],
                           length=14, mamode=atr_mode)
@@ -421,18 +361,13 @@ class EnhancedBacktestEngine:
                 self.state.last_atr_m15 = self._last_atr_m15
 
     def _update_regime(self, current_time: datetime) -> None:
-        """
-        Update regime — mirrors live classify_regime() exactly.
-        BUG #9 FIX: SUPER_TRENDING regime now implemented.
-        """
         spread     = self.data_feed.get_current_spread(current_time)
         avg_spread = (
             sum(self.data_feed.spreads.values()) / len(self.data_feed.spreads)
             if self.data_feed.spreads else 25.0
         )
         spread_ratio = spread / avg_spread if avg_spread > 0 else 1.0
-
-        has_event = len(self.data_feed.get_upcoming_events(current_time)) > 0
+        has_event    = len(self.data_feed.get_upcoming_events(current_time)) > 0
 
         no_trade_thresh = self.config.get("ATR_PCT_NO_TRADE_THRESHOLD",  95)
         unstable_thresh = self.config.get("ATR_PCT_UNSTABLE_THRESHOLD",  85)
@@ -452,7 +387,7 @@ class EnhancedBacktestEngine:
             regime, mult = "RANGING_CLEAR", 0.7
         else:
             sess_mult = 1.0 if session in ("LONDON_NY_OVERLAP", "LONDON", "NY") else 0.7
-            if adx > 35 and atr_pct > super_thresh:   # BUG #9 FIX: SUPER_TRENDING
+            if adx > 35 and atr_pct > super_thresh:
                 regime, mult = "SUPER_TRENDING", round(1.2 * sess_mult, 3)
             elif adx > 26:
                 regime, mult = "NORMAL_TRENDING", round(1.0 * sess_mult, 3)
@@ -463,19 +398,12 @@ class EnhancedBacktestEngine:
         self.state.size_multiplier = mult
 
     def _update_range_data(self, current_time: datetime) -> None:
-        """
-        Compute Asian range for S1/S3/S6 after 07:00 UTC.
-        BUG #5 FIX: uses recent slice via data_feed.get_bars(), not full BarBuffer.
-        """
         if current_time.hour < 7 or self.state.range_computed:
             return
-
-        # BUG #5 FIX: fetch only last ~300 bars instead of full BarBuffer series
         recent = self.data_feed.get_bars("M5", current_time, count=300)
         if not recent:
             return
         m5_df = pd.DataFrame(recent)
-
         today = current_time.date()
         mask  = (
             (m5_df["time"].dt.date == today) &
@@ -485,15 +413,11 @@ class EnhancedBacktestEngine:
         asian = m5_df[mask]
         if len(asian) < 12:
             return
-
         rh = float(asian["high"].max())
         rl = float(asian["low"].min())
         rs = rh - rl
-
-        min_range = self.config.get("MIN_RANGE_SIZE_PTS", 10)
-        if rs < min_range:
+        if rs < self.config.get("MIN_RANGE_SIZE_PTS", 10):
             return
-
         self.state.range_high     = rh
         self.state.range_low      = rl
         self.state.range_size     = rs
@@ -501,19 +425,18 @@ class EnhancedBacktestEngine:
         logger.debug(f"Asian range: {rl:.2f} - {rh:.2f} (size={rs:.2f})")
 
     # ================================================================== #
-    # INTERNAL — ORDER PROCESSING                                         #
+    # ORDER PROCESSING
     # ================================================================== #
 
     def _process_pending_orders(
         self, bar: dict, current_time: datetime
     ) -> None:
-        """Check pending orders for fills using the bar's OHLC."""
         if not self.pending_orders:
             return
 
         current_price = bar["close"]
-        remaining:     List[SimOrder] = []
-        filled_tags:   set            = set()
+        remaining:    List[SimOrder] = []
+        filled_tags:  set            = set()
 
         for order in self.pending_orders:
             if order.expiry and current_time >= order.expiry:
@@ -545,7 +468,6 @@ class EnhancedBacktestEngine:
             else:
                 remaining.append(order)
 
-        # OCO: remove orders whose linked tag just filled
         new_remaining: List[SimOrder] = []
         for order in remaining:
             if order.linked_tag and order.linked_tag in filled_tags:
@@ -559,18 +481,12 @@ class EnhancedBacktestEngine:
         self.pending_orders = new_remaining
 
     # ================================================================== #
-    # INTERNAL — POSITION MANAGEMENT                                      #
+    # POSITION MANAGEMENT
     # ================================================================== #
 
     def _manage_positions(
         self, bar: dict, current_time: datetime
     ) -> None:
-        """
-        Manage SL/TP, BE, partial exit, trailing stop for all open positions.
-        BUG #3 FIX: R3 positions routed to _manage_r3_position().
-        BUG #4 FIX: _update_position_state("CLOSE") called on every exit path.
-        BUG #14 FIX: partial exit logic implemented.
-        """
         close_price = bar["close"]
         still_open: List[SimPosition] = []
 
@@ -583,7 +499,6 @@ class EnhancedBacktestEngine:
                 still_open.append(pos)
                 continue
 
-            # --- update MFE ---
             if pos.direction == "LONG":
                 pos.max_favorable = max(pos.max_favorable, bar["high"] - pos.entry_price)
             else:
@@ -592,16 +507,12 @@ class EnhancedBacktestEngine:
             r = pos.current_r(close_price)
             pos.max_r = max(pos.max_r, r)
 
-            # BUG #3 FIX: R3 special management (30-min time exit)
             if pos.strategy == "R3_CAL_MOMENTUM":
                 self._manage_r3_position(pos, close_price, current_time, {})
-                # If R3 was closed inside _manage_r3_position, it was removed
-                # from self.open_positions; only keep if still open.
                 if pos in self.open_positions:
                     still_open.append(pos)
                 continue
 
-            # --- direction-aware SL / TP hit check ---
             sl_hit = (
                 (pos.direction == "LONG"  and bar["low"]  <= pos.current_sl) or
                 (pos.direction == "SHORT" and bar["high"] >= pos.current_sl)
@@ -616,15 +527,14 @@ class EnhancedBacktestEngine:
             if tp_hit:
                 trade = self._build_trade_record(pos, pos.tp, current_time, "TP")
                 self._record_trade(trade)
-                self._update_position_state(pos, "CLOSE")   # BUG #4 FIX
+                self._update_position_state(pos, "CLOSE")
                 continue
             if sl_hit:
                 trade = self._build_trade_record(pos, pos.current_sl, current_time, "SL")
                 self._record_trade(trade)
-                self._update_position_state(pos, "CLOSE")   # BUG #4 FIX
+                self._update_position_state(pos, "CLOSE")
                 continue
 
-            # BUG #14 FIX: partial exit at 1R (if not already done)
             partial_r = self.config.get("PARTIAL_EXIT_R", 1.0)
             if not pos.partial_done and r >= partial_r and pos.lots >= 0.02:
                 half_lots = round(pos.lots / 2.0, 2)
@@ -660,22 +570,13 @@ class EnhancedBacktestEngine:
                 pos.lots         -= half_lots
                 pos.partial_done  = True
                 self.state.position_partial_done = True
-                logger.debug(
-                    f"Partial exit: {pos.strategy} {pos.direction} "
-                    f"half @ {partial_exit_price:.2f} (R={partial_r})"
-                )
 
-            # --- BE activation ---
             be_r = self.config.get("BE_ACTIVATION_R", 1.5)
             if not pos.be_activated and r >= be_r:
                 pos.current_sl   = pos.entry_price
                 pos.be_activated = True
                 self.state.position_be_activated = True
-                logger.debug(
-                    f"BE activated: {pos.strategy} {pos.direction} @ {pos.entry_price:.2f}"
-                )
 
-            # --- ATR trailing stop (after BE) ---
             if pos.be_activated:
                 trail_mult = self.config.get("ATR_TRAIL_MULTIPLIER", 2.5)
                 trail_dist = self._last_atr_m15 * trail_mult
@@ -699,27 +600,35 @@ class EnhancedBacktestEngine:
         current_time: datetime,
         indicators: Dict[str, Any],
     ) -> None:
-        """
-        Manage R3 position — hard exit after 30 minutes.
-        BUG #3 FIX: This method is now actually called from _manage_positions().
-        BUG #4 FIX: _update_position_state("CLOSE") called on exit.
-        """
         elapsed = (current_time - position.entry_time).total_seconds() / 60.0
         if elapsed >= 30:
             trade = self._build_trade_record(
                 position, current_price, current_time, "R3_TIME_EXIT"
             )
             self._record_trade(trade)
-            self._update_position_state(position, "CLOSE")  # BUG #4 FIX
+            self._update_position_state(position, "CLOSE")
             if position in self.open_positions:
                 self.open_positions.remove(position)
 
     # ================================================================== #
-    # INTERNAL — STRATEGY EVALUATION                                      #
+    # STRATEGY EVALUATION
     # ================================================================== #
 
     def _evaluate_strategies(self, current_time: datetime) -> None:
-        """Evaluate all enabled strategies and queue new orders."""
+        """
+        Evaluate all enabled strategies and queue new orders.
+
+        BUG-S1a FIX: Apply state_updates from each strategy result immediately
+        via setattr() so that the next strategy in the loop sees the updated
+        s1_family_attempts_today (and any other counter) on the SAME bar.
+        Previously state_updates were applied inside the loop but the counter
+        write for S1 could be lost if two strategies both emitted the same key;
+        now each result is flushed before moving to the next strategy.
+
+        BUG-S6S7 FIX: s6_placed_today / s7_placed_today are set BEFORE calling
+        the respective evaluate(), not in a post-loop block that ran after ALL
+        strategies had already placed orders.
+        """
         daily_loss_limit = self.config.get("KS3_DAILY_LOSS_LIMIT_PCT", -0.04)
         if self.state.balance > 0:
             if (self.state.daily_pnl / self.state.balance) <= daily_loss_limit:
@@ -731,7 +640,13 @@ class EnhancedBacktestEngine:
 
             strategy = self.strategy_instances[name]
 
-            # BUG #6 FIX: cap series to last N bars; strategies need max ~100–200
+            # BUG-S6S7 FIX: guard BEFORE calling evaluate so the strategy
+            # itself sees the flag as True and returns early on repeat calls.
+            if name == "S6_ASIAN_BRK" and self.state.s6_placed_today:
+                continue
+            if name == "S7_DAILY_STRUCT" and self.state.s7_placed_today:
+                continue
+
             bar_data = {
                 "M5":  self.bar_buffer.get_series("M5",  count=100),
                 "M15": self.bar_buffer.get_series("M15", count=200),
@@ -761,17 +676,20 @@ class EnhancedBacktestEngine:
                     f"{order.order_type} @ {order.price:.2f}"
                 )
 
+            # BUG-S1a FIX: flush state_updates immediately after each strategy
+            # so the next strategy sees the freshly updated counter.
             for key, value in result.state_updates.items():
                 setattr(self.state, key, value)
 
-        for order in self.pending_orders:
-            if order.strategy == "S7_DAILY_STRUCT":
-                self.state.s7_placed_today = True
-            elif order.strategy == "S6_ASIAN_BRK":
-                self.state.s6_placed_today = True
+            # BUG-S6S7 FIX: mark placed flags right after orders are queued
+            if result.orders:
+                if name == "S6_ASIAN_BRK":
+                    self.state.s6_placed_today = True
+                elif name == "S7_DAILY_STRUCT":
+                    self.state.s7_placed_today = True
 
     # ================================================================== #
-    # INTERNAL — TRADE RECORDING / EQUITY                                 #
+    # TRADE RECORDING / EQUITY
     # ================================================================== #
 
     def _build_trade_record(
@@ -784,14 +702,11 @@ class EnhancedBacktestEngine:
         commission = self.config.get("COMMISSION_PER_LOT_ROUND_TRIP", 7.0) * pos.lots
         pnl_gross  = pos.unrealized_pnl(exit_price)
         pnl_net    = pnl_gross - commission
-
         stop_dist  = abs(pos.entry_price - pos.stop_price_original)
         r_multiple = (
             pnl_gross / (stop_dist * 100.0 * pos.lots)
             if (stop_dist > 0 and pos.lots > 0) else 0.0
         )
-
-        # BUG #8 FIX: TradeRecord has no max_r field — removed from kwargs
         return TradeRecord(
             strategy=pos.strategy,
             direction=pos.direction,
@@ -815,12 +730,10 @@ class EnhancedBacktestEngine:
         self.state.balance      += trade.pnl
         self.state.daily_pnl    += trade.pnl
         self.state.daily_trades += 1
-
         if trade.pnl >= 0:
             self.state.consecutive_losses = 0
         else:
             self.state.consecutive_losses += 1
-
         logger.debug(
             f"Trade closed: {trade.strategy} {trade.direction} "
             f"P&L=${trade.pnl:+.2f} R={trade.r_multiple:+.2f} ({trade.exit_reason})"
@@ -833,12 +746,10 @@ class EnhancedBacktestEngine:
         equity                 = self.state.balance + unrealized
         self.state.equity      = equity
         self.state.peak_equity = max(self.state.peak_equity, equity)
-
         dd = (
             (self.state.peak_equity - equity) / self.state.peak_equity
             if self.state.peak_equity > 0 else 0.0
         )
-
         self.equity_curve.append(EquityPoint(
             timestamp=current_time,
             equity=equity,
@@ -846,7 +757,7 @@ class EnhancedBacktestEngine:
         ))
 
     # ================================================================== #
-    # INTERNAL — HELPERS                                                   #
+    # HELPERS
     # ================================================================== #
 
     def _create_position_from_order(
@@ -871,7 +782,6 @@ class EnhancedBacktestEngine:
         )
 
     def _update_position_state(self, position: SimPosition, action: str) -> None:
-        """Update SimulatedState tracking fields based on position open/close."""
         if position.strategy == "S8_ATR_SPIKE":
             if action == "OPEN":
                 self.state.s8_open_ticket         = position.strategy
@@ -889,7 +799,6 @@ class EnhancedBacktestEngine:
                 self.state.s8_trade_direction     = None
                 self.state.s8_be_activated        = False
                 self.state.s8_open_time_utc       = None
-
         elif position.strategy == "R3_CAL_MOMENTUM":
             if action == "OPEN":
                 self.state.r3_open_ticket = position.strategy
@@ -903,9 +812,7 @@ class EnhancedBacktestEngine:
                 self.state.r3_entry_price = 0.0
                 self.state.r3_stop_price  = 0.0
                 self.state.r3_tp_price    = 0.0
-
         else:
-            # Trend-family
             if action == "OPEN":
                 self.state.trend_family_occupied  = True
                 self.state.trend_family_strategy  = position.strategy
@@ -930,7 +837,6 @@ class EnhancedBacktestEngine:
     def _close_all_positions(
         self, price: float, time: datetime, reason: str
     ) -> None:
-        """Force-close all open positions at end of backtest."""
         for pos in list(self.open_positions):
             trade = self._build_trade_record(pos, price, time, reason)
             self._record_trade(trade)
@@ -938,18 +844,12 @@ class EnhancedBacktestEngine:
         self.open_positions = []
 
     def _reconcile_positions(self) -> None:
-        """
-        Log any ghost/orphan positions (mirrors live reconciliation).
-        BUG #13 FIX: now called at end of run().
-        """
         believed = set()
         for attr in ("open_position", "s8_open_ticket", "r3_open_ticket"):
             val = getattr(self.state, attr, None)
             if val:
                 believed.add(val)
-
         actual = {pos.strategy for pos in self.open_positions}
-
         for ghost in (believed - actual):
             logger.critical(f"Ghost position detected: {ghost}")
         for orphan in (actual - believed):
