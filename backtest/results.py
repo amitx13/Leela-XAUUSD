@@ -48,6 +48,10 @@ class BacktestResults:
         self.end_date      = end_date
         self.strategies    = strategies
 
+    def _analysis_trades(self) -> list[TradeRecord]:
+        """Exclude synthetic end-of-backtest liquidations from analytics metrics."""
+        return [t for t in self.trades if t.exit_reason != "BACKTEST_END"]
+
     # =========================================================================
     # SUMMARY
     # =========================================================================
@@ -68,15 +72,17 @@ class BacktestResults:
             lines.append(f"Total Return:    {total_return:+.2f}%")
         lines.append("")
 
+        analysis_trades = self._analysis_trades()
+
         # Overall metrics
-        overall = self._compute_metrics(self.trades)
+        overall = self._compute_metrics(analysis_trades)
         lines.append("── OVERALL ─────────────────────────────────────────────")
         lines.extend(self._format_metrics(overall))
         lines.append("")
 
         # Per-strategy breakdown
         strategy_trades: dict[str, list[TradeRecord]] = {}
-        for trade in self.trades:
+        for trade in analysis_trades:
             strategy_trades.setdefault(trade.strategy, []).append(trade)
 
         for strat in sorted(strategy_trades.keys()):
@@ -147,8 +153,8 @@ class BacktestResults:
             "profit_factor":          gross_profit / gross_loss if gross_loss > 0 else float("inf"),
             "expectancy_r":           float(np.mean(r_multiples)),
             "avg_r":                  float(np.mean(r_multiples)),
-            "median_r":               float(np.median(r_multiples)),      # NEW: robust to outliers
-            "pct_positive_r":         float(np.mean([r > 0 for r in r_multiples]) * 100),  # NEW
+            "median_r":               float(np.median(r_multiples)),
+            "pct_positive_r":         float(np.mean([r > 0 for r in r_multiples]) * 100),
             "max_consecutive_losses": max_consec,
             "total_commission":       sum(t.commission for t in trades),
         }
@@ -201,14 +207,14 @@ class BacktestResults:
         Now sums net P&L of all trades closed each calendar day.
         Days with no closed trades are assigned 0.0 so the denominator is correct.
         """
-        if not self.trades:
+        analysis_trades = self._analysis_trades()
+        if not analysis_trades:
             return pd.Series(dtype=float)
 
-        df = self.to_dataframe()
+        df = self.to_dataframe(include_backtest_end=False)
         df["date"] = pd.to_datetime(df["exit_time"]).dt.normalize()
         daily = df.groupby("date")["pnl"].sum()
 
-        # Fill calendar days with no trades as 0
         idx = pd.date_range(self.start_date.date(), self.end_date.date(), freq="D")
         daily = daily.reindex(idx, fill_value=0.0)
         return daily
@@ -250,7 +256,7 @@ class BacktestResults:
         returns   = daily / self.initial_balance
         downside  = returns[returns < mar] - mar
         if len(downside) == 0:
-            return float("inf")  # No losing days — perfect
+            return float("inf")
 
         downside_std = float(np.sqrt(np.mean(downside ** 2)))
         if downside_std == 0:
@@ -298,7 +304,8 @@ class BacktestResults:
         Use this to check whether E(R) holds across time, not to optimise params.
         For true parameter robustness, run separate optimisation passes.
         """
-        if not self.trades:
+        analysis_trades = self._analysis_trades()
+        if not analysis_trades:
             return "No trades to analyze."
 
         lines: list[str] = []
@@ -319,8 +326,8 @@ class BacktestResults:
                 break
             test_end = min(test_end, self.end_date)
 
-            train_trades = [t for t in self.trades if window_start <= t.entry_time < train_end]
-            test_trades  = [t for t in self.trades if train_end   <= t.entry_time < test_end]
+            train_trades = [t for t in analysis_trades if window_start <= t.entry_time < train_end]
+            test_trades  = [t for t in analysis_trades if train_end   <= t.entry_time < test_end]
 
             window_num += 1
             lines.append(
@@ -384,10 +391,11 @@ class BacktestResults:
         Answers: 'Which regimes are actually profitable? Am I losing money
         trading WEAK_TRENDING or RANGING_CLEAR regimes?'
         """
-        if not self.trades:
+        analysis_trades = self._analysis_trades()
+        if not analysis_trades:
             return pd.DataFrame()
 
-        df = self.to_dataframe()
+        df = self.to_dataframe(include_backtest_end=False)
         rows = []
         for regime, grp in df.groupby("regime_at_entry"):
             winners = grp[grp["pnl"] > 0]
@@ -415,10 +423,11 @@ class BacktestResults:
         Useful for spotting strategies that hold too long relative to their
         intended timeframe (e.g. R3 should be <30 min; S1 should be <4 hours).
         """
-        if not self.trades:
+        analysis_trades = self._analysis_trades()
+        if not analysis_trades:
             return pd.DataFrame()
 
-        df = self.to_dataframe()
+        df = self.to_dataframe(include_backtest_end=False)
         df["duration_min"] = (
             pd.to_datetime(df["exit_time"]) - pd.to_datetime(df["entry_time"])
         ).dt.total_seconds() / 60.0
@@ -448,12 +457,13 @@ class BacktestResults:
         Returns:
             DataFrame with columns: trade_num, entry_time, rolling_e_r
         """
-        if len(self.trades) < window:
+        analysis_trades = self._analysis_trades()
+        if len(analysis_trades) < window:
             return pd.DataFrame()
 
         rows = []
-        r_vals = [t.r_multiple for t in self.trades]
-        times  = [t.entry_time for t in self.trades]
+        r_vals = [t.r_multiple for t in analysis_trades]
+        times  = [t.entry_time for t in analysis_trades]
 
         for i in range(window - 1, len(r_vals)):
             window_r = r_vals[i - window + 1 : i + 1]
@@ -477,10 +487,11 @@ class BacktestResults:
         and cumulative P&L — critical for spotting seasonal patterns and
         consecutive losing months.
         """
-        if not self.trades:
+        analysis_trades = self._analysis_trades()
+        if not analysis_trades:
             return pd.DataFrame()
 
-        df = self.to_dataframe()
+        df = self.to_dataframe(include_backtest_end=False)
         df["month"] = pd.to_datetime(df["exit_time"]).dt.to_period("M")
 
         rows = []
@@ -511,12 +522,13 @@ class BacktestResults:
     # DATA EXPORT
     # =========================================================================
 
-    def to_dataframe(self) -> pd.DataFrame:
+    def to_dataframe(self, include_backtest_end: bool = True) -> pd.DataFrame:
         """Convert trades to a pandas DataFrame for further analysis."""
-        if not self.trades:
+        trades = self.trades if include_backtest_end else self._analysis_trades()
+        if not trades:
             return pd.DataFrame()
         records = []
-        for t in self.trades:
+        for t in trades:
             records.append({
                 "strategy":        t.strategy,
                 "direction":       t.direction,
@@ -550,7 +562,7 @@ class BacktestResults:
         """Returns metrics dict per strategy."""
         result: dict[str, dict] = {}
         strategy_trades: dict[str, list[TradeRecord]] = {}
-        for trade in self.trades:
+        for trade in self._analysis_trades():
             strategy_trades.setdefault(trade.strategy, []).append(trade)
         for strat, s_trades in strategy_trades.items():
             result[strat] = self._compute_metrics(s_trades)
@@ -560,7 +572,9 @@ class BacktestResults:
         """Breakdown of trades by exit reason."""
         if not self.trades:
             return pd.DataFrame()
-        df = self.to_dataframe()
+        df = self.to_dataframe(include_backtest_end=False)
+        if df.empty:
+            return pd.DataFrame()
         return df.groupby("exit_reason").agg(
             count=("pnl", "count"),
             total_pnl=("pnl", "sum"),
@@ -599,7 +613,6 @@ class BacktestResults:
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
 
-        # Equity curve
         ax1.plot(eq_df["timestamp"], eq_df["equity"],
                  color="steelblue", linewidth=1)
         ax1.axhline(y=self.initial_balance, color="gray",
@@ -614,7 +627,6 @@ class BacktestResults:
         ax1.grid(True, alpha=0.3)
         ax1.legend(fontsize=8)
 
-        # Drawdown
         ax2.fill_between(eq_df["timestamp"],
                          -eq_df["drawdown_pct"] * 100, 0,
                          color="salmon", alpha=0.5)
@@ -624,7 +636,6 @@ class BacktestResults:
                     alpha=0.7, label="KS6 limit (-12%)")
         ax2.legend(fontsize=8)
 
-        # Rolling E(R)
         if not roll_er.empty and n_rows == 3:
             ax3 = fig.add_subplot(gs[2], sharex=ax1)
             ax3.plot(roll_er["entry_time"], roll_er["rolling_e_r"],
