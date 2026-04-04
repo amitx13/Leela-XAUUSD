@@ -167,6 +167,15 @@ class SimulatedState:
     s8_confirmation_passed: bool = False
     s2_fired_today: bool = False
 
+    # S1d / S1e pyramid tracking
+    s1d_pyramid_count: int = 0   # number of M5-pullback pyramids added today
+    s1e_pyramid_count: int = 0   # number of aggressive pyramids added today
+
+    # S1f post-time-kill re-entry tracking
+    s1f_reentered_today: bool = False          # re-entry already taken today
+    s1f_killed_position_profitable: bool = False  # was the TK'd position in profit?
+    s1f_original_size: float = 0.0            # lot size of original S1 position
+
     # R3 state (independent lane)
     r3_armed: bool = False
     r3_arm_time: Optional[datetime] = None
@@ -177,6 +186,10 @@ class SimulatedState:
     # Position state (enhanced for independent lanes)
     trend_family_occupied: bool = False
     trend_family_strategy: Optional[str] = None
+    # Direction of the currently open trend-family position.
+    # Set to pos.direction on OPEN, cleared to None on CLOSE.
+    # Read by S1d and S1e to determine pyramid order direction.
+    trend_trade_direction: Optional[str] = None
     reversal_family_occupied: bool = False
     open_position: Optional[int] = None  # Main trend family ticket
     entry_price: float = 0.0
@@ -292,6 +305,11 @@ class SimulatedState:
             "s8_spike_direction": self.s8_spike_direction,
             "s8_confirmation_passed": self.s8_confirmation_passed,
             "s2_fired_today": self.s2_fired_today,
+            "s1d_pyramid_count": self.s1d_pyramid_count,
+            "s1e_pyramid_count": self.s1e_pyramid_count,
+            "s1f_reentered_today": self.s1f_reentered_today,
+            "s1f_killed_position_profitable": self.s1f_killed_position_profitable,
+            "s1f_original_size": self.s1f_original_size,
             
             # R3
             "r3_armed": self.r3_armed,
@@ -303,6 +321,7 @@ class SimulatedState:
             # Position state
             "trend_family_occupied": self.trend_family_occupied,
             "trend_family_strategy": self.trend_family_strategy,
+            "trend_trade_direction": self.trend_trade_direction,
             "reversal_family_occupied": self.reversal_family_occupied,
             "open_position": self.open_position,
             "entry_price": self.entry_price,
