@@ -24,12 +24,17 @@ Fixes applied (v2 — full review pass):
  17. Session classification uses utils.session.get_session_for_datetime()
 
 Fixes applied (v3 — 0-trades diagnosis):
- 18. S1 counter race: s1_family_attempts_today written via setattr BEFORE next
-     strategy loop iteration, not deferred via state_updates dict              [BUG-S1a]
- 19. S6/S7 placed-today flags set BEFORE evaluate() is called, not AFTER the
-     full strategy loop (loop-end block could never block same-day repeats)    [BUG-S6S7]
- 20. MARKET orders fill immediately on same bar at bar close (was silently
-     dropped when check_fill returned filled=False for MARKET type)            [BUG-FILL]
+ 18. S1 counter race: state_updates flushed per-strategy via setattr           [BUG-S1a]
+ 19. S6/S7 placed-today flags set BEFORE evaluate() guard, not post-loop       [BUG-S6S7]
+ 20. S4 daily fire guard added in s4_london_pull.py                            [BUG-S4a]
+
+Fixes applied (v4 — fill accuracy + loop safety):
+ 21. MARKET/STOP/LIMIT orders use deterministic price-cross fill logic;
+     bar high/low passed into check_fill() for accurate trigger detection      [BUG-FILL]
+ 22. _check_daily_reset() preserves consecutive_losses across midnight —
+     only consecutive_m5_losses (intra-day micro-counter) resets               [BUG-KS5]
+ 23. _manage_r3_position() no longer calls open_positions.remove() inside
+     the positions iteration loop; uses still_open list pattern                [BUG-R3LOOP]
 """
 
 import sys
@@ -54,7 +59,6 @@ from backtest.results import BacktestResults
 
 logger = logging.getLogger("backtest.enhanced_engine")
 
-# Add parent dir to path for config imports
 _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
@@ -136,8 +140,8 @@ class EnhancedBacktestEngine:
         self._last_rsi_h1:     Optional[float] = None
         self._last_daily_atr:  Optional[float] = None
 
-        self._current_day:        Optional[int] = None
-        self._last_session_hour:  int           = -1
+        self._current_day:       Optional[int] = None
+        self._last_session_hour: int           = -1
 
         logger.info("Enhanced backtest engine initialised")
         logger.info(f"Strategies : {self.strategies}")
@@ -246,6 +250,17 @@ class EnhancedBacktestEngine:
     # ================================================================== #
 
     def _check_daily_reset(self, current_time: datetime) -> None:
+        """
+        Reset daily counters at midnight.
+
+        BUG-KS5 FIX: consecutive_losses is intentionally NOT reset here.
+        It is a multi-day circuit breaker (KS5). The live system preserves
+        it across midnight; resetting it would prevent KS5 from ever firing
+        during a multi-day losing streak in the backtest.
+
+        consecutive_m5_losses IS reset — it is an intra-day micro-counter
+        used for short-burst halt logic only.
+        """
         day = current_time.timetuple().tm_yday
         if self._current_day is not None and day != self._current_day:
             self.state.s1_family_attempts_today  = 0
@@ -275,6 +290,7 @@ class EnhancedBacktestEngine:
             self.state.stop_hunt_detected        = False
             self.state.failed_breakout_flag      = False
             self.state.failed_breakout_direction = None
+            # consecutive_m5_losses resets daily; consecutive_losses does NOT
             self.state.consecutive_m5_losses     = 0
             self.state.daily_pnl                 = 0.0
             self.state.daily_trades              = 0
@@ -422,7 +438,7 @@ class EnhancedBacktestEngine:
         self.state.range_low      = rl
         self.state.range_size     = rs
         self.state.range_computed = True
-        logger.debug(f"Asian range: {rl:.2f} - {rh:.2f} (size={rs:.2f})")
+        logger.debug(f"Asian range: {rl:.2f} – {rh:.2f} (size={rs:.2f})")
 
     # ================================================================== #
     # ORDER PROCESSING
@@ -434,16 +450,21 @@ class EnhancedBacktestEngine:
         if not self.pending_orders:
             return
 
-        current_price = bar["close"]
-        remaining:    List[SimOrder] = []
-        filled_tags:  set            = set()
+        bar_high = float(bar.get("high", bar["close"]))
+        bar_low  = float(bar.get("low",  bar["close"]))
+        remaining:   List[SimOrder] = []
+        filled_tags: set            = set()
 
         for order in self.pending_orders:
             if order.expiry and current_time >= order.expiry:
                 logger.debug(f"Order expired: {order.strategy} {order.direction}")
                 continue
 
-            fill = self.execution_sim.check_fill(order, current_price, current_time)
+            # BUG-FILL FIX: pass bar_high / bar_low for accurate price-cross detection
+            fill = self.execution_sim.check_fill(
+                order, bar["close"], current_time,
+                bar_high=bar_high, bar_low=bar_low
+            )
 
             if fill.filled:
                 pos = self._create_position_from_order(order, fill, current_time)
@@ -508,10 +529,12 @@ class EnhancedBacktestEngine:
             pos.max_r = max(pos.max_r, r)
 
             if pos.strategy == "R3_CAL_MOMENTUM":
-                self._manage_r3_position(pos, close_price, current_time, {})
-                if pos in self.open_positions:
-                    still_open.append(pos)
-                continue
+                # BUG-R3LOOP FIX: pass still_open so removal happens via the
+                # same list that replaces open_positions at end of loop.
+                self._manage_r3_position(
+                    pos, close_price, current_time, {}, still_open
+                )
+                continue  # _manage_r3_position handles whether pos is kept
 
             sl_hit = (
                 (pos.direction == "LONG"  and bar["low"]  <= pos.current_sl) or
@@ -595,11 +618,19 @@ class EnhancedBacktestEngine:
 
     def _manage_r3_position(
         self,
-        position: SimPosition,
+        position:    SimPosition,
         current_price: float,
-        current_time: datetime,
-        indicators: Dict[str, Any],
+        current_time:  datetime,
+        indicators:    Dict[str, Any],
+        still_open:    List[SimPosition],
     ) -> None:
+        """
+        Manage R3 momentum position with 30-min time exit.
+
+        BUG-R3LOOP FIX: appends to still_open (passed from caller) instead
+        of calling self.open_positions.remove() inside the iteration loop,
+        which could raise ValueError or skip positions.
+        """
         elapsed = (current_time - position.entry_time).total_seconds() / 60.0
         if elapsed >= 30:
             trade = self._build_trade_record(
@@ -607,28 +638,15 @@ class EnhancedBacktestEngine:
             )
             self._record_trade(trade)
             self._update_position_state(position, "CLOSE")
-            if position in self.open_positions:
-                self.open_positions.remove(position)
+            # Do NOT append to still_open — position is closed
+        else:
+            still_open.append(position)
 
     # ================================================================== #
     # STRATEGY EVALUATION
     # ================================================================== #
 
     def _evaluate_strategies(self, current_time: datetime) -> None:
-        """
-        Evaluate all enabled strategies and queue new orders.
-
-        BUG-S1a FIX: Apply state_updates from each strategy result immediately
-        via setattr() so that the next strategy in the loop sees the updated
-        s1_family_attempts_today (and any other counter) on the SAME bar.
-        Previously state_updates were applied inside the loop but the counter
-        write for S1 could be lost if two strategies both emitted the same key;
-        now each result is flushed before moving to the next strategy.
-
-        BUG-S6S7 FIX: s6_placed_today / s7_placed_today are set BEFORE calling
-        the respective evaluate(), not in a post-loop block that ran after ALL
-        strategies had already placed orders.
-        """
         daily_loss_limit = self.config.get("KS3_DAILY_LOSS_LIMIT_PCT", -0.04)
         if self.state.balance > 0:
             if (self.state.daily_pnl / self.state.balance) <= daily_loss_limit:
@@ -640,8 +658,6 @@ class EnhancedBacktestEngine:
 
             strategy = self.strategy_instances[name]
 
-            # BUG-S6S7 FIX: guard BEFORE calling evaluate so the strategy
-            # itself sees the flag as True and returns early on repeat calls.
             if name == "S6_ASIAN_BRK" and self.state.s6_placed_today:
                 continue
             if name == "S7_DAILY_STRUCT" and self.state.s7_placed_today:
@@ -676,12 +692,10 @@ class EnhancedBacktestEngine:
                     f"{order.order_type} @ {order.price:.2f}"
                 )
 
-            # BUG-S1a FIX: flush state_updates immediately after each strategy
-            # so the next strategy sees the freshly updated counter.
+            # Flush state_updates immediately so next strategy sees fresh counters
             for key, value in result.state_updates.items():
                 setattr(self.state, key, value)
 
-            # BUG-S6S7 FIX: mark placed flags right after orders are queued
             if result.orders:
                 if name == "S6_ASIAN_BRK":
                     self.state.s6_placed_today = True
@@ -694,10 +708,10 @@ class EnhancedBacktestEngine:
 
     def _build_trade_record(
         self,
-        pos: SimPosition,
+        pos:        SimPosition,
         exit_price: float,
-        exit_time: datetime,
-        reason: str,
+        exit_time:  datetime,
+        reason:     str,
     ) -> TradeRecord:
         commission = self.config.get("COMMISSION_PER_LOT_ROUND_TRIP", 7.0) * pos.lots
         pnl_gross  = pos.unrealized_pnl(exit_price)
@@ -762,7 +776,7 @@ class EnhancedBacktestEngine:
 
     def _create_position_from_order(
         self,
-        order: SimOrder,
+        order:        SimOrder,
         fill,
         current_time: datetime,
     ) -> SimPosition:
