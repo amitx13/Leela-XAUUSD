@@ -112,22 +112,12 @@ def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optional[dict]:
-    """Compute Asian session range (00:00–07:00 UTC) from M5 bars."""
-    # FIX Performance: cap series to last 300 bars — not full history
-    m5_df = bar_buffer.get_series("M5", count=300)
-    if m5_df.empty:
+    """Compute Asian session range (00:00–07:00 UTC) from the latest 84 M5 bars."""
+    m5_df = bar_buffer.get_series("M5", count=84)
+    if m5_df.empty or len(m5_df) < 12:
         return None
-    today = current_time.date()
-    mask = (
-        (m5_df["time"].dt.date == today) &
-        (m5_df["time"].dt.hour >= 0) &
-        (m5_df["time"].dt.hour < 7)
-    )
-    asian_bars = m5_df[mask]
-    if len(asian_bars) < 12:
-        return None
-    rh = float(asian_bars["high"].max())
-    rl = float(asian_bars["low"].min())
+    rh = float(m5_df["high"].max())
+    rl = float(m5_df["low"].min())
     rs = rh - rl
     min_range = getattr(config, "MIN_RANGE_SIZE_PTS", 10)
     if rs < min_range:
@@ -416,7 +406,7 @@ def _calculate_lot_size(
     balance: float, stop_distance: float,
     size_multiplier: float, base_risk: float = None,
 ) -> float:
-    """Risk-based lot sizing: lots = (balance * risk_pct * size_mult) / (stop_dist * 100)."""
+    """Risk-based lot sizing: lots = (balance * risk_pct * size_mult) / (stop_dist * 100). Matches live main.py / execution path risk sizing assumptions."""
     if base_risk is None:
         base_risk = getattr(config, "BASE_RISK_PHASE_1", 0.01)
     if stop_distance <= 0 or size_multiplier <= 0:
@@ -493,7 +483,7 @@ class BacktestEngine:
         self._current_day:          Optional[int]      = None
         self._bars_processed:       int                = 0
         self._last_regime_update:   Optional[datetime] = None
-        self._last_session_hour:    int                = -1   # session cache
+        self._last_session_hour:    Optional[tuple[int, int]] = None
 
     # =========================================================================
     # MAIN RUN LOOP
@@ -534,10 +524,10 @@ class BacktestEngine:
             self._check_daily_reset(current_time)
             spread = self.spread_feed.get_spread_at(current_time)
 
-            # FIX Performance Bug 7: cache session per-hour, not per-bar
-            if current_time.hour != self._last_session_hour:
+            current_hour_key = (current_time.year, current_time.timetuple().tm_yday, current_time.hour)
+            if current_hour_key != self._last_session_hour:
                 self._update_session(current_time)
-                self._last_session_hour = current_time.hour
+                self._last_session_hour = current_hour_key
 
             if completed.get("H1"): self._update_h1_indicators()
             if completed.get("H4"): self._update_h4_indicators()
@@ -617,6 +607,7 @@ class BacktestEngine:
             # ── Account metrics ────────────────────────────────────────────
             self.state.daily_pnl                = 0.0
             self.state.daily_trades             = 0
+            # consecutive_losses intentionally not reset; live state preserves loss streaks across midnight
             logger.debug(f"Daily reset at {current_time.date()}")
         self._current_day = day
 
