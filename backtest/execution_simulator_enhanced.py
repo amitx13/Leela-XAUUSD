@@ -1,7 +1,13 @@
 """
 Enhanced Execution Simulator
 
-Realistic order execution with phantom order detection and enhanced fills.
+Realistic order execution with deterministic price-cross fill logic.
+
+Fix (v2):
+  _simulate_fill_decision() replaced with deterministic price-cross logic.
+  STOP/LIMIT orders fill only when bar high/low actually crosses the order
+  price — not via random probability. MARKET orders always fill.
+  Engine passes (bar_high, bar_low) into check_fill() for accuracy.
 """
 
 import logging
@@ -30,317 +36,206 @@ class FillResult:
 
 class EnhancedExecutionSimulator:
     """
-    Enhanced execution simulator with realistic fill modeling.
-    
-    Features:
-    - Realistic fill probabilities
-    - Slippage modeling
-    - Partial fills
-    - Phantom order detection
-    - Order expiry handling
-    - Spread-aware execution
-    - Latency simulation
+    Execution simulator with deterministic price-cross fill logic.
+
+    Fill rules (mirrors MT5 behaviour):
+      MARKET    — always fills at current_price ± slippage
+      BUY_STOP  — fills when bar_high  >= order.price
+      SELL_STOP — fills when bar_low   <= order.price
+      BUY_LIMIT — fills when bar_low   <= order.price
+      SELL_LIMIT— fills when bar_high  >= order.price
     """
-    
+
     def __init__(self, slippage_points: float = 0.7):
         self.slippage_points = slippage_points
-        self.pending_orders: List[SimOrder] = []
-        self.order_history: List[Dict[str, Any]] = []
-        
-        logger.info(f"Enhanced execution simulator initialized with slippage: {slippage_points}")
-    
+        self.pending_orders:  List[SimOrder]       = []
+        self.order_history:   List[Dict[str, Any]] = []
+        logger.info(f"Enhanced execution simulator initialised (slippage={slippage_points})")
+
+    # ------------------------------------------------------------------ #
+    # PUBLIC
+    # ------------------------------------------------------------------ #
+
     def submit_order(self, order: SimOrder) -> None:
-        """Submit order for execution."""
-        order_with_metadata = {
-            "order": order,
-            "submit_time": datetime.utcnow(),
-            "status": "PENDING",
-            "fill_attempts": 0,
-            "phantom_checks": 0
-        }
-        
         self.pending_orders.append(order)
-        self.order_history.append(order_with_metadata)
-        
+        self.order_history.append({
+            "order":         order,
+            "submit_time":   datetime.utcnow(),
+            "status":        "PENDING",
+            "fill_attempts": 0,
+        })
         logger.debug(f"Order submitted: {order.strategy} {order.direction} @ {order.price}")
-    
-    def check_fill(self, order: SimOrder, current_price: float, current_time: datetime) -> FillResult:
-        """Check if order should be filled with enhanced logic."""
-        # Find order in pending list
-        order_metadata = None
-        for om in self.order_history:
-            if om["order"] == order:
-                order_metadata = om
-                break
-        
-        if not order_metadata:
-            return FillResult(
-                filled=False,
-                fill_price=0.0,
-                fill_time=current_time,
-                fill_volume=0.0,
-                slippage=0.0,
-                phantom_order=False,
-                rejection_reason="ORDER_NOT_FOUND"
-            )
-        
-        # Check if order already filled
-        if order_metadata["status"] == "FILLED":
-            return FillResult(
-                filled=True,
-                fill_price=order_metadata.get("fill_price", order.price),
-                fill_time=order_metadata.get("fill_time", current_time),
-                fill_volume=order_metadata.get("fill_volume", order.lots),
-                slippage=order_metadata.get("slippage", 0.0),
-                phantom_order=order_metadata.get("phantom_order", False),
-                partial_fill=order_metadata.get("partial_fill", False)
-            )
-        
-        # Check order expiry
-        if order.expiry and current_time >= order.expiry:
-            order_metadata["status"] = "EXPIRED"
-            return FillResult(
-                filled=False,
-                fill_price=0.0,
-                fill_time=current_time,
-                fill_volume=0.0,
-                slippage=0.0,
-                phantom_order=False,
-                rejection_reason="ORDER_EXPIRED"
-            )
-        
-        # Increment fill attempts
-        order_metadata["fill_attempts"] += 1
-        
-        # Simulate fill decision
-        fill_decision = self._simulate_fill_decision(order, current_price, current_time)
-        
-        if fill_decision["fill"]:
-            # Order fills
-            fill_price = fill_decision["fill_price"]
-            slippage = fill_decision["slippage"]
-            fill_volume = fill_decision["fill_volume"]
-            
-            # Update order metadata
-            order_metadata.update({
-                "status": "FILLED",
-                "fill_time": current_time,
-                "fill_price": fill_price,
-                "fill_volume": fill_volume,
-                "slippage": slippage,
-                "partial_fill": fill_decision["partial_fill"],
-                "phantom_order": fill_decision["phantom_order"]
-            })
-            
-            # Remove from pending orders
-            if order in self.pending_orders:
-                self.pending_orders.remove(order)
-            
-            logger.info(f"Order FILLED: {order.strategy} {order.direction} @ {fill_price} (slippage: {slippage:.1f})")
-            
-            return FillResult(
-                filled=True,
-                fill_price=fill_price,
-                fill_time=current_time,
-                fill_volume=fill_volume,
-                slippage=slippage,
-                phantom_order=fill_decision["phantom_order"],
-                partial_fill=fill_decision["partial_fill"]
-            )
-        
-        else:
-            # Order rejected
-            order_metadata["status"] = "REJECTED"
-            
-            # Remove from pending orders
-            if order in self.pending_orders:
-                self.pending_orders.remove(order)
-            
-            logger.warning(f"Order REJECTED: {order.strategy} {order.direction} - {fill_decision['rejection_reason']}")
-            
-            return FillResult(
-                filled=False,
-                fill_price=0.0,
-                fill_time=current_time,
-                fill_volume=0.0,
-                slippage=0.0,
-                phantom_order=False,
-                rejection_reason=fill_decision["rejection_reason"]
-            )
-    
-    def _simulate_fill_decision(self, order: SimOrder, current_price: float, current_time: datetime) -> Dict[str, Any]:
-        """Simulate realistic fill decision logic."""
-        # Calculate distance to order price
-        price_distance = abs(current_price - order.price)
-        
-        # Base fill probability by order type
-        if order.order_type == "MARKET":
-            # Market orders: high fill probability
-            base_fill_prob = 0.95
-        else:
-            # Pending orders: fill probability based on price distance
-            if price_distance <= 0.5:  # Very close
-                base_fill_prob = 0.8
-            elif price_distance <= 1.0:  # Close
-                base_fill_prob = 0.6
-            elif price_distance <= 2.0:  # Moderate distance
-                base_fill_prob = 0.3
-            else:  # Far from price
-                base_fill_prob = 0.1
-        
-        # Adjust for volatility (higher volatility = better fill chance)
-        volatility_multiplier = 1.2  # Would be calculated from ATR in real system
-        adjusted_fill_prob = min(base_fill_prob * volatility_multiplier, 0.98)
-        
-        # Simulate fill decision
-        random_fill = random.random() < adjusted_fill_prob
-        
-        if not random_fill:
-            return {
-                "fill": False,
-                "rejection_reason": "PRICE_NOT_REACHED"
-            }
-        
-        # Calculate fill price with slippage
-        if random_fill:
-            # Slippage in favor of broker (worse for client)
-            slippage_direction = 1 if order.direction == "LONG" else -1
-            slippage_amount = random.uniform(0, self.slippage_points * 1.5)  # Variable slippage
-            
-            fill_price = order.price + (slippage_direction * slippage_amount)
-            
-            # Determine partial fill probability
-            partial_fill_prob = 0.05  # 5% chance of partial fill
-            is_partial = random.random() < partial_fill_prob
-            
-            if is_partial:
-                fill_volume = order.lots * random.uniform(0.5, 0.9)  # Fill 50-90%
-            else:
-                fill_volume = order.lots
-            
-            return {
-                "fill": True,
-                "fill_price": fill_price,
-                "fill_volume": fill_volume,
-                "slippage": slippage_amount,
-                "partial_fill": is_partial,
-                "phantom_order": False
-            }
-        
-        return {
-            "fill": False,
-            "rejection_reason": "SIMULATION_REJECTED"
-        }
-    
-    def check_phantom_order(
+
+    def check_fill(
         self,
-        order: SimOrder,
-        current_time: datetime,
-        verification_delay_seconds: int = 30
-    ) -> bool:
+        order:         SimOrder,
+        current_price: float,
+        current_time:  datetime,
+        bar_high:      Optional[float] = None,
+        bar_low:       Optional[float] = None,
+    ) -> FillResult:
         """
-        Check for phantom orders (accepted but never actually filled).
-        
-        This simulates enhanced phantom order detection from live system.
+        Deterministic fill check.
+
+        Args:
+            order:         The pending order to evaluate.
+            current_price: Bar close price (used for MARKET fills & fallback).
+            current_time:  Current simulation time.
+            bar_high:      Bar high  — required for BUY_STOP / SELL_LIMIT.
+            bar_low:       Bar low   — required for SELL_STOP / BUY_LIMIT.
         """
-        # Find order metadata
-        order_metadata = None
-        for om in self.order_history:
-            if om["order"] == order:
-                order_metadata = om
-                break
-        
-        if not order_metadata:
-            return False
-        
-        # Check if order was "filled" but we want to verify it's real
-        if order_metadata["status"] != "FILLED":
-            return False
-        
-        # Check if enough time has passed for verification
-        fill_time = order_metadata.get("fill_time")
-        if not fill_time:
-            return False
-        
-        elapsed = (current_time - fill_time).total_seconds()
-        if elapsed < verification_delay_seconds:
-            return False
-        
-        # Simulate phantom order detection (5% chance)
-        phantom_probability = 0.05
-        is_phantom = random.random() < phantom_probability
-        
-        if is_phantom:
-            logger.critical(f"PHANTOM ORDER DETECTED: {order.strategy} {order.direction} @ {order.price}")
-            order_metadata["phantom_order"] = True
-            
-            # In live system, this would trigger emergency shutdown
-            # For backtest, we'll just log it
-            return True
-        
-        return False
-    
-    def simulate_order_latency(self, order: SimOrder) -> timedelta:
-        """Simulate realistic order execution latency."""
-        # Market orders: lower latency
-        if order.order_type == "MARKET":
-            base_latency_ms = 50
+        meta = self._get_meta(order)
+        if not meta:
+            return FillResult(False, 0.0, current_time, 0.0, 0.0,
+                              rejection_reason="ORDER_NOT_FOUND")
+
+        if meta["status"] == "FILLED":
+            return FillResult(
+                True,
+                meta["fill_price"],
+                meta["fill_time"],
+                meta["fill_volume"],
+                meta["slippage"],
+                partial_fill=meta.get("partial_fill", False),
+            )
+
+        if order.expiry and current_time >= order.expiry:
+            meta["status"] = "EXPIRED"
+            return FillResult(False, 0.0, current_time, 0.0, 0.0,
+                              rejection_reason="ORDER_EXPIRED")
+
+        meta["fill_attempts"] += 1
+
+        # ── Determine fill price using price-cross logic ─────────────── #
+        fill_price = self._price_cross_fill(
+            order, current_price, bar_high, bar_low
+        )
+
+        if fill_price is None:
+            return FillResult(False, 0.0, current_time, 0.0, 0.0,
+                              rejection_reason="PRICE_NOT_REACHED")
+
+        # Apply slippage (adverse: costs the trader)
+        slippage = random.uniform(0.0, self.slippage_points)
+        if order.direction == "LONG":
+            fill_price += slippage
         else:
-            # Pending orders: higher latency
-            base_latency_ms = 150
-        
-        # Add random variation
-        latency_ms = base_latency_ms + random.randint(-20, 50)
-        return timedelta(milliseconds=latency_ms)
-    
+            fill_price -= slippage
+
+        fill_volume = order.lots
+
+        meta.update({
+            "status":       "FILLED",
+            "fill_time":    current_time,
+            "fill_price":   fill_price,
+            "fill_volume":  fill_volume,
+            "slippage":     slippage,
+            "partial_fill": False,
+            "phantom_order": False,
+        })
+        if order in self.pending_orders:
+            self.pending_orders.remove(order)
+
+        logger.info(
+            f"Filled: {order.strategy} {order.direction} {order.order_type} "
+            f"@ {fill_price:.2f} (slippage {slippage:.2f})"
+        )
+        return FillResult(
+            True, fill_price, current_time, fill_volume, slippage
+        )
+
+    # ------------------------------------------------------------------ #
+    # INTERNAL FILL LOGIC
+    # ------------------------------------------------------------------ #
+
+    def _price_cross_fill(
+        self,
+        order:         SimOrder,
+        current_price: float,
+        bar_high:      Optional[float],
+        bar_low:       Optional[float],
+    ) -> Optional[float]:
+        """
+        Return the fill price if the bar crosses the order level, else None.
+
+        Uses bar_high / bar_low when available (accurate); falls back to
+        current_price (bar close) only for MARKET orders or when hi/lo are
+        not provided.
+        """
+        ot = order.order_type
+        op = order.price
+
+        if ot == "MARKET":
+            return current_price
+
+        high = bar_high if bar_high is not None else current_price
+        low  = bar_low  if bar_low  is not None else current_price
+
+        if ot == "BUY_STOP":
+            # Triggers when price rises to or above order level
+            if high >= op:
+                return op
+        elif ot == "SELL_STOP":
+            # Triggers when price falls to or below order level
+            if low <= op:
+                return op
+        elif ot == "BUY_LIMIT":
+            # Triggers when price falls to or below order level (buy cheaper)
+            if low <= op:
+                return op
+        elif ot == "SELL_LIMIT":
+            # Triggers when price rises to or above order level (sell higher)
+            if high >= op:
+                return op
+        elif ot in ("BUY", "SELL"):
+            # Immediate market-style orders
+            return current_price
+
+        return None
+
+    def _get_meta(self, order: SimOrder) -> Optional[Dict[str, Any]]:
+        for m in self.order_history:
+            if m["order"] is order:
+                return m
+        return None
+
+    # ------------------------------------------------------------------ #
+    # STATS / RESET
+    # ------------------------------------------------------------------ #
+
     def get_pending_orders(self) -> List[SimOrder]:
-        """Get all currently pending orders."""
         return self.pending_orders.copy()
-    
+
     def get_order_history(self) -> List[Dict[str, Any]]:
-        """Get complete order execution history."""
         return self.order_history.copy()
-    
+
     def reset(self) -> None:
-        """Reset simulator state."""
         self.pending_orders.clear()
         self.order_history.clear()
         logger.info("Execution simulator reset")
-    
+
     def get_execution_stats(self) -> Dict[str, Any]:
-        """Get execution statistics for analysis."""
         if not self.order_history:
             return {}
-        
-        filled_orders = [om for om in self.order_history if om["status"] == "FILLED"]
-        rejected_orders = [om for om in self.order_history if om["status"] == "REJECTED"]
-        expired_orders = [om for om in self.order_history if om["status"] == "EXPIRED"]
-        phantom_orders = [om for om in self.order_history if om.get("phantom_order", False)]
-        
-        total_orders = len(self.order_history)
-        
+        filled   = [m for m in self.order_history if m["status"] == "FILLED"]
+        rejected = [m for m in self.order_history if m["status"] == "REJECTED"]
+        expired  = [m for m in self.order_history if m["status"] == "EXPIRED"]
+        total    = len(self.order_history)
         return {
-            "total_orders": total_orders,
-            "filled_orders": len(filled_orders),
-            "rejected_orders": len(rejected_orders),
-            "expired_orders": len(expired_orders),
-            "phantom_orders": len(phantom_orders),
-            "fill_rate": len(filled_orders) / total_orders if total_orders > 0 else 0,
-            "phantom_rate": len(phantom_orders) / total_orders if total_orders > 0 else 0,
-            "avg_slippage": sum(om.get("slippage", 0) for om in filled_orders) / len(filled_orders) if filled_orders else 0,
-            "partial_fill_rate": sum(1 for om in filled_orders if om.get("partial_fill", False)) / len(filled_orders) if filled_orders else 0,
+            "total_orders":     total,
+            "filled_orders":    len(filled),
+            "rejected_orders":  len(rejected),
+            "expired_orders":   len(expired),
+            "fill_rate":        len(filled) / total if total > 0 else 0,
+            "avg_slippage":     sum(m.get("slippage", 0) for m in filled) / len(filled) if filled else 0,
         }
-    
+
     def log_execution_summary(self) -> None:
-        """Log execution summary for debugging."""
         stats = self.get_execution_stats()
-        
         logger.info("=== EXECUTION SIMULATOR SUMMARY ===")
-        logger.info(f"Total Orders: {stats.get('total_orders', 0)}")
-        logger.info(f"Filled Orders: {stats.get('filled_orders', 0)} ({stats.get('fill_rate', 0):.1%})")
-        logger.info(f"Rejected Orders: {stats.get('rejected_orders', 0)}")
-        logger.info(f"Expired Orders: {stats.get('expired_orders', 0)}")
-        logger.info(f"Phantom Orders: {stats.get('phantom_orders', 0)} ({stats.get('phantom_rate', 0):.1%})")
-        logger.info(f"Avg Slippage: {stats.get('avg_slippage', 0):.2f} points")
-        logger.info(f"Partial Fill Rate: {stats.get('partial_fill_rate', 0):.1%}")
+        logger.info(f"Total Orders : {stats.get('total_orders', 0)}")
+        logger.info(f"Filled       : {stats.get('filled_orders', 0)} ({stats.get('fill_rate', 0):.1%})")
+        logger.info(f"Rejected     : {stats.get('rejected_orders', 0)}")
+        logger.info(f"Expired      : {stats.get('expired_orders', 0)}")
+        logger.info(f"Avg Slippage : {stats.get('avg_slippage', 0):.2f} pts")
         logger.info("=====================================")
