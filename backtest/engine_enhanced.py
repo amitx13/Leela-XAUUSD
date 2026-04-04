@@ -35,6 +35,13 @@ Fixes applied (v4 — fill accuracy + loop safety):
      only consecutive_m5_losses (intra-day micro-counter) resets               [BUG-KS5]
  23. _manage_r3_position() no longer calls open_positions.remove() inside
      the positions iteration loop; uses still_open list pattern                [BUG-R3LOOP]
+
+Fixes applied (v5 — 0-trades root cause):
+ 24. execution_sim.submit_order() called alongside pending_orders.append() —
+     simulator order_history was always empty so every check_fill() returned
+     ORDER_NOT_FOUND immediately, silently blocking all fills                  [BUG-FILL-META]
+ 25. _update_session() + _update_regime() bootstrapped before main loop so
+     initial regime is never stuck on NO_TRADE/OFF_HOURS default               [BUG-REGIME-STARTUP]
 """
 
 import sys
@@ -170,6 +177,13 @@ class EnhancedBacktestEngine:
             timestamp=self.start_date,
             equity=self.initial_balance,
         ))
+
+        # BUG-REGIME-STARTUP FIX: bootstrap session + regime from the actual
+        # backtest start time so the initial regime is never stuck on the
+        # OFF_HOURS / NO_TRADE dataclass default before the first M15 close.
+        self._update_session(self.start_date)
+        self._last_session_hour = self.start_date.hour
+        self._update_regime(self.start_date)
 
         for bar_num, (_, row) in enumerate(m5_df.iterrows()):
             bar          = row.to_dict()
@@ -686,6 +700,12 @@ class EnhancedBacktestEngine:
             )
 
             for order in result.orders:
+                # BUG-FILL-META FIX: register the order with the execution
+                # simulator's order_history so _get_meta() can find it via
+                # identity lookup on the next fill check. Without this call
+                # order_history stays empty and every check_fill() returns
+                # ORDER_NOT_FOUND, silently blocking all fills forever.
+                self.execution_sim.submit_order(order)
                 self.pending_orders.append(order)
                 logger.debug(
                     f"New order: {order.strategy} {order.direction} "
