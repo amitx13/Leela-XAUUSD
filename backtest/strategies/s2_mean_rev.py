@@ -1,7 +1,7 @@
 """
 S2 Mean Reversion Strategy
 
-Mean reversion based on overextended conditions.
+Mean reversion from extreme levels.
 """
 
 from datetime import datetime, timedelta
@@ -11,81 +11,92 @@ from ..models import SimOrder, SimulatedState
 
 
 class S2MeanRev(BaseStrategy):
-    """
-    S2 Mean Reversion Strategy.
-
-    Trades price extremes back to the mean.
-    """
+    """S2 Mean Reversion Strategy."""
 
     def get_strategy_name(self) -> str:
         return "S2_MEAN_REV"
 
     def get_strategy_family(self) -> str:
-        return "trend"
+        return "reversal"
 
-    def evaluate(self, state, bar_data, current_time, indicators):
+    def evaluate(
+        self,
+        state: SimulatedState,
+        bar_data: Dict[str, Any],
+        current_time: datetime,
+        indicators: Dict[str, Any]
+    ) -> StrategyResult:
         orders = []
         signals = []
         state_updates = {}
 
-        can_fire, _ = self.can_fire(state, current_time)
+        can_fire, reason = self.can_fire(state, current_time)
         if not can_fire:
             return StrategyResult(orders, signals, state_updates)
 
         if state.s2_fired_today:
             return StrategyResult(orders, signals, state_updates)
 
-        rsi_h1   = indicators.get("rsi_h1")
-        ema20_h1 = indicators.get("ema20_h1")
-        atr_h1   = indicators.get("atr_h1")
-
-        if None in [rsi_h1, ema20_h1, atr_h1]:
+        m5_bars = bar_data.get("M5")
+        current_bar = self._get_bar(m5_bars, -1)
+        if current_bar is None:
             return StrategyResult(orders, signals, state_updates)
 
-        # FIX: .iloc[-1] via helper
-        current_price = self._get_current_price(bar_data)
-        if current_price == 0.0:
+        current_price = float(current_bar["close"])
+
+        atr_m15 = indicators.get("atr_m15", 20)
+        ema_h1  = indicators.get("ema_h1", current_price)
+
+        deviation = abs(current_price - ema_h1)
+        mean_rev_threshold = atr_m15 * self.config.get("MEAN_REV_ATR_MULT", 2.5)
+
+        if deviation < mean_rev_threshold:
             return StrategyResult(orders, signals, state_updates)
 
-        ema_distance     = abs(current_price - ema20_h1)
-        ema_distance_pct = ema_distance / ema20_h1 * 100
+        if current_price > ema_h1:
+            direction   = "SHORT"
+            entry_price = current_price
+            stop_price  = current_price + atr_m15 * 1.5
+            tp_price    = ema_h1
+        else:
+            direction   = "LONG"
+            entry_price = current_price
+            stop_price  = current_price - atr_m15 * 1.5
+            tp_price    = ema_h1
 
-        overextended_rsi = rsi_h1 > 70 or rsi_h1 < 30
-        overextended_ema = ema_distance_pct > 0.5
+        base_lot = self.config.get("BASE_LOT_SIZE", 0.01)
+        lot_size = self.calculate_lot_size(state, base_lot * 0.8, state.size_multiplier)
 
-        if overextended_rsi and overextended_ema:
-            if rsi_h1 > 70:
-                direction   = "SHORT"
-                entry_price = current_price
-                stop_price  = current_price + (atr_h1 * 0.5)
-            else:
-                direction   = "LONG"
-                entry_price = current_price
-                stop_price  = current_price - (atr_h1 * 0.5)
-
-            base_lot = self.config.get("BASE_LOT_SIZE", 0.01)
-            lot_size = self.calculate_lot_size(state, base_lot, state.size_multiplier)
-
-            if lot_size > 0:
-                orders.append(self.create_order(
-                    direction=direction, order_type="MARKET",
-                    price=entry_price, sl=stop_price, lots=lot_size,
-                    tag="s2_mean_reversion"
-                ))
-                state_updates["s2_fired_today"] = True
-                signals.append({"type": "S2_MEAN_REVERSION_PLACED", "direction": direction, "entry": entry_price, "stop": stop_price, "lots": lot_size, "rsi": rsi_h1, "ema_distance_pct": ema_distance_pct, "time": current_time})
-                self.log_signal("MEAN_REVERSION_PLACED", direction=direction, entry=entry_price, stop=stop_price, lots=lot_size, rsi=rsi_h1)
+        if lot_size > 0:
+            order = self.create_order(
+                direction=direction,
+                order_type="MARKET",
+                price=entry_price,
+                sl=stop_price,
+                tp=tp_price,
+                lots=lot_size,
+                tag="s2_mean_reversion"
+            )
+            orders.append(order)
+            state_updates["s2_fired_today"] = True
+            signals.append({
+                "type":      "S2_MEAN_REV_PLACED",
+                "direction": direction,
+                "entry":     entry_price,
+                "stop":      stop_price,
+                "tp":        tp_price,
+                "lots":      lot_size,
+                "deviation": deviation,
+                "time":      current_time,
+            })
+            self.log_signal("MEAN_REV_PLACED", direction=direction,
+                            entry=entry_price, stop=stop_price,
+                            tp=tp_price, deviation=deviation)
 
         return StrategyResult(orders, signals, state_updates)
 
-    def _check_daily_limit(self, state):
+    def _check_daily_limit(self, state: SimulatedState) -> bool:
         return state.s2_fired_today
 
-    def _check_time_restrictions(self, state, current_time):
-        hour = current_time.hour
-        if 8  <= hour <= 10: return False, "NEWS_BLACKOUT"
-        if 11 <= hour <= 12: return False, "VOLATILE_PERIOD"
-        return True, "OK"
-
-    def reset_daily_counters(self, state):
+    def reset_daily_counters(self, state: SimulatedState):
         state.s2_fired_today = False
