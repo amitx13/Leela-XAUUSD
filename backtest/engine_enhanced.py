@@ -50,6 +50,13 @@ Fixes applied (v6 — missing SimulatedState fields):
  27. s1d_pyramid_count, s1e_pyramid_count, s1f_reentered_today,
      s1f_killed_position_profitable, s1f_original_size added to daily
      reset in _check_daily_reset()                                             [BUG-DAILY-RESET]
+
+Fixes applied (v7 — TREND_FAMILY_OCCUPIED blocks position management):
+ 28. check_position_limits() removed from _manage_positions() — it is a
+     new-order guard and MUST NOT be called on already-open positions.
+     Once any trend-family position fills, trend_family_occupied=True and
+     every subsequent management call was returning TREND_FAMILY_OCCUPIED,
+     making all SL/TP/trailing/partial logic permanently unreachable.          [BUG-MGMT-BLOCK]
 """
 
 import sys
@@ -69,7 +76,6 @@ from backtest.data_feed import BarBuffer
 from backtest.data_feed_enhanced import EnhancedHistoricalDataFeed
 from backtest.execution_simulator_enhanced import EnhancedExecutionSimulator
 from backtest.strategies import STRATEGY_REGISTRY, ALL_STRATEGIES
-from backtest.risk import run_all_kill_switches, check_position_limits
 from backtest.results import BacktestResults
 
 logger = logging.getLogger("backtest.enhanced_engine")
@@ -186,9 +192,8 @@ class EnhancedBacktestEngine:
             equity=self.initial_balance,
         ))
 
-        # BUG-REGIME-STARTUP FIX: bootstrap session + regime from the actual
-        # backtest start time so the initial regime is never stuck on the
-        # OFF_HOURS / NO_TRADE dataclass default before the first M15 close.
+        # Bootstrap session + regime before the main loop so the initial
+        # regime is never stuck on OFF_HOURS / NO_TRADE defaults.
         self._update_session(self.start_date)
         self._last_session_hour = self.start_date.hour
         self._update_regime(self.start_date)
@@ -275,13 +280,8 @@ class EnhancedBacktestEngine:
         """
         Reset daily counters at midnight.
 
-        BUG-KS5 FIX: consecutive_losses is intentionally NOT reset here.
-        It is a multi-day circuit breaker (KS5). The live system preserves
-        it across midnight; resetting it would prevent KS5 from ever firing
-        during a multi-day losing streak in the backtest.
-
-        consecutive_m5_losses IS reset — it is an intra-day micro-counter
-        used for short-burst halt logic only.
+        consecutive_losses is intentionally NOT reset — it is a multi-day
+        circuit breaker (KS5). consecutive_m5_losses IS reset — intra-day only.
         """
         day = current_time.timetuple().tm_yday
         if self._current_day is not None and day != self._current_day:
@@ -317,14 +317,13 @@ class EnhancedBacktestEngine:
             self.state.stop_hunt_detected        = False
             self.state.failed_breakout_flag      = False
             self.state.failed_breakout_direction = None
-            # consecutive_m5_losses resets daily; consecutive_losses does NOT
             self.state.consecutive_m5_losses     = 0
             self.state.daily_pnl                 = 0.0
             self.state.daily_trades              = 0
             self.state.daily_commission_paid     = 0.0
             self.state.range_computed            = False
             self._last_session_hour              = -1
-            logger.debug(f"Full daily reset at {current_time.date()}")
+            logger.debug(f"Daily reset at {current_time.date()}")
         self._current_day = day
 
     def _update_session(self, current_time: datetime) -> None:
@@ -487,7 +486,6 @@ class EnhancedBacktestEngine:
                 logger.debug(f"Order expired: {order.strategy} {order.direction}")
                 continue
 
-            # BUG-FILL FIX: pass bar_high / bar_low for accurate price-cross detection
             fill = self.execution_sim.check_fill(
                 order, bar["close"], current_time,
                 bar_high=bar_high, bar_low=bar_low
@@ -535,18 +533,19 @@ class EnhancedBacktestEngine:
     def _manage_positions(
         self, bar: dict, current_time: datetime
     ) -> None:
+        """
+        Manage all open positions every M5 bar.
+
+        BUG-MGMT-BLOCK FIX: check_position_limits() is a NEW-ORDER guard.
+        It must never be called here on already-open positions. Previously
+        this call caused every position to be skipped once any trend-family
+        slot was occupied (TREND_FAMILY_OCCUPIED), making SL/TP/trailing
+        logic permanently unreachable.
+        """
         close_price = bar["close"]
         still_open: List[SimPosition] = []
 
         for pos in self.open_positions:
-            can_manage, reason = check_position_limits(
-                self.state, pos.direction, pos.lots
-            )
-            if not can_manage:
-                logger.warning(f"Position mgmt blocked: {reason}")
-                still_open.append(pos)
-                continue
-
             if pos.direction == "LONG":
                 pos.max_favorable = max(pos.max_favorable, bar["high"] - pos.entry_price)
             else:
@@ -556,12 +555,10 @@ class EnhancedBacktestEngine:
             pos.max_r = max(pos.max_r, r)
 
             if pos.strategy == "R3_CAL_MOMENTUM":
-                # BUG-R3LOOP FIX: pass still_open so removal happens via the
-                # same list that replaces open_positions at end of loop.
                 self._manage_r3_position(
                     pos, close_price, current_time, {}, still_open
                 )
-                continue  # _manage_r3_position handles whether pos is kept
+                continue
 
             sl_hit = (
                 (pos.direction == "LONG"  and bar["low"]  <= pos.current_sl) or
@@ -651,13 +648,6 @@ class EnhancedBacktestEngine:
         indicators:    Dict[str, Any],
         still_open:    List[SimPosition],
     ) -> None:
-        """
-        Manage R3 momentum position with 30-min time exit.
-
-        BUG-R3LOOP FIX: appends to still_open (passed from caller) instead
-        of calling self.open_positions.remove() inside the iteration loop,
-        which could raise ValueError or skip positions.
-        """
         elapsed = (current_time - position.entry_time).total_seconds() / 60.0
         if elapsed >= 30:
             trade = self._build_trade_record(
@@ -665,7 +655,6 @@ class EnhancedBacktestEngine:
             )
             self._record_trade(trade)
             self._update_position_state(position, "CLOSE")
-            # Do NOT append to still_open — position is closed
         else:
             still_open.append(position)
 
@@ -713,11 +702,6 @@ class EnhancedBacktestEngine:
             )
 
             for order in result.orders:
-                # BUG-FILL-META FIX: register the order with the execution
-                # simulator's order_history so _get_meta() can find it via
-                # identity lookup on the next fill check. Without this call
-                # order_history stays empty and every check_fill() returns
-                # ORDER_NOT_FOUND, silently blocking all fills forever.
                 self.execution_sim.submit_order(order)
                 self.pending_orders.append(order)
                 logger.debug(
@@ -725,7 +709,6 @@ class EnhancedBacktestEngine:
                     f"{order.order_type} @ {order.price:.2f}"
                 )
 
-            # Flush state_updates immediately so next strategy sees fresh counters
             for key, value in result.state_updates.items():
                 setattr(self.state, key, value)
 
@@ -863,7 +846,7 @@ class EnhancedBacktestEngine:
             if action == "OPEN":
                 self.state.trend_family_occupied  = True
                 self.state.trend_family_strategy  = position.strategy
-                self.state.trend_trade_direction  = position.direction  # BUG-TTD FIX
+                self.state.trend_trade_direction  = position.direction
                 self.state.open_position          = position.strategy
                 self.state.entry_price            = position.entry_price
                 self.state.stop_price_original    = position.stop_price_original
@@ -874,7 +857,7 @@ class EnhancedBacktestEngine:
             else:
                 self.state.trend_family_occupied  = False
                 self.state.trend_family_strategy  = None
-                self.state.trend_trade_direction  = None               # BUG-TTD FIX
+                self.state.trend_trade_direction  = None
                 self.state.open_position          = None
                 self.state.entry_price            = 0.0
                 self.state.stop_price_original    = 0.0
@@ -903,3 +886,11 @@ class EnhancedBacktestEngine:
             logger.critical(f"Ghost position detected: {ghost}")
         for orphan in (actual - believed):
             logger.warning(f"Orphan position detected: {orphan}")
+
+
+# ---------------------------------------------------------------------------
+# MODULE-LEVEL IMPORT SHIM
+# Keep this at the bottom so the engine import doesn't need backtest.risk
+# ---------------------------------------------------------------------------
+
+from backtest.risk.kill_switches import run_all_kill_switches  # noqa: E402
