@@ -2,331 +2,368 @@
 Enhanced Data Feed
 
 Multi-timeframe support with event simulation and spread modeling.
+Fetches real data from MT5 or local cache (parquet/pickle).
+Falls back to MT5 copy_rates_range() — requires live MT5 connection.
+NEVER generates synthetic/random bars.
 """
 
 import os
 import logging
+import pytz
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("backtest.enhanced_data_feed")
+
+# MT5 timeframe string -> MT5 constant name
+MT5_TF_MAP = {
+    "M5":  "TIMEFRAME_M5",
+    "M15": "TIMEFRAME_M15",
+    "H1":  "TIMEFRAME_H1",
+    "H4":  "TIMEFRAME_H4",
+    "D1":  "TIMEFRAME_D1",
+}
 
 
 class EnhancedHistoricalDataFeed:
     """
     Enhanced historical data feed with multi-timeframe support.
-    
-    Features:
-    - Multiple timeframes (M5, M15, H1, H4, D1)
-    - Economic event simulation
-    - Spread modeling
-    - DXY correlation data
-    - Efficient caching
+
+    Data source priority (same as HistoricalDataFeed in data_feed.py):
+      1. Local parquet  — backtest_data/XAUUSD_{TF}.parquet
+      2. Local pickle   — backtest_data/XAUUSD_{TF}.pkl
+      3. MT5 copy_rates_range() — requires live MT5 connection
+
+    NEVER generates synthetic/random data.
     """
-    
+
     def __init__(self, cache_dir: str = "backtest_data"):
-        self.cache_dir = cache_dir
-        self.data = {}  # timeframe -> DataFrame
-        self.events = []  # Economic events
-        self.spreads = {}  # timeframe -> spread series
-        self.dxy_data = {}  # timeframe -> DXY series
-        
-        # Ensure cache directory exists
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        logger.info(f"Enhanced data feed initialized with cache dir: {cache_dir}")
-    
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.data: Dict[str, pd.DataFrame] = {}   # timeframe -> DataFrame
+        self.events: List[dict] = []
+        self.spreads: Dict[str, pd.DataFrame] = {}
+
+        logger.info(f"Enhanced data feed initialised, cache dir: {self.cache_dir}")
+
+    # ------------------------------------------------------------------ #
+    # PUBLIC                                                               #
+    # ------------------------------------------------------------------ #
+
     def load_data(
         self,
         start_date: datetime,
         end_date: datetime,
-        timeframes: List[str] = None
+        timeframes: List[str] = None,
+        symbol: str = "XAUUSD",
     ) -> None:
-        """Load historical data for specified timeframes."""
+        """Load historical data for specified timeframes from cache or MT5."""
         if timeframes is None:
             timeframes = ["M5", "M15", "H1", "H4", "D1"]
-        
-        logger.info(f"Loading data for {timeframes} from {start_date} to {end_date}")
-        
-        for timeframe in timeframes:
-            self._load_timeframe_data(timeframe, start_date, end_date)
-        
-        # Load economic events
-        self._load_economic_events(start_date, end_date)
-        
-        # Load DXY correlation data
-        self._load_dxy_data(start_date, end_date)
-        
-        # Generate spread data
-        self._generate_spread_data(timeframes, start_date, end_date)
-        
-        logger.info("Enhanced data loading completed")
-    
-    def _load_timeframe_data(self, timeframe: str, start_date: datetime, end_date: datetime):
-        """Load data for specific timeframe."""
-        cache_file = os.path.join(self.cache_dir, f"xauusd_{timeframe.lower()}.csv")
-        
-        if os.path.exists(cache_file):
-            try:
-                df = pd.read_csv(cache_file, parse_dates=["time"])
-                df = df[(df["time"] >= start_date) & (df["time"] <= end_date)]
-                self.data[timeframe] = df
-                logger.info(f"Loaded {len(df)} {timeframe} bars from cache")
-                return
-            except Exception as e:
-                logger.error(f"Error loading {cache_file}: {e}")
-        
-        # Generate synthetic data if no cache file
-        logger.warning(f"No cache file for {timeframe}, generating synthetic data")
-        self.data[timeframe] = self._generate_synthetic_data(timeframe, start_date, end_date)
-    
-    def _generate_synthetic_data(
+
+        logger.info(f"Loading {timeframes} for {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")
+
+        for tf in timeframes:
+            self._load_timeframe(tf, start_date, end_date, symbol)
+
+        # Build event calendar from config patterns (same as HistoricalEventFeed)
+        self._build_event_calendar(start_date, end_date)
+
+        # Build spread cache from M5 spread column (if available)
+        if "M5" in self.data:
+            self._build_spread_cache(self.data["M5"])
+
+        logger.info("Data loading complete")
+
+    def get_bars(
+        self,
+        timeframe: str,
+        current_time: datetime,
+        count: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Return up to `count` completed bars for `timeframe` up to current_time."""
+        if timeframe not in self.data or self.data[timeframe].empty:
+            return []
+
+        df = self.data[timeframe]
+        df_filtered = df[df["time"] <= current_time].tail(count)
+
+        return df_filtered.to_dict("records")
+
+    def get_upcoming_events(
+        self,
+        current_time: datetime,
+        pre_minutes: int = 45,
+        post_minutes: int = 20,
+    ) -> List[dict]:
+        """Return HIGH-impact events within the blackout window."""
+        result = []
+        for ev in self.events:
+            delta = (ev["time"] - current_time).total_seconds() / 60.0
+            if -post_minutes <= delta <= pre_minutes:
+                result.append(ev)
+        return result
+
+    def get_current_spread(self, current_time: datetime) -> float:
+        """Return spread in points for current_time."""
+        hour_key = f"hour_{current_time.hour}"
+        if hour_key in self.spreads:
+            return self.spreads[hour_key]
+
+        # Session-based fallback
+        h = current_time.hour
+        if 7 <= h < 12:
+            return 18.0   # London open
+        elif 12 <= h < 17:
+            return 12.0   # London/NY overlap
+        elif 17 <= h < 22:
+            return 20.0   # NY
+        else:
+            return 30.0   # Off-hours
+
+    # ------------------------------------------------------------------ #
+    # PRIVATE — DATA LOADING                                              #
+    # ------------------------------------------------------------------ #
+
+    def _load_timeframe(
         self,
         timeframe: str,
         start_date: datetime,
-        end_date: datetime
-    ) -> pd.DataFrame:
-        """Generate synthetic OHLCV data for testing."""
-        # Calculate number of bars based on timeframe
-        if timeframe == "M5":
-            freq = "5min"
-        elif timeframe == "M15":
-            freq = "15min"
-        elif timeframe == "H1":
-            freq = "1H"
-        elif timeframe == "H4":
-            freq = "4H"
-        elif timeframe == "D1":
-            freq = "1D"
+        end_date: datetime,
+        symbol: str = "XAUUSD",
+    ) -> None:
+        """
+        Load one timeframe from best available source:
+          1. parquet cache
+          2. pickle cache
+          3. MT5 live fetch
+        Raises RuntimeError if no data is available.
+        """
+        # 1 & 2 — local cache
+        for suffix, loader in [
+            (".parquet", pd.read_parquet),
+            (".pkl",     pd.read_pickle),
+        ]:
+            for candidate in [
+                self.cache_dir / f"{symbol}_{timeframe}{suffix}",
+                self.cache_dir / f"{symbol.lower()}_{timeframe.lower()}{suffix}",
+                Path("backtest_data") / f"{symbol}_{timeframe}{suffix}",
+            ]:
+                if candidate.exists():
+                    try:
+                        df = loader(str(candidate))
+                        df = self._normalize_df(df)
+                        df = df[
+                            (df["time"] >= start_date) &
+                            (df["time"] <= end_date)
+                        ].copy()
+                        df.sort_values("time", inplace=True)
+                        df.reset_index(drop=True, inplace=True)
+                        self.data[timeframe] = df
+                        logger.info(
+                            f"{timeframe}: loaded {len(df)} bars "
+                            f"from {candidate.name}"
+                        )
+                        return
+                    except Exception as e:
+                        logger.warning(f"Failed to load {candidate}: {e}")
+
+        # 3 — MT5 live fetch
+        df = self._fetch_from_mt5(timeframe, start_date, end_date, symbol)
+        if df is not None and len(df) > 0:
+            self.data[timeframe] = df
+            logger.info(f"{timeframe}: fetched {len(df)} bars from MT5")
+            return
+
+        raise RuntimeError(
+            f"No {timeframe} data available for {symbol} "
+            f"({start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}). "
+            "Run tools/collect_historical_data.py or ensure MT5 is connected."
+        )
+
+    def _fetch_from_mt5(
+        self,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        symbol: str = "XAUUSD",
+    ) -> Optional[pd.DataFrame]:
+        """Fetch bars from MT5 using copy_rates_range()."""
+        try:
+            from utils.mt5_client import get_mt5
+            mt5 = get_mt5()
+            if not mt5.initialize():
+                logger.error("MT5 initialize() failed")
+                return None
+
+            tf_const_name = MT5_TF_MAP.get(timeframe)
+            if tf_const_name is None:
+                logger.error(f"Unknown timeframe: {timeframe}")
+                return None
+
+            tf_const = getattr(mt5, tf_const_name, None)
+            if tf_const is None:
+                logger.error(f"MT5 has no attribute {tf_const_name}")
+                return None
+
+            # MT5 expects naive UTC datetimes
+            start_naive = start_date.replace(tzinfo=None)
+            end_naive   = end_date.replace(tzinfo=None)
+
+            bars = mt5.copy_rates_range(symbol, tf_const, start_naive, end_naive)
+
+            if bars is None or len(bars) == 0:
+                logger.warning(f"MT5 returned no bars for {timeframe}")
+                return None
+
+            df = pd.DataFrame(bars)
+            df = self._normalize_df(df)
+            df.sort_values("time", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df
+
+        except ImportError:
+            logger.warning("MT5 client not available — cannot fetch live data")
+            return None
+        except Exception as e:
+            logger.warning(f"MT5 fetch failed for {timeframe}: {e}")
+            return None
+
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalise column names and ensure UTC-aware timestamps.
+        Handles MT5 raw output (epoch seconds) and pre-processed CSVs.
+        """
+        col_map = {
+            "Time": "time", "Open": "open", "High": "high",
+            "Low":  "low",  "Close": "close",
+            "Volume": "tick_volume", "Tick_volume": "tick_volume",
+            "Spread": "spread",
+            # CSV exports sometimes use these names
+            "vol": "tick_volume", "volume": "tick_volume",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        for col in ["time", "open", "high", "low", "close"]:
+            if col not in df.columns:
+                raise ValueError(f"Missing required column: {col}")
+
+        if "tick_volume" not in df.columns:
+            df["tick_volume"] = 0
+        if "spread" not in df.columns:
+            df["spread"] = 0
+
+        # Convert time to UTC-aware datetime
+        if not pd.api.types.is_datetime64_any_dtype(df["time"]):
+            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        elif df["time"].dt.tz is None:
+            df["time"] = df["time"].dt.tz_localize("UTC")
         else:
-            freq = "1H"
-        
-        # Generate date range
-        date_range = pd.date_range(start=start_date, end=end_date, freq=freq)
-        
-        # Generate synthetic price data
-        np.random.seed(42)  # For reproducible results
-        
-        n_bars = len(date_range)
-        base_price = 2000.0  # Base XAUUSD price
-        
-        # Generate price series first
-        returns = np.random.normal(0, 0.0002, n_bars)  # Small random movements
-        prices = [base_price]
-        
-        for i in range(1, n_bars):
-            change = returns[i] * base_price
-            new_price = prices[-1] + change
-            
-            # Add some volatility patterns
-            if i % 100 == 0:  # Occasional bigger moves
-                change *= 5
-            
-            prices.append(new_price)
-        
-        # Create OHLC data from prices
-        opens = prices[:-1]
-        closes = prices[1:]
-        
-        # Generate highs and lows
-        highs = []
-        lows = []
-        for i in range(len(opens)):
-            high = max(opens[i], closes[i])
-            low = min(opens[i], closes[i])
-            highs.append(high)
-            lows.append(low)
-        
-        # Generate volumes
-        volumes = np.random.randint(100, 1000, n_bars-1)
-        
-        # Create DataFrame with matching lengths
-        df = pd.DataFrame({
-            "time": date_range[1:],  # Skip first to match OHLC
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes
-        })
-        
-        logger.info(f"Generated {len(df)} synthetic {timeframe} bars")
+            df["time"] = df["time"].dt.tz_convert("UTC")
+
         return df
-    
-    def _load_economic_events(self, start_date: datetime, end_date: datetime):
-        """Load economic events for the period."""
-        # In a real system, this would load from a calendar API
-        # For backtest, we'll generate synthetic high-impact events
-        
-        events = []
-        current = start_date
-        
-        # Generate major news events (FOMC, NFP, CPI, etc.)
+
+    # ------------------------------------------------------------------ #
+    # PRIVATE — EVENT CALENDAR                                            #
+    # ------------------------------------------------------------------ #
+
+    def _build_event_calendar(
+        self, start_date: datetime, end_date: datetime
+    ) -> None:
+        """
+        Generate approximate event timestamps from config.HARDCODED_EVENT_PATTERNS.
+        Mirrors HistoricalEventFeed._build_event_calendar() exactly.
+        """
+        import calendar as cal_mod
+
+        try:
+            import config
+            patterns = config.HARDCODED_EVENT_PATTERNS
+        except (ImportError, AttributeError):
+            patterns = []
+
+        ist_tz = pytz.timezone("Asia/Kolkata")
+        current = start_date.replace(day=1)
+        events: List[dict] = []
+
         while current <= end_date:
-            # Randomly decide if this is a major event day
-            if np.random.random() < 0.1:  # 10% chance of major event
-                # Generate event around 8:30 AM NY time (13:30 UTC)
-                event_time = current.replace(hour=13, minute=30, second=0)
-                
-                events.append({
-                    "time": event_time,
-                    "name": np.random.choice(["FOMC", "NFP", "CPI", "GDP"]),
-                    "impact": np.random.choice(["HIGH", "MEDIUM", "LOW"]),
-                    "currency": "USD",
-                    "forecast": np.random.choice(["Better", "Worse", "Same"]),
-                })
-                
-                logger.info(f"Generated economic event: {events[-1]['name']} at {event_time}")
-            
-            current += timedelta(days=1)
-        
+            year, month = current.year, current.month
+            for pattern in patterns:
+                ev_time = self._resolve_event_pattern(
+                    pattern, year, month, ist_tz, cal_mod
+                )
+                if ev_time and start_date <= ev_time <= end_date:
+                    events.append({
+                        "name":   pattern["name"],
+                        "time":   ev_time,
+                        "impact": pattern.get("impact", "HIGH"),
+                    })
+            if month == 12:
+                current = current.replace(year=year + 1, month=1)
+            else:
+                current = current.replace(month=month + 1)
+
+        events.sort(key=lambda e: e["time"])
         self.events = events
-        logger.info(f"Generated {len(events)} economic events")
-    
-    def _load_dxy_data(self, start_date: datetime, end_date: datetime):
-        """Load DXY correlation data."""
-        # In a real system, this would load from market data API
-        # For backtest, we'll generate synthetic DXY data
-        
-        date_range = pd.date_range(start=start_date, end=end_date, freq="1h")
-        
-        # Generate synthetic DXY with some correlation to XAUUSD
-        dxy_values = []
-        base_dxy = 100.0
-        
-        for i in range(len(date_range)):
-            # DXY tends to be inversely correlated with XAUUSD
-            change = np.random.normal(0, 0.5, 1)  # DXY volatility
-            new_dxy = base_dxy + change
-            
-            # Add some trend patterns
-            if i % 50 == 0:  # Occasional trend changes
-                change *= 2
-            
-            dxy_values.append(new_dxy)
-            base_dxy = new_dxy
-        
-        # Create DataFrame with proper 1D arrays
-        dxy_changes = np.diff(dxy_values).tolist()
-        if len(dxy_changes) < len(dxy_values):
-            dxy_changes.insert(0, 0.0)  # Insert 0 for first element to match length
-        
-        dxy_df = pd.DataFrame({
-            "time": date_range,
-            "dxy": dxy_values,
-            "change": dxy_changes
-        })
-        
-        self.dxy_data["H1"] = dxy_df
-        logger.info(f"Generated {len(dxy_df)} DXY data points")
-    
-    def _generate_spread_data(self, timeframes: List[str], start_date: datetime, end_date: datetime):
-        """Generate realistic spread data."""
-        for timeframe in timeframes:
-            if timeframe not in self.data:
-                continue
-            
-            df = self.data[timeframe]
-            if df.empty:
-                continue
-            
-            # Generate spread based on time and volatility
-            import numpy as np
-            np.random.seed(42)
-            
-            n_bars = len(df)
-            spreads = []
-            
-            for i in range(n_bars):
-                hour = df.iloc[i]["time"].hour
-                
-                # Base spread varies by session
-                if 13 <= hour <= 17:  # London/NY overlap - tight spreads
-                    base_spread = np.random.normal(1.5, 0.3, 1)
-                elif 8 <= hour <= 12:  # Asian session - wider spreads
-                    base_spread = np.random.normal(2.5, 0.5, 1)
-                else:  # Other times - moderate spreads
-                    base_spread = np.random.normal(2.0, 0.4, 1)
-                
-                # Add volatility-based spread widening
-                if i > 0:
-                    prev_range = df.iloc[i]["high"] - df.iloc[i-1]["low"]
-                    curr_range = df.iloc[i]["high"] - df.iloc[i]["low"]
-                    if curr_range > prev_range * 1.5:  # Volatility spike
-                        base_spread *= 2.0
-                
-                spreads.append(max(0.5, base_spread))  # Minimum 0.5 spread
-            
-            spread_df = pd.DataFrame({
-                "time": df["time"],
-                "spread": spreads
-            })
-            
-            self.spreads[timeframe] = spread_df
-            logger.info(f"Generated spread data for {timeframe}")
-    
-    def get_bars(self, timeframe: str, current_time: datetime, count: int = 1000) -> List[Dict[str, Any]]:
-        """Get recent bars for specified timeframe."""
-        if timeframe not in self.data:
-            return []
-        
-        df = self.data[timeframe]
-        if df.empty:
-            return []
-        
-        # Filter bars up to current time
-        df_filtered = df[df['time'] <= current_time].tail(count)
-        
-        # Convert to list of dictionaries
-        bars = []
-        for _, row in df_filtered.iterrows():
-            bars.append({
-                "time": row["time"],
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-                "volume": row["volume"]
-            })
-        
-        return bars
-    
-    def get_upcoming_events(self, current_time: datetime, lookahead_hours: int = 2) -> List[Dict[str, Any]]:
-        """Get upcoming economic events within lookahead window."""
-        upcoming = []
-        cutoff = current_time + timedelta(hours=lookahead_hours)
-        
-        for event in self.events:
-            if current_time < event["time"] <= cutoff:
-                upcoming.append(event)
-        
-        return upcoming
-    
-    def get_current_spread(self, current_time: datetime) -> float:
-        """Get current spread for specified time."""
-        # Find appropriate timeframe (use M5 for current spread)
-        timeframe = "M5"
-        
-        if timeframe in self.spreads:
-            spread_df = self.spreads[timeframe]
-            if not spread_df.empty:
-                # Find spread for current time
-                mask = spread_df["time"] <= current_time
-                if mask.any():
-                    current_spread = spread_df[mask].iloc[-1]["spread"]
-                    return current_spread
-        
-        # Default spread
-        return 2.0
-    
-    def get_dxy_correlation(self, current_time: datetime) -> Optional[float]:
-        """Get DXY value for correlation analysis."""
-        if "H1" in self.dxy_data and not self.dxy_data["H1"].empty:
-            dxy_df = self.dxy_data["H1"]
-            mask = dxy_df["time"] <= current_time
-            if mask.any():
-                return dxy_df[mask].iloc[-1]["dxy"]
-        
+        logger.info(f"Event calendar built: {len(events)} events")
+
+    @staticmethod
+    def _resolve_event_pattern(
+        pattern: dict, year: int, month: int, ist_tz, cal_mod
+    ) -> Optional[datetime]:
+        """Resolve a hardcoded event pattern to a UTC datetime."""
+        hour_ist   = pattern.get("hour_ist", 18)
+        minute_ist = pattern.get("minute_ist", 30)
+
+        if "day_of_month" in pattern:
+            try:
+                dt_ist = ist_tz.localize(
+                    datetime(year, month, pattern["day_of_month"], hour_ist, minute_ist)
+                )
+                return dt_ist.astimezone(pytz.utc)
+            except ValueError:
+                return None
+
+        if "weekday" in pattern:
+            weekday = pattern["weekday"]
+            week    = pattern.get("week_of_month", 3)
+            count   = 0
+            for week_days in cal_mod.monthcalendar(year, month):
+                if week_days[weekday] != 0:
+                    count += 1
+                    if count == week:
+                        try:
+                            dt_ist = ist_tz.localize(
+                                datetime(
+                                    year, month, week_days[weekday],
+                                    hour_ist, minute_ist,
+                                )
+                            )
+                            return dt_ist.astimezone(pytz.utc)
+                        except ValueError:
+                            return None
+
         return None
+
+    # ------------------------------------------------------------------ #
+    # PRIVATE — SPREAD CACHE                                              #
+    # ------------------------------------------------------------------ #
+
+    def _build_spread_cache(self, m5_df: pd.DataFrame) -> None:
+        """
+        Pre-compute hourly average spreads from M5 spread column.
+        Falls back to session defaults if no spread data.
+        """
+        if "spread" not in m5_df.columns or m5_df["spread"].sum() == 0:
+            return
+        df = m5_df.copy()
+        df["hour"] = df["time"].dt.hour
+        hourly = df.groupby("hour")["spread"].mean()
+        for hour, spread in hourly.items():
+            self.spreads[f"hour_{hour}"] = float(spread)
+        logger.info("Spread cache built from M5 data")
