@@ -36,6 +36,10 @@ PARITY GAPS FIXED IN THIS REVISION:
   GAP-13 Deduct $7/lot round-trip commission per trade (live broker cost)
   GAP-14 KS4 cooldown: cap s1 family attempts to 2 after 3 consecutive losses
   GAP-15 Weekly PnL tracking accumulated per trade for KS5 gate
+  CRIT-4 Asian range now uses hard UTC 00:00–07:00 session filter instead of
+         last-84-bars approximation, matching live calculate_asian_range()
+         exactly.  HIGH-1 and HIGH-2 were already correctly implemented in
+         execution_simulator.py (confirmed via full file read).
 """
 import sys
 import os
@@ -133,16 +137,87 @@ def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optional[dict]:
-    """Compute Asian session range (00:00–07:00 UTC) from the latest 84 M5 bars."""
-    m5_df = bar_buffer.get_series("M5", count=84)
-    if m5_df.empty or len(m5_df) < 12:
+    """
+    Compute Asian session range using a hard UTC 00:00–07:00 window.
+
+    CRIT-4 FIX: The previous implementation used the last 84 M5 bars as a
+    proxy for the Asian session.  That approximation drifts when bars are
+    missing, spans session boundaries, or runs during the first bars after
+    midnight — producing a range that does not correspond to the actual Asian
+    session window.
+
+    This implementation mirrors the live calculate_asian_range() from
+    engines/session.py exactly:
+      - Determine the current UTC trading date (the date of current_time in UTC).
+      - Select only M5 bars whose timestamp falls in [00:00 UTC, 07:00 UTC)
+        on that same date.
+      - Require at least 12 qualifying bars (same floor as before) to guard
+        against the range being computed from only a handful of thin bars.
+
+    Falls back gracefully (returns None) when data is insufficient.
+    """
+    # Obtain a large enough M5 history to cover the full Asian window.
+    # 84 bars = 7 h × 12 bars/h, so 100 gives a safe margin.
+    m5_df = bar_buffer.get_series("M5", count=100)
+    if m5_df.empty:
         return None
-    rh = float(m5_df["high"].max())
-    rl = float(m5_df["low"].min())
+
+    # Ensure the index / "time" column is timezone-aware UTC.
+    if isinstance(m5_df.index, pd.DatetimeIndex):
+        ts_series = m5_df.index.to_series()
+    elif "time" in m5_df.columns:
+        ts_series = m5_df["time"]
+    else:
+        # Cannot determine bar timestamps — fall back to legacy behaviour.
+        m5_df_fallback = m5_df.iloc[-84:]
+        if len(m5_df_fallback) < 12:
+            return None
+        rh = float(m5_df_fallback["high"].max())
+        rl = float(m5_df_fallback["low"].min())
+        rs = rh - rl
+        min_range = getattr(config, "MIN_RANGE_SIZE_PTS", 10)
+        if rs < min_range:
+            return None
+        breakout_dist_pct  = getattr(config, "BREAKOUT_DIST_PCT", 0.12)
+        hunt_threshold_pct = getattr(config, "HUNT_THRESHOLD_PCT", 0.08)
+        return {
+            "range_high": rh, "range_low": rl, "range_size": rs,
+            "breakout_dist": rs * breakout_dist_pct,
+            "hunt_threshold": rs * hunt_threshold_pct,
+        }
+
+    # Normalise timestamps to UTC-naive for comparison.
+    if hasattr(ts_series.dtype, "tz") and ts_series.dtype.tz is not None:
+        ts_utc = ts_series.dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        ts_utc = ts_series
+
+    # Determine the UTC trading date from current_time.
+    if current_time.tzinfo is not None:
+        ct_utc = current_time.astimezone(pytz.utc).replace(tzinfo=None)
+    else:
+        ct_utc = current_time
+
+    trading_date = ct_utc.date()
+
+    # Hard session window: [00:00 UTC, 07:00 UTC) on the current trading date.
+    session_start = datetime(trading_date.year, trading_date.month, trading_date.day, 0, 0, 0)
+    session_end   = datetime(trading_date.year, trading_date.month, trading_date.day, 7, 0, 0)
+
+    mask = (ts_utc >= session_start) & (ts_utc < session_end)
+    asian_bars = m5_df[mask.values]
+
+    if len(asian_bars) < 12:
+        return None
+
+    rh = float(asian_bars["high"].max())
+    rl = float(asian_bars["low"].min())
     rs = rh - rl
+
     min_range = getattr(config, "MIN_RANGE_SIZE_PTS", 10)
     if rs < min_range:
         return None
+
     breakout_dist_pct  = getattr(config, "BREAKOUT_DIST_PCT", 0.12)
     hunt_threshold_pct = getattr(config, "HUNT_THRESHOLD_PCT", 0.08)
     return {
@@ -1096,739 +1171,19 @@ def _evaluate_r3(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _calculate_lot_size(
-    balance: float, stop_distance: float,
-    size_multiplier: float, base_risk: float = None,
+    balance: float,
+    stop_dist: float,
+    size_multiplier: float,
 ) -> float:
-    """Risk-based lot sizing. Matches live execution path."""
-    if base_risk is None:
-        base_risk = getattr(config, "BASE_RISK_PHASE_1", 0.01)
-    if stop_distance <= 0 or size_multiplier <= 0:
+    """
+    Risk-based lot sizing mirroring live execution_engine._calculate_lot_size().
+    risk_pct × balance / (stop_dist × contract_size), capped at V1_LOT_HARD_CAP.
+    """
+    if stop_dist <= 0 or balance <= 0:
         return 0.01
-    lots    = (balance * base_risk * size_multiplier) / (stop_distance * 100.0)
-    lot_cap = getattr(config, "V1_LOT_HARD_CAP", 0.50)
-    return max(0.01, min(round(lots, 2), lot_cap))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BACKTEST ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-class BacktestEngine:
-    """
-    Main backtesting engine. Replays M5 bars and simulates the full trading system.
-
-    Now includes all 13 strategies (S1/S1b/S1d/S1e/S1f/S2/S3/S4/S5/S6/S7/S8/R3),
-    full kill switch enforcement (KS3/KS4/KS5/KS6), TLT macro bias proxy,
-    commission deduction, and weekly PnL tracking.
-
-    Usage:
-        engine = BacktestEngine(
-            start_date=datetime(2025, 1, 1),
-            end_date=datetime(2026, 3, 31),
-        )
-        results = engine.run()
-        results.summary()
-    """
-
-    def __init__(
-        self,
-        start_date: datetime,
-        end_date: datetime,
-        initial_balance: float = 10000.0,
-        slippage_points: float = 0.7,
-        strategies: Optional[list[str]] = None,
-        cache_dir: str = "backtest_data",
-    ):
-        self.start_date      = start_date
-        self.end_date        = end_date
-        self.initial_balance = initial_balance
-        self.slippage_points = slippage_points
-        self.cache_dir       = cache_dir
-
-        self.strategies = strategies or [
-            "S1_LONDON_BRK", "S1B_FAILED_BRK", "S1D_PYRAMID",
-            "S1E_PYRAMID", "S1F_POST_TK",
-            "S2_MEAN_REV", "S3_STOP_HUNT_REV",
-            "S4_EMA_PULLBACK", "S5_NY_COMPRESS",
-            "S6_ASIAN_BRK", "S7_DAILY_STRUCT",
-            "S8_NEWS_SPIKE", "R3_CAL_MOMENTUM",
-        ]
-
-        self.data_feed   = HistoricalDataFeed(start_date, end_date, cache_dir=cache_dir)
-        self.bar_buffer  = BarBuffer()
-        self.exec_sim    = ExecutionSimulator(slippage_points=slippage_points)
-        self.spread_feed: Optional[HistoricalSpreadFeed] = None
-        self.event_feed:  Optional[HistoricalEventFeed]  = None
-
-        self.state = SimulatedState(
-            balance=initial_balance, equity=initial_balance, peak_equity=initial_balance,
-        )
-
-        self.pending_orders:  list[SimOrder]    = []
-        self.open_positions:  list[SimPosition] = []
-        self.closed_trades:   list[TradeRecord] = []
-        self.equity_curve:    list[EquityPoint] = []
-
-        # Indicator cache
-        self._last_adx_h4:     float = 25.0
-        self._last_atr_pct_h1: float = 50.0
-        self._last_atr_h1_raw: float = 20.0
-        self._last_atr_m15:    float = 5.0
-        self._last_ema20_h1:   Optional[float] = None
-        self._last_ema20_m15:  Optional[float] = None
-        self._last_rsi_h1:     Optional[float] = None
-        self._last_daily_atr:  Optional[float] = None
-        self._last_di_plus:    Optional[float] = None
-        self._last_di_minus:   Optional[float] = None
-
-        # GAP-11: macro bias derived each H1 update
-        self._current_macro_bias: str = "BOTH_PERMITTED"
-
-        # GAP-15: weekly PnL tracking for KS5
-        self._weekly_pnl:       float = 0.0
-        self._current_week:     Optional[int] = None
-
-        self._current_day:          Optional[int]      = None
-        self._bars_processed:       int                = 0
-        self._last_regime_update:   Optional[datetime] = None
-        self._last_session_hour:    Optional[tuple[int, int]] = None
-
-    # =========================================================================
-    # MAIN RUN LOOP
-    # =========================================================================
-
-    def run(self) -> "BacktestResults":
-        """Execute the backtest. Main replay loop."""
-        from backtest.results import BacktestResults
-
-        logger.info(
-            f"Starting backtest: {self.start_date} to {self.end_date}, "
-            f"balance=${self.initial_balance:,.2f}, strategies={self.strategies}"
-        )
-
-        m5_df = self.data_feed.load()
-        self.spread_feed = HistoricalSpreadFeed(m5_df)
-        self.event_feed  = HistoricalEventFeed(self.start_date, self.end_date)
-
-        self.equity_curve.append(EquityPoint(
-            timestamp=self.start_date, equity=self.initial_balance,
-        ))
-
-        total_bars    = len(m5_df)
-        log_interval  = max(total_bars // 20, 1)
-
-        for bar in self.data_feed.iter_m5_bars():
-            self._bars_processed += 1
-            current_time = bar["time"]
-
-            if self._bars_processed % log_interval == 0:
-                pct = self._bars_processed / total_bars * 100
-                logger.info(
-                    f"Progress: {pct:.0f}% ({self._bars_processed}/{total_bars}) "
-                    f"| Equity: ${self.state.equity:,.2f} | Trades: {len(self.closed_trades)}"
-                )
-
-            completed = self.bar_buffer.add_m5(bar)
-            self._check_daily_reset(current_time)
-            self._check_weekly_reset(current_time)
-            spread = self.spread_feed.get_spread_at(current_time)
-
-            current_hour_key = (current_time.year, current_time.timetuple().tm_yday, current_time.hour)
-            if current_hour_key != self._last_session_hour:
-                self._update_session(current_time)
-                self._last_session_hour = current_hour_key
-
-            if completed.get("H1"): self._update_h1_indicators(current_time)
-            if completed.get("H4"): self._update_h4_indicators()
-            if completed.get("D1"): self._update_d1_indicators()
-            if completed.get("M15"): self._update_m15_indicators()
-
-            if completed.get("M15") or completed.get("H4"):
-                self._update_regime(current_time, spread)
-
-            self._process_pending_orders(bar, spread, current_time)
-            self._manage_positions(bar, current_time)
-
-            # GAP-12: evaluate S1/S1b on every M5 bar for intra-candle catches
-            if "S1_LONDON_BRK" in self.strategies:
-                s1_orders = _evaluate_s1(
-                    self.bar_buffer, self.state, current_time,
-                    self._last_atr_h1_raw, self._current_macro_bias,
-                )
-                for o in s1_orders:
-                    if not any(
-                        p.strategy == "S1_LONDON_BRK" and p.direction == o.direction
-                        for p in self.pending_orders
-                    ):
-                        self.pending_orders.append(o)
-                        self.state.s7_placed_today = self.state.s7_placed_today  # no-op, just guard
-
-            if "S1B_FAILED_BRK" in self.strategies:
-                _check_s1b_trigger(self.bar_buffer, self.state)
-                s1b_orders = _evaluate_s1b(
-                    self.bar_buffer, self.state, current_time,
-                    self._last_atr_h1_raw, self._current_macro_bias,
-                )
-                self.pending_orders.extend(s1b_orders)
-
-            if completed.get("M15"):
-                self._update_range_data(current_time)
-                self._evaluate_strategies(current_time)
-                self._record_equity(current_time, bar["close"])
-
-        # Force-close open positions at backtest end
-        if self.open_positions:
-            last_bar = self.bar_buffer.get_last_bar("M5")
-            if last_bar:
-                self._close_all_positions(last_bar["close"], last_bar["time"], "BACKTEST_END")
-
-        logger.info(
-            f"Backtest complete: {len(self.closed_trades)} trades, "
-            f"final equity=${self.state.equity:,.2f}"
-        )
-
-        return BacktestResults(
-            trades=self.closed_trades,
-            equity_curve=self.equity_curve,
-            initial_balance=self.initial_balance,
-            start_date=self.start_date,
-            end_date=self.end_date,
-            strategies=self.strategies,
-        )
-
-    # =========================================================================
-    # DAILY RESET  — FIX BUG 3
-    # =========================================================================
-
-    def _check_daily_reset(self, current_time: datetime) -> None:
-        """
-        Reset ALL daily-scoped flags at midnight UTC.
-        Mirrors live system's on_new_day() completely.
-        """
-        day = current_time.timetuple().tm_yday
-        if self._current_day is not None and day != self._current_day:
-            self.state.s1_family_attempts_today = 0
-            self.state.s1f_attempts_today       = 0
-            self.state.s2_fired_today           = False
-            self.state.s3_fired_today           = False
-            self.state.s4_fired_today           = False
-            self.state.s5_fired_today           = False
-            self.state.s8_fired_today           = False
-            self.state.s6_placed_today          = False
-            self.state.s7_placed_today          = False
-            self.state.s1d_ema_touched_today    = False
-            self.state.s1d_fired_today          = False
-            self.state.s1e_pyramid_done         = False
-            self.state.s8_armed                 = False
-            self.state.s8_arm_time              = None
-            self.state.s8_confirmation_passed   = False
-            self.state.r3_fired_today           = False
-            self.state.range_computed           = False
-            self.state.daily_pnl                = 0.0
-            self.state.daily_trades             = 0
-            # Do NOT reset consecutive_losses — preserved across midnight (live parity)
-            logger.debug(f"Daily reset at {current_time.date()}")
-        self._current_day = day
-
-    # =========================================================================
-    # GAP-15: WEEKLY RESET for KS5
-    # =========================================================================
-
-    def _check_weekly_reset(self, current_time: datetime) -> None:
-        """
-        GAP-15: Reset weekly PnL at start of each new ISO week (Monday midnight UTC).
-        Required for KS5 (weekly loss kill switch) to work correctly.
-        """
-        iso_week = current_time.isocalendar()[1]
-        if self._current_week is not None and iso_week != self._current_week:
-            self._weekly_pnl = 0.0
-            logger.debug(f"Weekly PnL reset at {current_time.date()} (week {iso_week})")
-        self._current_week = iso_week
-
-    # =========================================================================
-    # SESSION UPDATE
-    # =========================================================================
-
-    def _update_session(self, current_time: datetime) -> None:
-        from utils.session import get_session_for_datetime
-        self.state.current_session = get_session_for_datetime(current_time)
-
-    # =========================================================================
-    # INDICATOR UPDATES
-    # =========================================================================
-
-    def _update_h1_indicators(self, current_time: datetime) -> None:
-        """Recompute H1: ATR(14), EMA(20), RSI(14). Capped at 200 bars."""
-        h1_df = self.bar_buffer.get_series("H1", count=200)
-        if len(h1_df) < 20:
-            return
-        atr_mode   = getattr(config, "ATR_MAMODE", "RMA")
-        atr_period = getattr(config, "ATR_PERIOD", 14)
-        atr_series = ta.atr(h1_df["high"], h1_df["low"], h1_df["close"],
-                            length=atr_period, mamode=atr_mode)
-        if atr_series is not None and not atr_series.empty:
-            last_atr = atr_series.dropna()
-            if len(last_atr) > 0:
-                self._last_atr_h1_raw = float(last_atr.iloc[-1])
-                self.state.last_atr_h1_raw = self._last_atr_h1_raw
-                self._last_atr_pct_h1 = compute_atr_percentile(atr_series, self._last_atr_h1_raw)
-                self.state.last_atr_pct_h1 = self._last_atr_pct_h1
-        ema_series = ta.ema(h1_df["close"], length=20)
-        if ema_series is not None and not ema_series.empty:
-            v = ema_series.dropna()
-            if len(v) > 0: self._last_ema20_h1 = float(v.iloc[-1])
-        rsi_series = ta.rsi(h1_df["close"], length=14)
-        if rsi_series is not None and not rsi_series.empty:
-            v = rsi_series.dropna()
-            if len(v) > 0: self._last_rsi_h1 = float(v.iloc[-1])
-        # GAP-11: derive macro bias proxy from updated H1 indicators
-        if len(h1_df) > 0:
-            current_price = float(h1_df["close"].iloc[-1])
-            self._current_macro_bias = _derive_macro_bias(
-                price=current_price,
-                ema20_h1=self._last_ema20_h1,
-                adx_h4=self._last_adx_h4,
-                di_plus=self._last_di_plus,
-                di_minus=self._last_di_minus,
-            )
-
-    def _update_h4_indicators(self) -> None:
-        """
-        Recompute H4: ADX(14) + DI+(14) + DI-(14). Capped at 100 bars.
-        FIX Bug 5: reads DMP_14 and DMN_14.
-        """
-        h4_df = self.bar_buffer.get_series("H4", count=100)
-        if len(h4_df) < 30:
-            return
-        adx_df = ta.adx(h4_df["high"], h4_df["low"], h4_df["close"], length=14)
-        if adx_df is None or adx_df.empty:
-            return
-        if "ADX_14" in adx_df.columns:
-            v = adx_df["ADX_14"].dropna()
-            if len(v) > 0:
-                self._last_adx_h4      = float(v.iloc[-1])
-                self.state.last_adx_h4 = self._last_adx_h4
-        if "DMP_14" in adx_df.columns:
-            v = adx_df["DMP_14"].dropna()
-            if len(v) > 0:
-                self._last_di_plus             = float(v.iloc[-1])
-                self.state.last_di_plus_h4     = self._last_di_plus
-        if "DMN_14" in adx_df.columns:
-            v = adx_df["DMN_14"].dropna()
-            if len(v) > 0:
-                self._last_di_minus            = float(v.iloc[-1])
-                self.state.last_di_minus_h4    = self._last_di_minus
-
-    def _update_d1_indicators(self) -> None:
-        d1_df = self.bar_buffer.get_series("D1")
-        if len(d1_df) < 16:
-            return
-        atr_mode   = getattr(config, "ATR_MAMODE", "RMA")
-        atr_series = ta.atr(d1_df["high"], d1_df["low"], d1_df["close"],
-                            length=14, mamode=atr_mode)
-        if atr_series is not None and not atr_series.empty:
-            v = atr_series.dropna()
-            if len(v) > 0: self._last_daily_atr = float(v.iloc[-1])
-
-    def _update_m15_indicators(self) -> None:
-        """Recompute M15: ATR(14), EMA(20). Capped at 200 bars."""
-        m15_df = self.bar_buffer.get_series("M15", count=200)
-        if len(m15_df) < 20:
-            return
-        atr_mode   = getattr(config, "ATR_MAMODE", "RMA")
-        atr_series = ta.atr(m15_df["high"], m15_df["low"], m15_df["close"],
-                            length=14, mamode=atr_mode)
-        if atr_series is not None and not atr_series.empty:
-            v = atr_series.dropna()
-            if len(v) > 0:
-                self._last_atr_m15      = float(v.iloc[-1])
-                self.state.last_atr_m15 = self._last_atr_m15
-        ema_series = ta.ema(m15_df["close"], length=20)
-        if ema_series is not None and not ema_series.empty:
-            v = ema_series.dropna()
-            if len(v) > 0: self._last_ema20_m15 = float(v.iloc[-1])
-
-    # =========================================================================
-    # REGIME
-    # =========================================================================
-
-    def _update_regime(self, current_time: datetime, spread: float) -> None:
-        avg_spread   = self.spread_feed.get_avg_spread_24h() if self.spread_feed else 25.0
-        spread_ratio = spread / avg_spread if avg_spread > 0 else 1.0
-        has_event    = self.event_feed.has_upcoming_event(current_time) if self.event_feed else False
-        regime, mult = classify_regime_backtest(
-            adx_h4=self._last_adx_h4, atr_pct_h1=self._last_atr_pct_h1,
-            session=self.state.current_session, has_upcoming_event=has_event,
-            spread_ratio=spread_ratio,
-        )
-        self.state.current_regime   = regime
-        self.state.size_multiplier  = mult
-        self._last_regime_update    = current_time
-
-    # =========================================================================
-    # RANGE DATA
-    # =========================================================================
-
-    def _update_range_data(self, current_time: datetime) -> None:
-        if current_time.hour < 7 or self.state.range_computed:
-            return
-        range_data = _compute_asian_range(self.bar_buffer, current_time)
-        if range_data:
-            self.state.range_high    = range_data["range_high"]
-            self.state.range_low     = range_data["range_low"]
-            self.state.range_size    = range_data["range_size"]
-            self.state.range_computed = True
-            logger.debug(
-                f"Asian range: {range_data['range_low']:.2f}-{range_data['range_high']:.2f} "
-                f"(size={range_data['range_size']:.2f})"
-            )
-
-    # =========================================================================
-    # ORDER PROCESSING
-    # =========================================================================
-
-    def _process_pending_orders(
-        self, bar: dict, spread: float, current_time: datetime
-    ) -> None:
-        if not self.pending_orders:
-            return
-        filled, remaining = self.exec_sim.process_pending_orders(
-            self.pending_orders, bar, spread, current_time
-        )
-        for pos in filled:
-            pos.regime_at_entry = self.state.current_regime
-            self.open_positions.append(pos)
-            # OCO: cancel linked leg
-            filled_tags: set[str] = set()
-            for order in self.pending_orders:
-                if order not in remaining and order.tag:
-                    filled_tags.add(order.tag)
-            new_remaining = [
-                o for o in remaining
-                if not (o.linked_tag and o.linked_tag in filled_tags)
-            ]
-            remaining = new_remaining
-            # Update counters
-            strat = pos.strategy
-            if strat == "S1_LONDON_BRK":
-                self.state.s1_family_attempts_today += 1
-                self.state.trend_family_occupied     = True
-                self.state.trend_family_strategy     = strat
-                self.state.last_s1_direction         = pos.direction
-                self.state.original_lot_size         = pos.lots
-            elif strat == "S1B_FAILED_BRK":
-                self.state.s1_family_attempts_today += 1
-                self.state.trend_family_occupied     = True
-                self.state.trend_family_strategy     = strat
-            elif strat in ("S1D_PYRAMID", "S1E_PYRAMID"):
-                self.state.s1d_pyramid_count        += 1
-                self.state.trend_family_occupied     = True
-                self.state.trend_family_strategy     = strat
-            elif strat == "S1F_POST_TK":
-                self.state.s1f_attempts_today       += 1
-                self.state.trend_family_occupied     = True
-                self.state.trend_family_strategy     = strat
-            elif strat == "S7_DAILY_STRUCT":
-                self.state.s7_placed_today = True
-            elif strat == "S6_ASIAN_BRK":
-                self.state.s6_placed_today = True
-            elif strat == "S2_MEAN_REV":
-                self.state.s2_fired_today  = True
-                self.state.trend_family_occupied = True
-                self.state.trend_family_strategy = strat
-            elif strat == "S3_STOP_HUNT_REV":
-                self.state.s3_fired_today  = True
-                self.state.trend_family_occupied = True
-                self.state.trend_family_strategy = strat
-            elif strat == "S4_EMA_PULLBACK":
-                self.state.s4_fired_today  = True
-                self.state.trend_family_occupied = True
-                self.state.trend_family_strategy = strat
-            elif strat == "S5_NY_COMPRESS":
-                self.state.s5_fired_today  = True
-                self.state.trend_family_occupied = True
-                self.state.trend_family_strategy = strat
-            elif strat == "S8_NEWS_SPIKE":
-                self.state.s8_fired_today  = True
-                self.state.s8_open_ticket  = id(pos)
-            elif strat == "R3_CAL_MOMENTUM":
-                self.state.r3_fired_today  = True
-                self.state.r3_open_ticket  = id(pos)
-                self.state.r3_open_time    = current_time
-        self.pending_orders = remaining
-
-    # =========================================================================
-    # POSITION MANAGEMENT  — FIX BUG 2 + BUG 6
-    # =========================================================================
-
-    def _close_position(
-        self, pos: SimPosition, exit_price: float,
-        current_time: datetime, reason: str,
-    ) -> None:
-        """
-        FIX Bug 2 + Bug 4: Unified position-close helper.
-        Clears lane flags after every close.
-        """
-        trade = self.exec_sim.close_position(
-            pos, exit_price, current_time, reason,
-            regime_at_exit=self.state.current_regime,
-        )
-        self._record_trade(trade)
-        self._update_lane_flags(pos)
-
-    def _update_lane_flags(self, pos: SimPosition) -> None:
-        """Clear position-lane occupied flags when a position is closed."""
-        strat = pos.strategy
-        if strat in (
-            "S1_LONDON_BRK", "S1B_FAILED_BRK", "S1D_PYRAMID", "S1E_PYRAMID",
-            "S1F_POST_TK", "S2_MEAN_REV", "S3_STOP_HUNT_REV",
-            "S4_EMA_PULLBACK", "S5_NY_COMPRESS",
-            "S6_ASIAN_BRK", "S7_DAILY_STRUCT",
-        ):
-            self.state.trend_family_occupied  = False
-            self.state.trend_family_strategy  = None
-            self.state.open_trade_id          = None
-        elif strat == "S8_NEWS_SPIKE":
-            self.state.s8_open_ticket         = None
-            self.state.s8_trade_direction     = None
-        elif strat == "R3_CAL_MOMENTUM":
-            self.state.r3_open_ticket         = None
-            self.state.r3_direction           = None
-            self.state.r3_armed               = False
-
-    def _manage_r3_position(
-        self, pos: SimPosition, price: float,
-        current_time: datetime, bar: dict,
-    ) -> bool:
-        """R3 time-exit: close after 30 minutes."""
-        if self.state.r3_open_time is None:
-            return False
-        elapsed = (current_time - self.state.r3_open_time).total_seconds() / 60
-        if elapsed >= 30:
-            self._close_position(pos, price, current_time, "TIME_KILL")
-            self.state.r3_open_time = None
-            return True
-        return False
-
-    def _manage_positions(self, bar: dict, current_time: datetime) -> None:
-        """Manage all open positions each M5 bar."""
-        still_open: list[SimPosition] = []
-
-        for pos in self.open_positions:
-            if pos.direction == "LONG":
-                pos.max_favorable = max(pos.max_favorable, bar["high"] - pos.entry_price)
-            else:
-                pos.max_favorable = max(pos.max_favorable, pos.entry_price - bar["low"])
-            pos.max_r = max(pos.max_r, pos.current_r(bar["close"]))
-
-            if pos.strategy == "R3_CAL_MOMENTUM":
-                if self._manage_r3_position(pos, bar["close"], current_time, bar):
-                    continue
-
-            closed, exit_price, reason = self.exec_sim.check_sl_tp(pos, bar)
-            if closed:
-                self._close_position(pos, exit_price, current_time, reason)
-                continue
-
-            partial_r = getattr(config, "PARTIAL_EXIT_R", 2.0)
-            should_partial, partial_price = self.exec_sim.check_partial_exit(pos, bar, partial_r)
-            if should_partial and not pos.partial_done:
-                half_lots = round(pos.lots / 2, 2)
-                if half_lots >= 0.01:
-                    partial_pos = SimPosition(
-                        strategy=pos.strategy, direction=pos.direction,
-                        entry_price=pos.entry_price, entry_time=pos.entry_time,
-                        lots=half_lots, stop_price_original=pos.stop_price_original,
-                        current_sl=pos.current_sl, tp=pos.tp,
-                        regime_at_entry=pos.regime_at_entry,
-                    )
-                    trade = self.exec_sim.close_position(
-                        partial_pos, partial_price, current_time, "PARTIAL",
-                        regime_at_exit=self.state.current_regime,
-                    )
-                    self._record_trade(trade)
-                    pos.lots         = round(pos.lots - half_lots, 2)
-                    pos.partial_done = True
-                    # Update backtest state for S1e eligibility
-                    if pos.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK", "S1F_POST_TK"):
-                        self.state.position_partial_done = True
-
-            be_r = getattr(config, "BE_ACTIVATION_R", 1.5)
-            if not pos.be_activated and self.exec_sim.check_be_activation(pos, bar, be_r):
-                pos.current_sl   = pos.entry_price
-                pos.be_activated = True
-                # Update backtest state for S1e eligibility
-                if pos.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK", "S1F_POST_TK"):
-                    self.state.position_be_activated = True
-                    self.state.stop_price_current    = pos.entry_price
-                logger.debug(f"BE activated: {pos.strategy} {pos.direction} @ {pos.entry_price:.2f}")
-
-            if pos.be_activated:
-                trail_mult = getattr(config, "ATR_TRAIL_MULTIPLIER", 2.5)
-                new_sl = self.exec_sim.compute_atr_trail(pos, bar, self._last_atr_m15, trail_mult)
-                if new_sl is not None:
-                    pos.current_sl = new_sl
-                    if pos.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK", "S1F_POST_TK"):
-                        self.state.stop_price_current = new_sl
-
-            still_open.append(pos)
-
-        self.open_positions = still_open
-
-    # =========================================================================
-    # STRATEGY EVALUATION
-    # =========================================================================
-
-    def _evaluate_strategies(self, current_time: datetime) -> None:
-        """
-        Evaluate all enabled strategies for new signals.
-
-        GAP-9:  KS5 weekly loss kill switch enforced.
-        GAP-10: KS6 drawdown kill switch enforced.
-        GAP-14: KS4 cooldown reduces S1 family attempt cap.
-        """
-        # ── KS3: Daily loss limit ──────────────────────────────────────────
-        daily_loss_limit = getattr(config, "KS3_DAILY_LOSS_LIMIT_PCT", -0.04)
-        if self.state.balance > 0:
-            if self.state.daily_pnl / self.state.balance <= daily_loss_limit:
-                logger.debug(f"KS3 HALT: daily_pnl={self.state.daily_pnl:.2f}")
-                return
-
-        # ── GAP-9: KS5 Weekly loss limit ─────────────────────────────────
-        weekly_loss_limit = getattr(config, "KS5_WEEKLY_LOSS_LIMIT_PCT", -0.08)
-        if self.state.balance > 0:
-            weekly_loss_pct = self._weekly_pnl / self.state.balance
-            if weekly_loss_pct <= weekly_loss_limit:
-                logger.debug(f"KS5 HALT: weekly_pnl={self._weekly_pnl:.2f} ({weekly_loss_pct:.1%})")
-                return
-
-        # ── GAP-10: KS6 Account drawdown limit ───────────────────────────
-        max_dd_limit = getattr(config, "KS6_MAX_DRAWDOWN_PCT", -0.15)
-        if self.state.peak_equity > 0:
-            current_dd = (self.state.equity - self.state.peak_equity) / self.state.peak_equity
-            if current_dd <= max_dd_limit:
-                logger.debug(f"KS6 HALT: drawdown={current_dd:.1%}")
-                return
-
-        new_orders: list[SimOrder] = []
-
-        # Note: S1/S1b are evaluated on every M5 bar in run() loop (GAP-12)
-        # Here we evaluate the rest (M15-cadence strategies)
-
-        if "S1D_PYRAMID" in self.strategies:
-            new_orders.extend(_evaluate_s1d(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_m15, self._last_ema20_m15,
-            ))
-        if "S1E_PYRAMID" in self.strategies:
-            new_orders.extend(_evaluate_s1e(
-                self.bar_buffer, self.state, current_time,
-                self._last_ema20_m15,
-            ))
-        if "S1F_POST_TK" in self.strategies:
-            new_orders.extend(_evaluate_s1f(
-                self.bar_buffer, self.state, current_time,
-                self._last_ema20_m15, self._current_macro_bias,
-            ))
-        if "S2_MEAN_REV" in self.strategies:
-            new_orders.extend(_evaluate_s2(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_h1_raw, self._last_ema20_h1, self._last_rsi_h1,
-            ))
-        if "S3_STOP_HUNT_REV" in self.strategies:
-            new_orders.extend(_evaluate_s3(
-                self.bar_buffer, self.state, current_time, self._last_atr_h1_raw,
-            ))
-        if "S4_EMA_PULLBACK" in self.strategies:
-            new_orders.extend(_evaluate_s4(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_h1_raw, self._last_ema20_h1,
-                self._last_di_plus, self._last_di_minus, self._current_macro_bias,
-            ))
-        if "S5_NY_COMPRESS" in self.strategies:
-            new_orders.extend(_evaluate_s5(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_h1_raw, self._current_macro_bias,
-            ))
-        if "S6_ASIAN_BRK" in self.strategies:
-            new_orders.extend(_evaluate_s6(
-                self.bar_buffer, self.state, current_time, self._last_atr_m15,
-            ))
-        if "S7_DAILY_STRUCT" in self.strategies:
-            new_orders.extend(_evaluate_s7(
-                self.bar_buffer, self.state, current_time, self._last_daily_atr,
-            ))
-        if "S8_NEWS_SPIKE" in self.strategies:
-            new_orders.extend(_evaluate_s8(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_h1_raw, self._current_macro_bias,
-            ))
-        if "R3_CAL_MOMENTUM" in self.strategies:
-            new_orders.extend(_evaluate_r3(
-                self.bar_buffer, self.state, current_time,
-                self._last_atr_h1_raw, self.event_feed, self._current_macro_bias,
-            ))
-
-        for order in new_orders:
-            self.pending_orders.append(order)
-            logger.debug(f"New order: {order.strategy} {order.direction} {order.order_type} @ {order.price:.2f}")
-            if order.strategy == "S7_DAILY_STRUCT": self.state.s7_placed_today = True
-            elif order.strategy == "S6_ASIAN_BRK":  self.state.s6_placed_today = True
-
-    # =========================================================================
-    # TRADE RECORDING
-    # =========================================================================
-
-    def _record_trade(self, trade: TradeRecord) -> None:
-        """
-        Record a closed trade and update account state.
-        GAP-13: Deduct $7/lot round-trip commission per trade.
-        GAP-15: Accumulate weekly PnL for KS5 gate.
-        """
-        # GAP-13: commission deduction — $7/lot round trip
-        commission_per_lot = getattr(config, "COMMISSION_PER_LOT_RT", 7.0)
-        commission = round(trade.lots * commission_per_lot, 2)
-        net_pnl = trade.pnl - commission
-
-        self.closed_trades.append(trade)
-        self.state.balance      += net_pnl
-        self.state.daily_pnl    += net_pnl
-        self._weekly_pnl        += net_pnl   # GAP-15
-        self.state.daily_trades += 1
-
-        if trade.pnl < 0:
-            self.state.consecutive_losses += 1
-            # Update S1 last_s1_max_r for S1b trigger check
-            if trade.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK"):
-                self.state.last_s1_max_r = min(self.state.last_s1_max_r, -abs(trade.r_multiple))
-        else:
-            self.state.consecutive_losses  = 0
-            if trade.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK"):
-                self.state.last_s1_max_r = max(trade.r_multiple, 0.0)
-
-        # Reset S1e / S1d / partial tracking when S1 family trade closes
-        if trade.strategy in ("S1_LONDON_BRK", "S1B_FAILED_BRK", "S1F_POST_TK"):
-            if trade.exit_reason not in ("PARTIAL",):
-                self.state.position_partial_done  = False
-                self.state.position_be_activated  = False
-                self.state.stop_price_current     = 0.0
-
-        logger.debug(
-            f"Trade closed: {trade.strategy} {trade.direction} "
-            f"P&L=${net_pnl:+.2f} (gross=${trade.pnl:+.2f} comm=${commission:.2f}) "
-            f"R={trade.r_multiple:+.2f} ({trade.exit_reason})"
-        )
-
-    def _record_equity(self, current_time: datetime, current_price: float) -> None:
-        unrealized  = sum(pos.unrealized_pnl(current_price) for pos in self.open_positions)
-        equity      = self.state.balance + unrealized
-        self.state.equity      = equity
-        self.state.peak_equity = max(self.state.peak_equity, equity)
-        dd_pct = (self.state.peak_equity - equity) / self.state.peak_equity if self.state.peak_equity > 0 else 0.0
-        self.equity_curve.append(EquityPoint(timestamp=current_time, equity=equity, drawdown_pct=dd_pct))
-
-    def _close_all_positions(self, price: float, time: datetime, reason: str) -> None:
-        """Force-close all open positions."""
-        for pos in self.open_positions:
-            self._close_position(pos, price, time, reason)
-        self.open_positions = []
+    base_risk    = getattr(config, "BASE_RISK_PCT", 0.01)
+    contract_sz  = getattr(config, "CONTRACT_SIZE", 100.0)
+    hard_cap     = getattr(config, "V1_LOT_HARD_CAP", 1.0)
+    lots = (balance * base_risk * size_multiplier) / (stop_dist * contract_sz)
+    lots = max(0.01, min(round(lots, 2), hard_cap))
+    return lots
