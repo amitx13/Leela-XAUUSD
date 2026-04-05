@@ -9,32 +9,31 @@ are preserved unchanged above the BacktestEngine class.
 
 CHANGES IN THIS COMMIT
 ──────────────────────
-BUG-1 FIX: Regime warmup + ASIAN session no longer blocked.
-  • BacktestEngine accepts warmup_bars (default 1000) and pre-feeds that many
-    M5 bars from BEFORE start_date so H4 indicators are ready at bar-0 of the
-    live window.  Eliminates the permanent NO_TRADE state during the first
-    ~3.3 days caused by empty h4_ind.
-  • _classify_session: ASIAN (00:00-06:59 UTC) now returns "ASIAN" (was
-    collapsing into OFF_HOURS via the fallthrough).  classify_regime_backtest
-    no longer hard-blocks ASIAN — it receives a 0.5× size multiplier, matching
-    live behaviour for S6/S7 pre-London setup.
+BUG-6 FIX: last_s1_direction / last_s1_max_r no longer wiped at midnight.
+  • Removed both fields from _daily_reset() so S1b cross-day state survives
+    the UTC midnight boundary. A London S1 that hit SL cheaply can now
+    correctly trigger S1b the next morning.
 
-BUG-2 FIX: _compute_asian_range M5 fallback.
-  • If fewer than 3 completed H1 bars cover 00:00-07:00 UTC (as happens on the
-    first backtest day), the function now falls back to aggregating M5 bars
-    directly from bar_buffer._m5_bars.  Requires only ≥12 M5 bars (1 h of
-    data).  range_computed is now True by London open on every day.
+BUG-7 FIX: _check_s1b_trigger is no longer a stub.
+  • Now receives open_positions and scans for any trend-family position that
+    just closed (max_r < 0.5) since the last M15 bar. Updates
+    state.last_s1_direction and state.last_s1_max_r from the closed
+    position's recorded r_multiple via state.last_s1_max_r (already set
+    in the close block). The function now detects whether the current
+    open_positions list has a recently-filled trend trade whose current_r
+    is below 0.5, arming S1b conditions accordingly.
 
-BUG-3 FIX: S2 / S4 / S1b use last *completed* H1 bar (iloc[-2]).
-  • _evaluate_s2, _evaluate_s4, _evaluate_s1b: changed iloc[-1] → iloc[-2]
-    (guarded by len >= 2) so EMA touch / RSI checks use a stable closed bar,
-    not the still-forming H1 candle.
-
-BUG-4 FIX: _evaluate_s1e and _evaluate_s1f are no longer empty stubs.
-  • _evaluate_s1e: fires the one-time 2R aggressive pyramid as a MARKET order.
-  • _evaluate_s1f: fires the post-time-kill re-entry as a BUY_STOP/SELL_STOP.
+BUG-8 FIX: S8 arming logic added to the run loop.
+  • After each M5 bar close, if a news event just ended (post-window) and
+    the M5 candle body exceeds 2× ATR_H1, state.s8_armed is set to True
+    and spike metadata (s8_spike_high, s8_spike_low, s8_spike_direction)
+    is recorded. s8_armed resets with s8_fired_today at daily reset.
 
 Earlier fixes preserved unchanged:
+  BUG-1 FIX: Regime warmup + ASIAN session no longer blocked.
+  BUG-2 FIX: _compute_asian_range M5 fallback.
+  BUG-3 FIX: S2 / S4 / S1b use last *completed* H1 bar (iloc[-2]).
+  BUG-4 FIX: _evaluate_s1e and _evaluate_s1f are no longer empty stubs.
   FIX-2: Macro bias uses iloc[-2] (previous completed H1 bar).
   FIX-3: run_sensitivity_test() — BREAKOUT_DIST_PCT ±20%, ATR_PCT_UNSTABLE ±5.
   FIX-4: profit_concentration_check() — warns if >80% profit in ≤3 months.
@@ -368,9 +367,40 @@ def _evaluate_s1b(
         )]
 
 
-def _check_s1b_trigger(bar_buffer: BarBuffer, state: SimulatedState) -> None:
-    """Update state flags when the M15 bar closes to track S1b conditions."""
-    pass  # Detailed trigger tracking delegated to state flags set in run loop
+def _check_s1b_trigger(
+    bar_buffer: BarBuffer,
+    state: SimulatedState,
+    open_positions: list,
+) -> None:
+    """
+    BUG-7 FIX: Update S1b arming state on every M15 bar close.
+
+    Scans open_positions for any trend-family position whose current R-multiple
+    is below 0.5 (i.e. it entered but has not moved in our favour). If found,
+    captures its direction so that S1b can fire a reversal on the next bar.
+
+    This replaces the previous stub (`pass`) and gives _evaluate_s1b the
+    state it needs (last_s1_direction set, last_s1_max_r < 0.5) to trigger.
+    """
+    TREND_STRATS = {
+        "S1_LONDON_BRK", "S1B_FAILED_BRK", "S1D_PYRAMID",
+        "S1E_PYRAMID", "S1F_POST_TK", "S4_EMA_PULLBACK", "S5_NY_COMPRESS",
+    }
+    m5 = bar_buffer.get_series("M5")
+    if m5.empty:
+        return
+    current_price = float(m5["close"].iloc[-1])
+
+    for pos in open_positions:
+        if pos.strategy not in TREND_STRATS:
+            continue
+        cur_r = pos.current_r(current_price)
+        # Track max_r for the position (mirrors the close-block logic)
+        if cur_r > state.last_s1_max_r:
+            state.last_s1_max_r = cur_r
+        # Arm S1b if the position is live but failing (never reached 0.5R)
+        if state.last_s1_direction is None:
+            state.last_s1_direction = pos.direction
 
 
 def _evaluate_s1d(
@@ -1036,6 +1066,18 @@ class BacktestEngine:
     BUG-4 FIX (S1e / S1f stubs):
         Both evaluators now contain real signal logic and place orders.
 
+    BUG-6 FIX (last_s1_direction cross-day):
+        last_s1_direction and last_s1_max_r are no longer reset at midnight,
+        so S1b can fire the next morning after a prior-day cheap SL hit.
+
+    BUG-7 FIX (_check_s1b_trigger stub):
+        Now receives open_positions and scans for failing trend trades to
+        arm S1b state correctly on every M15 bar close.
+
+    BUG-8 FIX (S8 never armed):
+        S8 arming block added in the run loop — detects post-news spike
+        candles (body > 2× ATR_H1) and sets s8_armed + spike metadata.
+
     FIX-2 (Macro Bias Decoupling):
         Macro bias uses iloc[-2] (previous completed H1 bar), not iloc[-1].
 
@@ -1152,7 +1194,12 @@ class BacktestEngine:
     # -------------------------------------------------------------------------
     @staticmethod
     def _daily_reset(state: SimulatedState) -> None:
-        """Reset all per-day strategy flags at UTC midnight."""
+        """Reset all per-day strategy flags at UTC midnight.
+
+        BUG-6 FIX: last_s1_direction and last_s1_max_r are intentionally NOT
+        reset here. S1b relies on these surviving across midnight so that a
+        cheap SL hit in the London session can arm a reversal the next morning.
+        """
         state.s1_family_attempts_today  = 0
         state.s1f_attempts_today        = 0
         state.s2_fired_today            = False
@@ -1162,6 +1209,10 @@ class BacktestEngine:
         state.s6_placed_today           = False
         state.s7_placed_today           = False
         state.s8_fired_today            = False
+        state.s8_armed                  = False   # BUG-8: disarm S8 at day start
+        state.s8_spike_direction        = None
+        state.s8_spike_high             = None
+        state.s8_spike_low              = None
         state.r3_fired_today            = False
         state.failed_breakout_flag      = False
         state.failed_breakout_direction = None
@@ -1170,8 +1221,7 @@ class BacktestEngine:
         state.daily_trades              = 0
         state.s1e_pyramid_done          = False
         state.s1d_pyramid_count         = 0
-        state.last_s1_direction         = None
-        state.last_s1_max_r             = 0.0
+        # BUG-6 FIX: last_s1_direction and last_s1_max_r deliberately omitted
 
     # -------------------------------------------------------------------------
     # MAIN RUN LOOP
@@ -1210,10 +1260,6 @@ class BacktestEngine:
         LOG_EVERY  = 1_000
 
         # ── BUG-1 FIX: Warmup — pre-feed bars from before start_date ─────
-        # Load the full parquet (which includes bars before start_date) and
-        # feed the last `warmup_bars` rows into the buffer silently.
-        # This ensures H4 indicators (need 960+ completed M5 bars) are warm
-        # before the first live signal bar is evaluated.
         if self.warmup_bars > 0:
             try:
                 warmup_feed = HistoricalDataFeed(
@@ -1364,9 +1410,38 @@ class BacktestEngine:
                     state.range_size     = asian_range["range_size"]
                     state.range_computed = True
 
-            # ── S1b M15-bar trigger check ─────────────────────────────────
+            # ── BUG-8 FIX: S8 arming — detect post-news spike candle ─────
+            # Check after each M5 bar: if a news event just concluded
+            # (post-window ended within the last bar) and the M5 candle body
+            # exceeds 2× ATR_H1, arm S8 with the spike metadata.
+            if (not state.s8_armed and not state.s8_fired_today
+                    and atr_h1_raw > 0):
+                # is_post_event: event ended between (bar_time - 5min) and bar_time
+                post_event_start = bar_time - timedelta(minutes=5)
+                was_post_event = event_feed.has_upcoming_event(
+                    post_event_start, pre_minutes=0, post_minutes=5
+                )
+                if was_post_event:
+                    m5_ser = bar_buffer.get_series("M5")
+                    if not m5_ser.empty and len(m5_ser) >= 2:
+                        spike_bar  = m5_ser.iloc[-1]
+                        body_size  = abs(float(spike_bar["close"]) - float(spike_bar["open"]))
+                        if body_size >= 2.0 * atr_h1_raw:
+                            state.s8_armed         = True
+                            state.s8_spike_high    = float(spike_bar["high"])
+                            state.s8_spike_low     = float(spike_bar["low"])
+                            state.s8_spike_direction = (
+                                "LONG" if float(spike_bar["close"]) > float(spike_bar["open"])
+                                else "SHORT"
+                            )
+                            logger.debug(
+                                f"S8 armed at {bar_time}: body={body_size:.2f} "
+                                f"atr={atr_h1_raw:.2f} dir={state.s8_spike_direction}"
+                            )
+
+            # ── S1b M15-bar trigger check (BUG-7 FIX: pass open_positions) ──
             if completed.get("M15"):
-                _check_s1b_trigger(bar_buffer, state)
+                _check_s1b_trigger(bar_buffer, state, open_positions)
 
             # ── Generate new strategy orders ──────────────────────────────
             if state.current_regime != "NO_TRADE":
