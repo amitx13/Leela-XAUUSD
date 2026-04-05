@@ -353,6 +353,7 @@ def _evaluate_s1b(
             lots=lots,
             expiry=bar_time.replace(hour=14, minute=0, second=0, microsecond=0),
             placed_time=bar_time,
+            tag="s1b_buy", linked_tag="s1b_sell",
         )]
     else:
         entry = round(last_close - atr_h1 * 0.3, 2)
@@ -364,6 +365,7 @@ def _evaluate_s1b(
             lots=lots,
             expiry=bar_time.replace(hour=14, minute=0, second=0, microsecond=0),
             placed_time=bar_time,
+            tag="s1b_sell", linked_tag="s1b_buy",
         )]
 
 
@@ -1132,7 +1134,7 @@ class BacktestEngine:
 
         Returns {} if series is too short (< 20 bars).
         """
-        if ta is None or len(series) < 20:
+        if ta is None or len(series) < 16:
             return {}
         try:
             adx_df = ta.adx(series["high"], series["low"], series["close"], length=14)
@@ -1263,8 +1265,8 @@ class BacktestEngine:
         if self.warmup_bars > 0:
             try:
                 warmup_feed = HistoricalDataFeed(
-                    start_date = self.start_date - timedelta(days=30),
-                    end_date   = self.start_date,
+                    start_date = self.start_date - timedelta(days=60),
+                    end_date   = self.start_date + timedelta(days=1),
                     cache_dir  = self.cache_dir,
                 )
                 warmup_all = list(warmup_feed.iter_m5_bars())
@@ -1332,7 +1334,7 @@ class BacktestEngine:
             h1_series  = bar_buffer.get_series("H1")
             m15_series = bar_buffer.get_series("M15")
 
-            h4_ind  = self._compute_indicators(h4_series)  if len(h4_series)  > 20 else {}
+            h4_ind  = self._compute_indicators(h4_series)  if len(h4_series) >= 16 else {}
             h1_ind  = self._compute_indicators(h1_series)  if len(h1_series)  > 20 else {}
             m15_ind = self._compute_indicators(m15_series) if len(m15_series) > 20 else {}
 
@@ -1345,7 +1347,7 @@ class BacktestEngine:
             di_minus_h4 = h4_ind.get("di_minus")
 
             # ATR percentile for regime gate
-            if ta is not None and len(h1_series) > 14:
+            if ta is not None and len(h1_series) > 50:
                 atr_series_h1 = ta.atr(h1_series["high"], h1_series["low"],
                                         h1_series["close"], length=14)
                 atr_pct_h1 = compute_atr_percentile(atr_series_h1, atr_h1_raw)
@@ -1371,12 +1373,16 @@ class BacktestEngine:
 
             # ── KS3: daily loss kill switch ───────────────────────────────
             ks3_pct = self._cfg("KS3_DAILY_LOSS_LIMIT_PCT", 0.03)
-            if state.daily_pnl <= -(ks3_pct * state.balance):
+            ks3_limit = abs(ks3_pct) * state.balance
+            if state.daily_pnl < -ks3_limit:
+                logger.warning(f"KS3 triggered: daily_pnl={state.daily_pnl}, limit={ks3_limit}")
                 state.current_regime = "NO_TRADE"
 
             # ── KS5: weekly loss kill switch ──────────────────────────────
             ks5_pct = self._cfg("KS5_WEEKLY_LOSS_LIMIT_PCT", 0.05)
-            if weekly_pnl <= -(ks5_pct * state.balance):
+            ks5_limit = abs(ks5_pct) * state.balance
+            if weekly_pnl < -ks5_limit:
+                logger.warning(f"KS5 triggered: weekly_pnl={weekly_pnl}, limit={ks5_limit}")
                 state.current_regime = "NO_TRADE"
 
             # ── KS6: account drawdown kill switch ─────────────────────────
@@ -1385,8 +1391,9 @@ class BacktestEngine:
                 dd_pct = (state.peak_equity - state.equity) / state.peak_equity
             else:
                 dd_pct = 0.0
-            ks6_thresh = self._cfg("KS6_MAX_DRAWDOWN_PCT", 0.10)
+            ks6_thresh = self._cfg("KS6_DRAWDOWN_LIMIT_PCT", 0.20)
             if dd_pct >= ks6_thresh:
+                logger.warning(f"KS6 triggered: dd_pct={dd_pct:.2%}, thresh={ks6_thresh}")
                 state.current_regime = "NO_TRADE"
 
             # ── FIX-2: Macro bias from PREVIOUS completed H1 bar ─────────
