@@ -588,7 +588,6 @@ def _evaluate_s1e(
         tp=round(entry + stop_dist * 2.0, 3) if direction == "LONG" else round(entry - stop_dist * 2.0, 3),
         lots=lots, expiry=expiry_utc, placed_time=current_time,
     ))
-    state.s1e_pyramid_done = True
     return orders
 
 
@@ -658,6 +657,7 @@ def _evaluate_s1f(
         tp=round(entry + stop_dist * 2.0, 3) if direction == "LONG" else round(entry - stop_dist * 2.0, 3),
         lots=lots, expiry=expiry_utc, placed_time=current_time,
     ))
+    state.s1f_attempts_today += 1
     return orders
 
 
@@ -764,7 +764,7 @@ def _evaluate_s3(
     if sweep_depth_high >= atr_h1 * sweep_thresh:
         last_bar = recent.iloc[-1]
         if last_bar["close"] < rh:
-            entry     = round(float(last_bar["low"]) - reclaim_offset, 3)
+            entry     = round(float(last_bar["low"] ) - reclaim_offset, 3)
             stop      = round(sweep_high + atr_h1 * stop_mult, 3)
             stop_dist = abs(entry - stop)
             if stop_dist > 0:
@@ -918,7 +918,7 @@ def _evaluate_s5(
     if stop_dist <= 0:
         return orders
     lots = _calculate_lot_size(state.balance, stop_dist, state.size_multiplier)
-    expiry_utc = current_time.replace(hour=17, minute=0, second=0)
+    expiry_utc = current_time.astimezone(pytz.utc).replace(hour=17, minute=0, second=0, microsecond=0)
     orders.append(SimOrder(
         strategy="S5_NY_COMPRESS", direction=direction,
         order_type="MARKET", price=entry, sl=stop,
@@ -998,7 +998,7 @@ def _evaluate_s7(
         return orders
     prev_day = _get_prev_day_hl(bar_buffer)
     if prev_day is None:
-        return None
+        return orders
     ph         = prev_day["high"]
     pl         = prev_day["low"]
     prev_range = prev_day["range"]
@@ -1059,6 +1059,7 @@ def _evaluate_s8(
     # Look at second-to-last closed bar as the "spike" bar
     spike_bar  = m15_df.iloc[-3]
     confirm_bar = m15_df.iloc[-2]
+    current_bar = m15_df.iloc[-1]
     spike_range = abs(spike_bar["high"] - spike_bar["low"])
     spike_thresh = getattr(config, "S8_SPIKE_ATR_MULTIPLIER", 2.0)
     if spike_range < atr_h1 * spike_thresh:
@@ -1077,13 +1078,12 @@ def _evaluate_s8(
         return orders
     if direction == "SHORT" and confirm_bar["close"] >= confirm_bar["open"]:
         return orders
-    stop_dist = atr_h1 * 0.5
     if direction == "LONG":
-        entry = round(confirm_bar["close"], 3)
-        stop  = round(spike_bar["low"] - stop_dist, 3)
+        entry = round(current_bar["open"], 3)
+        stop  = round(spike_bar["low"] - atr_h1 * 0.5, 3)
     else:
-        entry = round(confirm_bar["close"], 3)
-        stop  = round(spike_bar["high"] + stop_dist, 3)
+        entry = round(current_bar["open"], 3)
+        stop  = round(spike_bar["high"] + atr_h1 * 0.5, 3)
     actual_stop_dist = abs(entry - stop)
     if actual_stop_dist <= 0:
         return orders
@@ -1095,6 +1095,7 @@ def _evaluate_s8(
         tp=round(entry + actual_stop_dist * 1.5, 3) if direction == "LONG" else round(entry - actual_stop_dist * 1.5, 3),
         lots=lots, expiry=expiry_utc, placed_time=current_time,
     ))
+    state.s1e_pyramid_done = state.s1e_pyramid_done
     return orders
 
 
