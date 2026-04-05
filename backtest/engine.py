@@ -13,6 +13,12 @@ BacktestEngine class added (was absent — caused ImportError on run).
 FIX-2: Macro bias now uses iloc[-2] (previous completed H1 bar), not iloc[-1].
 FIX-3: run_sensitivity_test() — BREAKOUT_DIST_PCT ±20%, ATR_PCT_UNSTABLE ±5.
 FIX-4: profit_concentration_check() — warns if >80% profit in ≤3 months.
+
+BUG-FIX (this commit):
+  has_upcoming_event() call in run() used wrong kwarg 'minutes_ahead' →
+  corrected to 'pre_minutes=30, post_minutes=15'.
+  get_events_near() call in _evaluate_r3() used wrong kwarg 'minutes_ahead' →
+  corrected to 'window_minutes=90'.
 """
 import logging
 import math
@@ -799,7 +805,8 @@ def _evaluate_r3(
     if bar_time.hour < 6 or bar_time.hour >= 13:
         return []
 
-    upcoming = event_feed.get_events_near(bar_time, minutes_ahead=90)
+    # FIX: get_events_near() uses 'window_minutes=', not 'minutes_ahead='
+    upcoming = event_feed.get_events_near(bar_time, window_minutes=90)
     if not upcoming:
         return []
 
@@ -1066,7 +1073,9 @@ class BacktestEngine:
             else:
                 atr_pct_h1 = 50.0
 
-            has_event    = event_feed.has_upcoming_event(bar_time, minutes_ahead=30)
+            # FIX: correct keyword argument — has_upcoming_event() uses
+            # 'pre_minutes' and 'post_minutes', not 'minutes_ahead'
+            has_event    = event_feed.has_upcoming_event(bar_time, pre_minutes=30, post_minutes=15)
             avg_spread   = spread_feed.get_avg_spread_24h()
             spread_ratio = spread / max(avg_spread, 0.001)
 
@@ -1275,7 +1284,6 @@ class BacktestEngine:
 
         # ── End of data: force-close remaining positions ──────────────────
         for pos in open_positions:
-            last_close_price = equity_curve[-1].equity if equity_curve else self.initial_balance
             rec = executor.close_position(
                 pos, pos.entry_price, self.end_date,
                 "SESSION_CLOSE", state.current_regime,
