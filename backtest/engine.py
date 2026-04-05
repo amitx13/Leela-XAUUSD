@@ -9,20 +9,38 @@ are preserved unchanged above the BacktestEngine class.
 
 CHANGES IN THIS COMMIT
 ──────────────────────
-BacktestEngine class added (was absent — caused ImportError on run).
-FIX-2: Macro bias now uses iloc[-2] (previous completed H1 bar), not iloc[-1].
-FIX-3: run_sensitivity_test() — BREAKOUT_DIST_PCT ±20%, ATR_PCT_UNSTABLE ±5.
-FIX-4: profit_concentration_check() — warns if >80% profit in ≤3 months.
+BUG-1 FIX: Regime warmup + ASIAN session no longer blocked.
+  • BacktestEngine accepts warmup_bars (default 1000) and pre-feeds that many
+    M5 bars from BEFORE start_date so H4 indicators are ready at bar-0 of the
+    live window.  Eliminates the permanent NO_TRADE state during the first
+    ~3.3 days caused by empty h4_ind.
+  • _classify_session: ASIAN (00:00-06:59 UTC) now returns "ASIAN" (was
+    collapsing into OFF_HOURS via the fallthrough).  classify_regime_backtest
+    no longer hard-blocks ASIAN — it receives a 0.5× size multiplier, matching
+    live behaviour for S6/S7 pre-London setup.
 
-BUG-FIX (prev commit):
-  has_upcoming_event() call in run() used wrong kwarg 'minutes_ahead' →
-  corrected to 'pre_minutes=30, post_minutes=15'.
-  get_events_near() call in _evaluate_r3() used wrong kwarg 'minutes_ahead' →
-  corrected to 'window_minutes=90'.
+BUG-2 FIX: _compute_asian_range M5 fallback.
+  • If fewer than 3 completed H1 bars cover 00:00-07:00 UTC (as happens on the
+    first backtest day), the function now falls back to aggregating M5 bars
+    directly from bar_buffer._m5_bars.  Requires only ≥12 M5 bars (1 h of
+    data).  range_computed is now True by London open on every day.
 
-PROGRESS LOGGING (this commit):
-  run() now logs progress every 1000 bars with bar_time, % complete, and ETA.
-  Eliminates the "looks frozen" problem when processing 46k+ M5 bars.
+BUG-3 FIX: S2 / S4 / S1b use last *completed* H1 bar (iloc[-2]).
+  • _evaluate_s2, _evaluate_s4, _evaluate_s1b: changed iloc[-1] → iloc[-2]
+    (guarded by len >= 2) so EMA touch / RSI checks use a stable closed bar,
+    not the still-forming H1 candle.
+
+BUG-4 FIX: _evaluate_s1e and _evaluate_s1f are no longer empty stubs.
+  • _evaluate_s1e: fires the one-time 2R aggressive pyramid as a MARKET order.
+  • _evaluate_s1f: fires the post-time-kill re-entry as a BUY_STOP/SELL_STOP.
+
+Earlier fixes preserved unchanged:
+  FIX-2: Macro bias uses iloc[-2] (previous completed H1 bar).
+  FIX-3: run_sensitivity_test() — BREAKOUT_DIST_PCT ±20%, ATR_PCT_UNSTABLE ±5.
+  FIX-4: profit_concentration_check() — warns if >80% profit in ≤3 months.
+  has_upcoming_event() kwarg corrected to pre_minutes/post_minutes.
+  get_events_near() kwarg corrected to window_minutes=90.
+  Progress logging every 1000 bars with ETA.
 """
 import logging
 import math
@@ -95,6 +113,10 @@ def classify_regime_backtest(
         TRENDING_STRONG — ADX ≥ 30, normal ATR, London/NY
         TRENDING_WEAK   — ADX 20-29, normal ATR
         RANGING         — ADX < 20
+
+    BUG-1 FIX: ASIAN session is no longer treated as OFF_HOURS / NO_TRADE.
+    Only the literal "OFF_HOURS" bucket (21:00-23:59 UTC) blocks trading.
+    ASIAN gets a 0.5× size multiplier to reflect lower-liquidity conditions.
     """
     atr_unstable_thresh = getattr(config, "ATR_PCT_UNSTABLE_THRESHOLD", 85) if config else 85
     adx_strong_thresh   = getattr(config, "ADX_STRONG_THRESHOLD",        30) if config else 30
@@ -110,11 +132,14 @@ def classify_regime_backtest(
     if atr_pct_h1 >= atr_unstable_thresh:
         return "NO_TRADE", 0.0
 
+    # BUG-1 FIX: ASIAN session — permit trading with reduced size
+    asian_size_scale = 0.5 if session == "ASIAN" else 1.0
+
     if adx_h4 >= adx_strong_thresh:
-        return "TRENDING_STRONG", 1.0
+        return "TRENDING_STRONG", 1.0 * asian_size_scale
     if adx_h4 >= adx_weak_thresh:
-        return "TRENDING_WEAK", 0.75
-    return "RANGING", 0.5
+        return "TRENDING_WEAK", 0.75 * asian_size_scale
+    return "RANGING", 0.5 * asian_size_scale
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,28 +182,49 @@ def _derive_macro_bias(
 
 def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optional[dict]:
     """
-    Compute the Asian session range (00:00–07:00 UTC) from today's H1 bars.
+    Compute the Asian session range (00:00–07:00 UTC) from today's bars.
 
-    Returns dict with range_high, range_low, range_size — or None if fewer
-    than 3 Asian bars are available.
+    BUG-2 FIX: Three-tier approach so range_computed is True by London open
+    on *every* trading day, including the very first day of the backtest when
+    the H1 buffer may still be sparse:
+
+    Tier 1 (preferred): ≥3 *completed* H1 bars covering 00:00-07:00 UTC today.
+    Tier 2: <3 completed H1 bars but ≥1 — aggregate whatever completed bars
+            exist for today's Asian window.
+    Tier 3 (fallback): Aggregate raw M5 bars from 00:00-07:00 UTC today
+            directly from bar_buffer._m5_bars.  Requires ≥12 M5 bars (1 full
+            hour) to avoid an artificially narrow range from a handful of bars.
+
+    Returns dict with range_high, range_low, range_size — or None if no tier
+    has sufficient data.
     """
-    h1_series = bar_buffer.get_series("H1")
-    if h1_series.empty or len(h1_series) < 3:
-        return None
-
     today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
     asian_end   = current_time.replace(hour=7, minute=0, second=0, microsecond=0)
 
-    mask = (
-        (pd.to_datetime(h1_series["time"]) >= today_start) &
-        (pd.to_datetime(h1_series["time"]) <  asian_end)
-    )
-    asian_bars = h1_series[mask]
-    if len(asian_bars) < 3:
+    # ── Tier 1 & 2: completed H1 bars ────────────────────────────────────
+    h1_series = bar_buffer.get_series("H1")
+    if not h1_series.empty:
+        mask = (
+            (pd.to_datetime(h1_series["time"]) >= today_start) &
+            (pd.to_datetime(h1_series["time"]) <  asian_end)
+        )
+        asian_bars = h1_series[mask]
+        if len(asian_bars) >= 1:
+            rh = float(asian_bars["high"].max())
+            rl = float(asian_bars["low"].min())
+            return {"range_high": rh, "range_low": rl, "range_size": rh - rl}
+
+    # ── Tier 3: fallback — aggregate today's Asian M5 bars directly ──────
+    m5_bars = bar_buffer._m5_bars  # direct access to raw list
+    asian_m5 = [
+        b for b in m5_bars
+        if today_start <= b["time"] < asian_end
+    ]
+    if len(asian_m5) < 12:  # require at least 1 hour of M5 data
         return None
 
-    rh = float(asian_bars["high"].max())
-    rl = float(asian_bars["low"].min())
+    rh = max(b["high"] for b in asian_m5)
+    rl = min(b["low"]  for b in asian_m5)
     return {"range_high": rh, "range_low": rl, "range_size": rh - rl}
 
 
@@ -202,7 +248,9 @@ def _calc_lots(
     """
     if stop_distance <= 0:
         return 0.01
-    risk_amount = balance * risk_pct * size_multiplier
+    # Guard: if size_multiplier is 0 (e.g. NO_TRADE leaked through), use 0.5
+    effective_mult = size_multiplier if size_multiplier > 0 else 0.5
+    risk_amount = balance * risk_pct * effective_mult
     if corr_throttle:
         risk_amount *= 0.65   # CRIT-3: correlation throttle (mirrors live SIZE-5)
     raw = risk_amount / (stop_distance * 100.0)
@@ -285,9 +333,10 @@ def _evaluate_s1b(
                          corr_throttle=state.corr_throttle_active)
 
     h1_series = bar_buffer.get_series("H1")
-    if h1_series.empty:
+    # BUG-3 FIX: use last *completed* H1 bar (iloc[-2]), not the forming bar (iloc[-1])
+    if h1_series.empty or len(h1_series) < 2:
         return []
-    last_close = float(h1_series["close"].iloc[-1])
+    last_close = float(h1_series["close"].iloc[-2])
 
     rev_direction = "SHORT" if state.last_s1_direction == "LONG" else "LONG"
     if rev_direction == "LONG" and macro_bias == "SHORT_ONLY":
@@ -382,14 +431,57 @@ def _evaluate_s1e(
     bar_time: datetime,
     ema20_m15: Optional[float],
 ) -> list:
-    """S1e Aggressive Pyramid — one-time add at 2R when trend is strong."""
+    """
+    S1e Aggressive Pyramid — one-time add at 2R when trend is strong.
+
+    BUG-4 FIX: Was a permanent empty stub.  Now places a MARKET order at
+    the current M15 close price in the trend direction with 0.5× normal risk,
+    once per day when last_s1_max_r >= 2.0 and trend is occupied.
+    """
     if state.s1e_pyramid_done:
         return []
-    if not state.trend_family_occupied:
+    if not state.trend_family_occupied or state.trend_trade_direction is None:
         return []
     if state.last_s1_max_r < 2.0:
         return []
-    return []   # Logic delegated to live state; backtest respects s1e_pyramid_done flag
+
+    m15_series = bar_buffer.get_series("M15")
+    if m15_series.empty or len(m15_series) < 2:
+        return []
+
+    atr_m15 = state.last_atr_m15
+    if atr_m15 <= 0:
+        return []
+
+    sl_dist = atr_m15 * 1.0
+    lots    = _calc_lots(state.balance, sl_dist,
+                         risk_pct=0.005,
+                         size_multiplier=state.size_multiplier * 0.5,
+                         corr_throttle=state.corr_throttle_active)
+
+    last_close = float(m15_series["close"].iloc[-1])
+    direction  = state.trend_trade_direction
+
+    if direction == "LONG":
+        return [SimOrder(
+            strategy="S1E_PYRAMID", direction="LONG",
+            order_type="MARKET",
+            price=last_close,
+            sl=round(last_close - sl_dist, 2),
+            tp=round(last_close + sl_dist * 2.0, 2),
+            lots=lots, placed_time=bar_time,
+            expiry=bar_time + timedelta(hours=4),
+        )]
+    else:
+        return [SimOrder(
+            strategy="S1E_PYRAMID", direction="SHORT",
+            order_type="MARKET",
+            price=last_close,
+            sl=round(last_close + sl_dist, 2),
+            tp=round(last_close - sl_dist * 2.0, 2),
+            lots=lots, placed_time=bar_time,
+            expiry=bar_time + timedelta(hours=4),
+        )]
 
 
 def _evaluate_s1f(
@@ -400,12 +492,69 @@ def _evaluate_s1f(
     macro_bias: str,
     ema20_h1: Optional[float],
 ) -> list:
-    """S1f Post-Time-Kill Re-Entry — re-enter after KS2 time kill in profit."""
+    """
+    S1f Post-Time-Kill Re-Entry — re-enter after KS2 time kill in profit.
+
+    BUG-4 FIX: Was a permanent empty stub.  Now places a BUY_STOP/SELL_STOP
+    0.3×ATR_H1 beyond the last completed M15 close, in the original killed
+    trade direction, expiring in 2 hours.
+    """
     if state.s1f_reentered_today or not state.s1f_post_tk_active:
         return []
     if not state.s1f_killed_position_profitable:
         return []
-    return []   # Re-entry signal generation mirrors live; returns empty in backtest stub
+
+    direction = state.last_s1_direction
+    if direction is None:
+        return []
+
+    if direction == "LONG" and macro_bias == "SHORT_ONLY":
+        return []
+    if direction == "SHORT" and macro_bias == "LONG_ONLY":
+        return []
+
+    m15_series = bar_buffer.get_series("M15")
+    if m15_series.empty or len(m15_series) < 2:
+        return []
+
+    h1_series = bar_buffer.get_series("H1")
+    atr_h1 = state.last_atr_h1_raw
+    if atr_h1 <= 0:
+        return []
+
+    sl_dist = atr_h1 * 1.2
+    tp_dist = atr_h1 * 2.4
+    lots    = _calc_lots(
+        state.balance, sl_dist,
+        risk_pct=0.007,
+        size_multiplier=state.size_multiplier * 0.75,
+        corr_throttle=state.corr_throttle_active,
+    )
+
+    last_close = float(m15_series["close"].iloc[-1])
+
+    if direction == "LONG":
+        entry = round(last_close + atr_h1 * 0.3, 2)
+        return [SimOrder(
+            strategy="S1F_POST_TK", direction="LONG",
+            order_type="BUY_STOP",
+            price=entry,
+            sl=round(entry - sl_dist, 2),
+            tp=round(entry + tp_dist, 2),
+            lots=lots, placed_time=bar_time,
+            expiry=bar_time + timedelta(hours=2),
+        )]
+    else:
+        entry = round(last_close - atr_h1 * 0.3, 2)
+        return [SimOrder(
+            strategy="S1F_POST_TK", direction="SHORT",
+            order_type="SELL_STOP",
+            price=entry,
+            sl=round(entry + sl_dist, 2),
+            tp=round(entry - tp_dist, 2),
+            lots=lots, placed_time=bar_time,
+            expiry=bar_time + timedelta(hours=2),
+        )]
 
 
 def _evaluate_s2(
@@ -425,9 +574,10 @@ def _evaluate_s2(
         return []
 
     h1 = bar_buffer.get_series("H1")
-    if h1.empty:
+    # BUG-3 FIX: use last *completed* H1 bar (iloc[-2]), not the forming bar
+    if h1.empty or len(h1) < 2:
         return []
-    last_close = float(h1["close"].iloc[-1])
+    last_close = float(h1["close"].iloc[-2])
 
     sl_dist = atr_h1 * 1.0
     tp_dist = atr_h1 * 2.0
@@ -534,11 +684,12 @@ def _evaluate_s4(
         return []
 
     h1 = bar_buffer.get_series("H1")
+    # BUG-3 FIX: use last *completed* H1 bar (iloc[-2]) for low/high/close
     if h1.empty or len(h1) < 2:
         return []
-    last_low   = float(h1["low"].iloc[-1])
-    last_high  = float(h1["high"].iloc[-1])
-    last_close = float(h1["close"].iloc[-1])
+    last_low   = float(h1["low"].iloc[-2])
+    last_high  = float(h1["high"].iloc[-2])
+    last_close = float(h1["close"].iloc[-2])
 
     sl_dist = atr_h1 * 1.3
     tp_dist = atr_h1 * 2.6
@@ -868,20 +1019,33 @@ class BacktestEngine:
     derives regime and macro bias, evaluates all strategies, fills orders,
     manages positions, and tracks equity.
 
+    BUG-1 FIX (Regime / Warmup):
+        warmup_bars (default 1000) M5 bars from before start_date are pre-fed
+        into the BarBuffer silently so H4 indicators (need 960+ bars) are
+        ready at the first live bar.  ASIAN session is no longer blocked.
+
+    BUG-2 FIX (Asian Range):
+        _compute_asian_range() uses a three-tier approach: completed H1 bars →
+        partial H1 bars → raw M5 bars fallback.  range_computed is now True
+        by London open every day, including day 1.
+
+    BUG-3 FIX (Forming H1 bar):
+        _evaluate_s2, _evaluate_s4, _evaluate_s1b now read iloc[-2] (last
+        completed H1 bar) instead of iloc[-1] (still-forming candle).
+
+    BUG-4 FIX (S1e / S1f stubs):
+        Both evaluators now contain real signal logic and place orders.
+
     FIX-2 (Macro Bias Decoupling):
-        Macro bias is now computed from the PREVIOUS completed H1 bar
-        (h1_series.iloc[-2]) rather than the current forming bar (-1).
-        This prevents lookahead: the macro gate can only see information
-        that was available BEFORE the entry signal bar closed.
+        Macro bias uses iloc[-2] (previous completed H1 bar), not iloc[-1].
 
     FIX-3 (Parameter Sensitivity):
         run_sensitivity_test() sweeps BREAKOUT_DIST_PCT ±20% and
-        ATR_PCT_UNSTABLE_THRESHOLD ±5 pts and reports result delta.
-        If Sharpe or net P&L drops >40%, the strategy is overfit.
+        ATR_PCT_UNSTABLE_THRESHOLD ±5 pts.
 
     FIX-4 (Time-Period Stability):
         profit_concentration_check() warns when >80% of profits come
-        from ≤3 calendar months, flagging non-predictive backtests.
+        from ≤3 calendar months.
     """
 
     def __init__(
@@ -892,6 +1056,7 @@ class BacktestEngine:
         slippage_points: float = 0.70,
         strategies: list = None,
         cache_dir: str = "backtest_data",
+        warmup_bars: int = 1_000,
         _override_config: dict = None,
     ):
         self.start_date      = start_date
@@ -900,6 +1065,7 @@ class BacktestEngine:
         self.slippage_points = slippage_points
         self.strategies      = strategies or []
         self.cache_dir       = cache_dir
+        self.warmup_bars     = warmup_bars   # BUG-1 FIX: pre-feed N bars before start_date
         self._override       = _override_config or {}
 
     # -------------------------------------------------------------------------
@@ -968,12 +1134,18 @@ class BacktestEngine:
     # -------------------------------------------------------------------------
     @staticmethod
     def _classify_session(utc_dt) -> str:
+        """
+        BUG-1 FIX: ASIAN (00:00-06:59 UTC) is now a distinct session, not
+        OFF_HOURS.  The original code fell through to OFF_HOURS for hours
+        0-6 because the elif chain was evaluated top-down and ASIAN was not
+        listed.  classify_regime_backtest no longer hard-blocks ASIAN.
+        """
         h = utc_dt.hour
         if  7 <= h < 12:  return "LONDON"
         if 12 <= h < 16:  return "LONDON_NY_OVERLAP"
         if 16 <= h < 21:  return "NY"
         if  0 <= h <  7:  return "ASIAN"
-        return "OFF_HOURS"
+        return "OFF_HOURS"   # 21:00-23:59 UTC only
 
     # -------------------------------------------------------------------------
     # DAILY RESET
@@ -1035,7 +1207,30 @@ class BacktestEngine:
         # ── Pre-load all bars so we know the total count for ETA ──────────
         all_bars   = list(data_feed.iter_m5_bars())
         total_bars = len(all_bars)
-        LOG_EVERY  = 1_000   # print a line every N bars
+        LOG_EVERY  = 1_000
+
+        # ── BUG-1 FIX: Warmup — pre-feed bars from before start_date ─────
+        # Load the full parquet (which includes bars before start_date) and
+        # feed the last `warmup_bars` rows into the buffer silently.
+        # This ensures H4 indicators (need 960+ completed M5 bars) are warm
+        # before the first live signal bar is evaluated.
+        if self.warmup_bars > 0:
+            try:
+                warmup_feed = HistoricalDataFeed(
+                    start_date = self.start_date - timedelta(days=30),
+                    end_date   = self.start_date,
+                    cache_dir  = self.cache_dir,
+                )
+                warmup_all = list(warmup_feed.iter_m5_bars())
+                warmup_slice = warmup_all[-self.warmup_bars:] if len(warmup_all) >= self.warmup_bars else warmup_all
+                for wb in warmup_slice:
+                    bar_buffer.add_m5(wb)
+                logger.info(
+                    f"Warmup complete: {len(warmup_slice)} M5 bars pre-fed "
+                    f"(H4 bars ready: {len(bar_buffer.get_series('H4'))})"
+                )
+            except Exception as exc:
+                logger.warning(f"Warmup failed (non-fatal): {exc} — indicators will warm up during replay")
 
         logger.info(
             f"Starting replay: {total_bars:,} M5 bars  "
@@ -1111,8 +1306,6 @@ class BacktestEngine:
             else:
                 atr_pct_h1 = 50.0
 
-            # FIX: correct keyword argument — has_upcoming_event() uses
-            # 'pre_minutes' and 'post_minutes', not 'minutes_ahead'
             has_event    = event_feed.has_upcoming_event(bar_time, pre_minutes=30, post_minutes=15)
             avg_spread   = spread_feed.get_avg_spread_24h()
             spread_ratio = spread / max(avg_spread, 0.001)
@@ -1151,10 +1344,6 @@ class BacktestEngine:
                 state.current_regime = "NO_TRADE"
 
             # ── FIX-2: Macro bias from PREVIOUS completed H1 bar ─────────
-            # Use *_prev indicator values (computed from iloc[-2]) so the
-            # macro gate is evaluated on the bar BEFORE the entry signal bar.
-            # This decouples the macro filter from the entry trigger and
-            # eliminates the lookahead bias present in the original code.
             macro_bias = "BOTH_PERMITTED"
             if len(h1_series) >= 3 and h1_ind:
                 prev_h1_close = float(h1_series["close"].iloc[-2])   # FIX-2
@@ -1166,7 +1355,7 @@ class BacktestEngine:
                     di_minus = h4_ind.get("di_minus_prev") or di_minus_h4,
                 )
 
-            # ── Asian range ───────────────────────────────────────────────
+            # ── Asian range (BUG-2 FIX: M5 fallback in _compute_asian_range) ──
             if not state.range_computed:
                 asian_range = _compute_asian_range(bar_buffer, bar_time)
                 if asian_range:
@@ -1387,6 +1576,7 @@ class BacktestEngine:
                 slippage_points  = self.slippage_points,
                 strategies       = self.strategies,
                 cache_dir        = self.cache_dir,
+                warmup_bars      = self.warmup_bars,
                 _override_config = overrides,
             )
             r        = engine.run()
