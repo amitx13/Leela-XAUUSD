@@ -1,25 +1,32 @@
 """
-backtest/results.py — Analytics and reporting for backtest results.
+backtest/results.py — Backtest result analysis and reporting.
 
-BacktestResults provides:
-  - summary()              — overall and per-strategy metrics
-  - compute_max_dd()       — maximum drawdown from equity curve
-  - compute_sharpe()       — annualized Sharpe (trade-based daily P&L) [FIXED]
-  - compute_sortino()      — annualized Sortino ratio [NEW]
-  - compute_calmar()       — CAGR / Max Drawdown ratio [NEW]
-  - walk_forward_report()  — rolling OOS performance analysis
-  - regime_breakdown()     — P&L / WR / E(R) split by entry regime [NEW]
-  - duration_stats()       — avg/median trade duration by strategy [NEW]
-  - rolling_expectancy()   — 20-trade rolling E(R) for edge stability [NEW]
+BacktestResults:
+  - summary()              — human-readable performance summary
+  - compute_max_dd()       — max drawdown (amount + %)
+  - compute_sharpe()       — annualised Sharpe ratio
+  - compute_sortino()      — annualised Sortino ratio
+  - compute_calmar()       — Calmar ratio
+  - walk_forward_report()  — IS/OOS split analysis
+  - regime_breakdown()     — performance per regime
+  - duration_stats()       — trade duration analysis
+  - rolling_expectancy()   — rolling window expectancy
   - monthly_returns()      — monthly P&L with win rate + streak data [ENHANCED]
+  - profit_concentration_check() — FIX-4: warn if >80% profit in ≤3 months [NEW]
   - to_dataframe()         — trades as pandas DataFrame
-  - plot_equity()          — equity curve + drawdown visualisation
+  - equity_to_dataframe()  — equity curve as pandas DataFrame
+  - strategy_breakdown()   — per-strategy performance metrics
+  - exit_reason_breakdown()— breakdown by exit reason
+  - plot_equity()          — equity curve matplotlib chart
+
+All timestamps are timezone-aware UTC (pytz.utc).
 """
 import logging
-import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
+
+import numpy  as np
+import pandas as pd
 
 from backtest.models import TradeRecord, EquityPoint
 
@@ -28,475 +35,348 @@ logger = logging.getLogger("backtest.results")
 
 class BacktestResults:
     """
-    Analytics container for backtest output.
-    Constructed by BacktestEngine.run() with all closed trades and equity curve.
+    Aggregates and analyses results from a completed backtest run.
     """
 
     def __init__(
         self,
-        trades: list[TradeRecord],
-        equity_curve: list[EquityPoint],
-        initial_balance: float,
-        start_date: datetime,
-        end_date: datetime,
-        strategies: list[str],
+        trades:          list,
+        equity_curve:    list,
+        initial_balance: float = 10_000.0,
+        final_balance:   float = 10_000.0,
+        strategies:      list  = None,
+        warmup_bars:     int   = 0,
     ):
-        self.trades        = trades
-        self.equity_curve  = equity_curve
+        self.trades          = trades           # list[TradeRecord]
+        self.equity_curve    = equity_curve     # list[EquityPoint]
         self.initial_balance = initial_balance
-        self.start_date    = start_date
-        self.end_date      = end_date
-        self.strategies    = strategies
+        self.final_balance   = final_balance
+        self.strategies      = strategies or []
+        self.warmup_bars     = warmup_bars
 
-    def _analysis_trades(self) -> list[TradeRecord]:
-        """Exclude synthetic end-of-backtest liquidations from analytics metrics."""
-        return [t for t in self.trades if t.exit_reason != "BACKTEST_END"]
-
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
+    def _analysis_trades(self) -> list:
+        """Return only trades beyond the warmup period."""
+        if self.warmup_bars <= 0:
+            return self.trades
+        if not self.equity_curve:
+            return self.trades
+        cutoff = self.equity_curve[self.warmup_bars].timestamp if len(self.equity_curve) > self.warmup_bars else None
+        if cutoff is None:
+            return self.trades
+        return [t for t in self.trades if t.exit_time >= cutoff]
 
     def summary(self) -> str:
-        """Print and return a comprehensive summary of backtest results."""
-        lines: list[str] = []
-        lines.append("=" * 80)
-        lines.append("BACKTEST RESULTS SUMMARY")
-        lines.append("=" * 80)
-        lines.append(f"Period:          {self.start_date.date()} to {self.end_date.date()}")
-        lines.append(f"Initial Balance: ${self.initial_balance:,.2f}")
+        """Return a human-readable performance summary string."""
+        trades  = self._analysis_trades()
+        winners = [t for t in trades if t.pnl > 0]
+        losers  = [t for t in trades if t.pnl <= 0]
 
-        if self.equity_curve:
-            final_eq = self.equity_curve[-1].equity
-            lines.append(f"Final Equity:    ${final_eq:,.2f}")
-            total_return = (final_eq - self.initial_balance) / self.initial_balance * 100
-            lines.append(f"Total Return:    {total_return:+.2f}%")
-        lines.append("")
+        net_pnl     = sum(t.pnl     for t in trades)
+        gross_pnl   = sum(t.pnl_gross for t in trades)
+        commission  = sum(t.commission for t in trades)
+        win_rate    = len(winners) / len(trades) * 100 if trades else 0.0
+        avg_win     = sum(t.pnl for t in winners) / len(winners) if winners else 0.0
+        avg_loss    = sum(t.pnl for t in losers)  / len(losers)  if losers  else 0.0
+        avg_r       = sum(t.r_multiple for t in trades) / len(trades) if trades else 0.0
+        sharpe      = self.compute_sharpe()
+        max_dd_amt, max_dd_pct = self.compute_max_dd()
 
-        analysis_trades = self._analysis_trades()
+        lines = [
+            "=" * 60,
+            "BACKTEST RESULTS SUMMARY",
+            "=" * 60,
+            f"  Trades          : {len(trades)}",
+            f"  Win Rate        : {win_rate:.1f}%  ({len(winners)}W / {len(losers)}L)",
+            f"  Net P&L         : ${net_pnl:>+10,.2f}",
+            f"  Gross P&L       : ${gross_pnl:>+10,.2f}",
+            f"  Commission paid : ${commission:>10,.2f}",
+            f"  Avg Winner      : ${avg_win:>+10,.2f}",
+            f"  Avg Loser       : ${avg_loss:>+10,.2f}",
+            f"  Avg R-multiple  : {avg_r:>+8.3f}R",
+            f"  Sharpe Ratio    : {sharpe:>8.3f}",
+            f"  Max Drawdown    : ${max_dd_amt:,.2f}  ({max_dd_pct:.1f}%)",
+            f"  Initial Balance : ${self.initial_balance:,.2f}",
+            f"  Final Balance   : ${self.final_balance:,.2f}",
+            "=" * 60,
+        ]
+        return "\n".join(lines)
 
-        # Overall metrics
-        overall = self._compute_metrics(analysis_trades)
-        lines.append("── OVERALL ─────────────────────────────────────────────")
-        lines.extend(self._format_metrics(overall))
-        lines.append("")
-
-        # Per-strategy breakdown
-        strategy_trades: dict[str, list[TradeRecord]] = {}
-        for trade in analysis_trades:
-            strategy_trades.setdefault(trade.strategy, []).append(trade)
-
-        for strat in sorted(strategy_trades.keys()):
-            s_trades = strategy_trades[strat]
-            metrics  = self._compute_metrics(s_trades)
-            lines.append(f"── {strat} ({len(s_trades)} trades) ──────────────────────")
-            lines.extend(self._format_metrics(metrics))
-            lines.append("")
-
-        # Risk metrics
-        max_dd, max_dd_pct = self.compute_max_dd()
-        sharpe   = self.compute_sharpe()
-        sortino  = self.compute_sortino()
-        calmar   = self.compute_calmar()
-
-        lines.append(f"── RISK METRICS ────────────────────────────────────────")
-        lines.append(f"  Max Drawdown:    ${max_dd:,.2f} ({max_dd_pct:.2f}%)")
-        lines.append(f"  Sharpe Ratio:    {sharpe:+.3f}  (annualised, trade-based daily P&L)")
-        lines.append(f"  Sortino Ratio:   {sortino:+.3f}  (downside deviation)")
-        lines.append(f"  Calmar Ratio:    {calmar:+.3f}  (CAGR / Max DD)")
-        lines.append("=" * 80)
-
-        output = "\n".join(lines)
-        print(output)
-        return output
-
-    # =========================================================================
-    # CORE METRICS
-    # =========================================================================
-
-    def _compute_metrics(self, trades: list[TradeRecord]) -> dict:
-        """Compute standard trading metrics for a list of trades."""
-        empty = {
-            "total_trades": 0, "winners": 0, "losers": 0,
-            "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
-            "avg_winner": 0.0, "avg_loser": 0.0, "profit_factor": 0.0,
-            "expectancy_r": 0.0, "avg_r": 0.0, "median_r": 0.0,
-            "pct_positive_r": 0.0, "max_consecutive_losses": 0,
-            "total_commission": 0.0,
-        }
+    def _compute_metrics(self, trades: list) -> dict:
         if not trades:
-            return empty
+            return {
+                "n": 0, "win_rate": 0.0, "avg_r": 0.0, "median_r": 0.0,
+                "avg_winner": 0.0, "avg_loser": 0.0, "profit_factor": 0.0,
+                "net_pnl": 0.0,
+            }
+        winners = [t for t in trades if t.pnl > 0]
+        losers  = [t for t in trades if t.pnl <= 0]
+        r_vals  = [t.r_multiple for t in trades]
 
-        pnls         = [t.pnl for t in trades]
-        r_multiples  = [t.r_multiple for t in trades]
-        winners      = [t for t in trades if t.pnl > 0]
-        losers       = [t for t in trades if t.pnl <= 0]
         gross_profit = sum(t.pnl for t in winners) if winners else 0.0
         gross_loss   = abs(sum(t.pnl for t in losers)) if losers else 0.0
 
-        max_consec = cur = 0
-        for t in trades:
-            if t.pnl <= 0:
-                cur += 1
-                max_consec = max(max_consec, cur)
-            else:
-                cur = 0
-
         return {
-            "total_trades":           len(trades),
-            "winners":                len(winners),
-            "losers":                 len(losers),
-            "win_rate":               len(winners) / len(trades) * 100,
-            "total_pnl":              sum(pnls),
-            "avg_pnl":                float(np.mean(pnls)),
-            "avg_winner":             float(np.mean([t.pnl for t in winners])) if winners else 0.0,
-            "avg_loser":              float(np.mean([t.pnl for t in losers]))  if losers  else 0.0,
-            "profit_factor":          gross_profit / gross_loss if gross_loss > 0 else float("inf"),
-            "expectancy_r":           float(np.mean(r_multiples)),
-            "avg_r":                  float(np.mean(r_multiples)),
-            "median_r":               float(np.median(r_multiples)),
-            "pct_positive_r":         float(np.mean([r > 0 for r in r_multiples]) * 100),
-            "max_consecutive_losses": max_consec,
-            "total_commission":       sum(t.commission for t in trades),
+            "n":             len(trades),
+            "win_rate":      len(winners) / len(trades) * 100,
+            "avg_r":         float(np.mean(r_vals)),
+            "median_r":      float(np.median(r_vals)),
+            "avg_winner":    gross_profit / len(winners) if winners else 0.0,
+            "avg_loser":     gross_loss   / len(losers)  if losers  else 0.0,
+            "profit_factor": gross_profit / gross_loss   if gross_loss > 0 else float("inf"),
+            "net_pnl":       sum(t.pnl for t in trades),
         }
 
     @staticmethod
-    def _format_metrics(m: dict) -> list[str]:
-        lines = [
-            f"  Trades:          {m['total_trades']}  (W:{m['winners']} / L:{m['losers']})",
-            f"  Win Rate:        {m['win_rate']:.1f}%",
-            f"  Total P&L:       ${m['total_pnl']:+,.2f}",
-            f"  Avg P&L:         ${m['avg_pnl']:+,.2f}",
-            f"  Avg Winner:      ${m['avg_winner']:+,.2f}",
-            f"  Avg Loser:       ${m['avg_loser']:+,.2f}",
-            f"  Profit Factor:   {m['profit_factor']:.2f}",
-            f"  Expectancy (R):  {m['expectancy_r']:+.3f}  |  Median R: {m['median_r']:+.3f}",
-            f"  %Trades +R:      {m['pct_positive_r']:.1f}%",
-            f"  Max Consec Loss: {m['max_consecutive_losses']}",
-            f"  Commission:      ${m['total_commission']:,.2f}",
+    def _format_metrics(m: dict) -> list:
+        return [
+            f"  Trades        : {m['n']}",
+            f"  Win Rate      : {m['win_rate']:.1f}%",
+            f"  Avg R         : {m['avg_r']:+.3f}",
+            f"  Median R      : {m['median_r']:+.3f}",
+            f"  Avg Winner    : ${m['avg_winner']:,.2f}",
+            f"  Avg Loser     : ${m['avg_loser']:,.2f}",
+            f"  Profit Factor : {m['profit_factor']:.2f}",
+            f"  Net P&L       : ${m['net_pnl']:+,.2f}",
         ]
-        return lines
 
-    # =========================================================================
-    # DRAWDOWN
-    # =========================================================================
-
-    def compute_max_dd(self) -> tuple[float, float]:
-        """Compute maximum drawdown from equity curve. Returns (dollars, percent)."""
+    def compute_max_dd(self) -> tuple:
+        """
+        Compute maximum drawdown from the equity curve.
+        Returns (max_dd_amount_usd, max_dd_pct).
+        """
         if not self.equity_curve:
             return 0.0, 0.0
+
         equities = [ep.equity for ep in self.equity_curve]
-        peak = equities[0]
-        max_dd = max_dd_pct = 0.0
+        peak     = equities[0]
+        max_dd   = 0.0
+        max_dd_pct = 0.0
+
         for eq in equities:
             peak = max(peak, eq)
-            dd = peak - eq
-            dd_pct = dd / peak if peak > 0 else 0.0
-            max_dd     = max(max_dd, dd)
-            max_dd_pct = max(max_dd_pct, dd_pct)
-        return round(max_dd, 2), round(max_dd_pct * 100, 2)
+            dd   = peak - eq
+            if dd > max_dd:
+                max_dd     = dd
+                max_dd_pct = dd / peak * 100 if peak > 0 else 0.0
 
-    # =========================================================================
-    # RATIO METRICS  (Sharpe / Sortino / Calmar)
-    # =========================================================================
+        return round(max_dd, 2), round(max_dd_pct, 2)
 
     def _daily_pnl_series(self) -> pd.Series:
         """
-        Build a tz-naive daily P&L series from closed trades.
-
-        BUG FIX: the previous implementation preserved timezone info on
-        exit_time when calling .dt.normalize(), producing a tz-aware index.
-        pd.date_range(self.start_date.date(), ...) always returns a tz-naive
-        index, so .reindex() found no matching keys and silently filled every
-        row with NaN.  std(NaN series) == NaN → Sharpe fell through to the
-        ``if std == 0`` guard and returned 0.0.
-
-        Fix: strip tz from exit_time with .dt.tz_convert(None) before
-        .dt.normalize() so both sides of .reindex() are always tz-naive.
+        Build a daily P&L series from closed trades.
+        Index is date, values are net P&L sums per day.
         """
-        analysis_trades = self._analysis_trades()
-        if not analysis_trades:
+        trades = self._analysis_trades()
+        if not trades:
             return pd.Series(dtype=float)
 
-        df = self.to_dataframe(include_backtest_end=False)
-
-        # Ensure exit_time is tz-naive before extracting the date key.
-        exit_ts = pd.to_datetime(df["exit_time"])
-        if exit_ts.dt.tz is not None:
-            exit_ts = exit_ts.dt.tz_convert(None)
-        df["date"] = exit_ts.dt.normalize()
-
+        df = pd.DataFrame([
+            {"date": t.exit_time.date(), "pnl": t.pnl}
+            for t in trades
+        ])
         daily = df.groupby("date")["pnl"].sum()
 
-        # Build a tz-naive index covering every calendar day in the backtest.
-        start = pd.Timestamp(self.start_date.date())
-        end   = pd.Timestamp(self.end_date.date())
-        idx   = pd.date_range(start, end, freq="D")
+        # Fill missing trading days with 0
+        if len(daily) > 1:
+            idx   = pd.date_range(daily.index[0], daily.index[-1], freq="D")
+            daily = daily.reindex(idx, fill_value=0.0)
 
-        daily = daily.reindex(idx, fill_value=0.0)
         return daily
 
     def compute_sharpe(self, risk_free_rate: float = 0.0) -> float:
         """
-        Annualised Sharpe ratio using trade-based daily P&L.
-
-        Each calendar day's return = sum(closed-trade P&L that day) / initial_balance.
-        Days with no closed trades contribute a 0.0 return (they still count in the
-        denominator — this is the correct treatment for a system that is "live" every
-        trading day whether or not it fires a trade).
-
-        Annualisation factor: sqrt(252) — standard for daily returns.
+        Annualised Sharpe ratio using daily P&L returns.
+        Returns 0.0 if insufficient data.
         """
         daily = self._daily_pnl_series()
-        if len(daily) < 2:
+        if len(daily) < 20:
             return 0.0
 
+        # Convert to daily return %
         returns = daily / self.initial_balance
-        std = returns.std()
-        if std == 0 or np.isnan(std):
+        excess  = returns - risk_free_rate / 252
+        std     = excess.std()
+        if std == 0:
             return 0.0
-
-        excess = returns.mean() - risk_free_rate / 252
-        return round(float(excess / std * np.sqrt(252)), 3)
+        return float(excess.mean() / std * np.sqrt(252))
 
     def compute_sortino(self, risk_free_rate: float = 0.0, mar: float = 0.0) -> float:
         """
         Annualised Sortino ratio.
-        Uses downside deviation (returns below MAR) in denominator instead
-        of total standard deviation — more relevant for a system with a hard
-        daily loss limit (KS3) that truncates the downside.
-
-        Args:
-            mar: Minimum acceptable return per day (default 0 = don't lose money).
+        Uses only downside deviation (returns below MAR).
+        Returns 0.0 if insufficient data.
         """
         daily = self._daily_pnl_series()
-        if len(daily) < 2:
+        if len(daily) < 20:
             return 0.0
 
-        returns   = daily / self.initial_balance
-        downside  = returns[returns < mar] - mar
-        if len(downside) == 0:
-            return float("inf")
-
-        downside_std = float(np.sqrt(np.mean(downside ** 2)))
-        if downside_std == 0 or np.isnan(downside_std):
+        returns  = daily / self.initial_balance
+        excess   = returns - risk_free_rate / 252
+        downside = excess[excess < mar]
+        down_std = downside.std()
+        if down_std == 0 or len(downside) == 0:
             return 0.0
-
-        excess = returns.mean() - risk_free_rate / 252
-        return round(float(excess / downside_std * np.sqrt(252)), 3)
+        return float(excess.mean() / down_std * np.sqrt(252))
 
     def compute_calmar(self) -> float:
         """
-        Calmar ratio = annualised CAGR / max drawdown.
-        Primary metric for prop-firm-style evaluation.
-
-        Returns 0.0 if backtest period < 1 month or max drawdown is 0.
+        Calmar ratio = annualised return / max drawdown %.
+        Returns 0.0 if drawdown is zero or data is insufficient.
         """
+        daily = self._daily_pnl_series()
+        if len(daily) < 20:
+            return 0.0
+
+        annual_return = (daily.sum() / self.initial_balance) * (252 / len(daily))
         _, max_dd_pct = self.compute_max_dd()
         if max_dd_pct == 0:
             return 0.0
-
-        if not self.equity_curve:
-            return 0.0
-
-        final_eq = self.equity_curve[-1].equity
-        days     = max((self.end_date - self.start_date).days, 1)
-        years    = days / 365.25
-        if years < (1 / 12):
-            return 0.0
-
-        cagr = (final_eq / self.initial_balance) ** (1 / years) - 1
-        return round(float(cagr / (max_dd_pct / 100)), 3)
-
-    # =========================================================================
-    # WALK-FORWARD
-    # =========================================================================
+        return round(annual_return / (max_dd_pct / 100), 3)
 
     def walk_forward_report(
         self,
-        train_months: int = 3,
-        test_months: int = 1,
+        is_fraction:  float = 0.70,
+        oos_fraction: float = 0.30,
     ) -> str:
         """
-        Walk-forward analysis: rolling IS/OOS windows.
+        Walk-forward IS/OOS split report.
 
-        NOTE: Parameters are NOT re-optimised per window (pure OOS split).
-        Use this to check whether E(R) holds across time, not to optimise params.
-        For true parameter robustness, run separate optimisation passes.
+        Splits trades into in-sample (first is_fraction) and
+        out-of-sample (last oos_fraction) by exit time.
+
+        Returns a formatted string comparing performance metrics.
         """
-        analysis_trades = self._analysis_trades()
-        if not analysis_trades:
-            return "No trades to analyze."
+        trades = self._analysis_trades()
+        if not trades:
+            return "No trades to analyse."
 
-        lines: list[str] = []
-        lines.append("=" * 80)
-        lines.append("WALK-FORWARD ANALYSIS  (IS/OOS split — no param re-optimisation)")
-        lines.append(f"Train: {train_months} months | Test: {test_months} months")
-        lines.append("=" * 80)
+        sorted_trades = sorted(trades, key=lambda t: t.exit_time)
+        cutoff_idx    = int(len(sorted_trades) * is_fraction)
+        is_trades     = sorted_trades[:cutoff_idx]
+        oos_trades    = sorted_trades[cutoff_idx:]
 
-        window_start = self.start_date
-        window_num   = 0
-        oos_retentions: list[float] = []
+        is_m  = self._compute_metrics(is_trades)
+        oos_m = self._compute_metrics(oos_trades)
 
-        while window_start < self.end_date:
-            train_end = window_start + timedelta(days=train_months * 30)
-            test_end  = train_end    + timedelta(days=test_months  * 30)
+        lines = [
+            "=" * 60,
+            f"WALK-FORWARD REPORT  (IS={is_fraction:.0%} / OOS={oos_fraction:.0%})",
+            "=" * 60,
+            f"  IS  period: {is_trades[0].exit_time.date()} → {is_trades[-1].exit_time.date()}"
+            if is_trades else "  IS  period: (no trades)",
+            f"  OOS period: {oos_trades[0].exit_time.date()} → {oos_trades[-1].exit_time.date()}"
+            if oos_trades else "  OOS period: (no trades)",
+            "-" * 60,
+            "  IN-SAMPLE",
+        ] + self._format_metrics(is_m) + [
+            "-" * 60,
+            "  OUT-OF-SAMPLE",
+        ] + self._format_metrics(oos_m) + [
+            "=" * 60,
+        ]
 
-            if train_end >= self.end_date:
-                break
-            test_end = min(test_end, self.end_date)
+        # Degradation check
+        if is_m["avg_r"] > 0 and oos_m["avg_r"] < is_m["avg_r"] * 0.6:
+            lines.append("  ⚠  WARNING: OOS avg-R is <60% of IS avg-R — possible overfit.")
+        if is_m["profit_factor"] > 1 and oos_m["profit_factor"] < 1:
+            lines.append("  ⚠  WARNING: OOS profit factor < 1.0 — strategy loses money OOS.")
 
-            train_trades = [t for t in analysis_trades if window_start <= t.entry_time < train_end]
-            test_trades  = [t for t in analysis_trades if train_end   <= t.entry_time < test_end]
-
-            window_num += 1
-            lines.append(
-                f"\n── Window {window_num}: "
-                f"Train {window_start.date()}→{train_end.date()} | "
-                f"Test {train_end.date()}→{test_end.date()} ──"
-            )
-
-            tm = self._compute_metrics(train_trades)
-            om = self._compute_metrics(test_trades)
-
-            lines.append(
-                f"  IN-SAMPLE:  {tm['total_trades']:>3} trades  "
-                f"WR={tm['win_rate']:.1f}%  E(R)={tm['expectancy_r']:+.3f}  "
-                f"Med R={tm['median_r']:+.3f}  PF={tm['profit_factor']:.2f}  "
-                f"P&L=${tm['total_pnl']:+,.2f}"
-            )
-            lines.append(
-                f"  OUT-SAMPLE: {om['total_trades']:>3} trades  "
-                f"WR={om['win_rate']:.1f}%  E(R)={om['expectancy_r']:+.3f}  "
-                f"Med R={om['median_r']:+.3f}  PF={om['profit_factor']:.2f}  "
-                f"P&L=${om['total_pnl']:+,.2f}"
-            )
-
-            if tm["expectancy_r"] > 0:
-                if om["expectancy_r"] > 0:
-                    ret = om["expectancy_r"] / tm["expectancy_r"] * 100
-                    oos_retentions.append(ret)
-                    lines.append(f"  RETENTION:  {ret:.0f}% of IS expectancy  ✅")
-                else:
-                    oos_retentions.append(0.0)
-                    lines.append("  RETENTION:  ⚠️  OOS expectancy negative — edge decay in this window")
-            else:
-                lines.append("  RETENTION:  n/a (IS expectancy ≤ 0)")
-
-            window_start = train_end
-
-        if oos_retentions:
-            avg_ret = float(np.mean(oos_retentions))
-            lines.append(f"\n── AVERAGE OOS RETENTION: {avg_ret:.0f}% across {len(oos_retentions)} windows")
-            if avg_ret >= 70:
-                lines.append("   ✅ Edge is robust across time periods.")
-            elif avg_ret >= 40:
-                lines.append("   🟡 Partial edge decay — consider regime filtering.")
-            else:
-                lines.append("   🔴 Significant OOS decay — system may be over-fit to IS data.")
-
-        lines.append("\n" + "=" * 80)
-        output = "\n".join(lines)
-        print(output)
-        return output
-
-    # =========================================================================
-    # REGIME BREAKDOWN  [NEW]
-    # =========================================================================
+        return "\n".join(lines)
 
     def regime_breakdown(self) -> pd.DataFrame:
         """
-        Break down P&L, win rate, and E(R) by regime_at_entry.
+        Performance breakdown by market regime at entry.
 
         Answers: 'Which regimes are actually profitable? Am I losing money
-        trading WEAK_TRENDING or RANGING_CLEAR regimes?'
+        in RANGING or TRENDING_WEAK regimes that I should filter out?'
+
+        Returns a DataFrame with columns:
+            regime, n, win_rate, avg_r, median_r, net_pnl, profit_factor
         """
-        analysis_trades = self._analysis_trades()
-        if not analysis_trades:
+        trades = self._analysis_trades()
+        if not trades:
             return pd.DataFrame()
 
-        df = self.to_dataframe(include_backtest_end=False)
-        rows = []
-        for regime, grp in df.groupby("regime_at_entry"):
-            winners = grp[grp["pnl"] > 0]
-            rows.append({
-                "regime":     regime,
-                "trades":     len(grp),
-                "win_rate":   len(winners) / len(grp) * 100,
-                "total_pnl":  grp["pnl"].sum(),
-                "avg_pnl":    grp["pnl"].mean(),
-                "avg_r":      grp["r_multiple"].mean(),
-                "median_r":   grp["r_multiple"].median(),
-            })
-        result = pd.DataFrame(rows).sort_values("total_pnl", ascending=False)
-        return result.reset_index(drop=True)
+        df = pd.DataFrame([
+            {"regime": t.regime_at_entry, "pnl": t.pnl,
+             "r": t.r_multiple, "win": t.pnl > 0}
+            for t in trades
+        ])
 
-    # =========================================================================
-    # DURATION STATS  [NEW]
-    # =========================================================================
+        rows = []
+        for regime, grp in df.groupby("regime"):
+            winners    = grp[grp["win"]]
+            losers     = grp[~grp["win"]]
+            gp         = winners["pnl"].sum()
+            gl         = abs(losers["pnl"].sum())
+            rows.append({
+                "regime":        regime,
+                "n":             len(grp),
+                "win_rate":      round(len(winners) / len(grp) * 100, 1),
+                "avg_r":         round(grp["r"].mean(), 3),
+                "median_r":      round(grp["r"].median(), 3),
+                "net_pnl":       round(grp["pnl"].sum(), 2),
+                "profit_factor": round(gp / gl, 2) if gl > 0 else float("inf"),
+            })
+        return pd.DataFrame(rows).sort_values("net_pnl", ascending=False)
 
     def duration_stats(self) -> pd.DataFrame:
         """
-        Compute average and median trade duration (minutes) by strategy
-        and by exit reason.
+        Trade duration statistics.
 
-        Useful for spotting strategies that hold too long relative to their
-        intended timeframe (e.g. R3 should be <30 min; S1 should be <4 hours).
+        Returns DataFrame with columns:
+            strategy, avg_duration_h, median_duration_h,
+            max_duration_h, pct_open_24h
         """
-        analysis_trades = self._analysis_trades()
-        if not analysis_trades:
-            return pd.DataFrame()
-
-        df = self.to_dataframe(include_backtest_end=False)
-        df["duration_min"] = (
-            pd.to_datetime(df["exit_time"]) - pd.to_datetime(df["entry_time"])
-        ).dt.total_seconds() / 60.0
-
-        by_strat = (
-            df.groupby("strategy")["duration_min"]
-            .agg(avg_min="mean", median_min="median", max_min="max", count="count")
-            .reset_index()
-            .sort_values("avg_min", ascending=False)
-        )
-        return by_strat
-
-    # =========================================================================
-    # ROLLING EXPECTANCY  [NEW]
-    # =========================================================================
-
-    def rolling_expectancy(self, window: int = 20) -> pd.DataFrame:
-        """
-        Compute rolling E(R) over a sliding window of trades.
-
-        A stable, consistently positive E(R) line indicates a robust edge.
-        Oscillation around zero suggests regime-dependent or noisy edge.
-
-        Args:
-            window: Number of trades per rolling window (default 20).
-
-        Returns:
-            DataFrame with columns: trade_num, entry_time, rolling_e_r
-        """
-        analysis_trades = self._analysis_trades()
-        if len(analysis_trades) < window:
+        trades = self._analysis_trades()
+        if not trades:
             return pd.DataFrame()
 
         rows = []
-        r_vals = [t.r_multiple for t in analysis_trades]
-        times  = [t.entry_time for t in analysis_trades]
-
-        for i in range(window - 1, len(r_vals)):
-            window_r = r_vals[i - window + 1 : i + 1]
+        strats = set(t.strategy for t in trades)
+        for strat in sorted(strats):
+            st = [t for t in trades if t.strategy == strat]
+            durations = [(t.exit_time - t.entry_time).total_seconds() / 3600
+                         for t in st]
             rows.append({
-                "trade_num":    i + 1,
-                "entry_time":   times[i],
-                "rolling_e_r":  float(np.mean(window_r)),
+                "strategy":        strat,
+                "n":               len(st),
+                "avg_duration_h":  round(np.mean(durations), 2),
+                "med_duration_h":  round(np.median(durations), 2),
+                "max_duration_h":  round(max(durations), 2),
+                "pct_open_24h":    round(sum(1 for d in durations if d >= 24)
+                                         / len(durations) * 100, 1),
             })
-
         return pd.DataFrame(rows)
 
-    # =========================================================================
-    # ENHANCED MONTHLY RETURNS  [FIXED]
-    # =========================================================================
+    def rolling_expectancy(self, window: int = 20) -> pd.DataFrame:
+        """
+        Rolling window expectancy (avg R per trade) over the trade sequence.
+
+        Useful for spotting regime changes, skill decay, or mean-reversion
+        in performance over time.
+
+        Returns DataFrame:
+            exit_time, rolling_avg_r, rolling_win_rate, rolling_net_pnl
+        """
+        trades = self._analysis_trades()
+        if len(trades) < window:
+            return pd.DataFrame()
+
+        sorted_t = sorted(trades, key=lambda t: t.exit_time)
+        rows     = []
+        for i in range(window, len(sorted_t) + 1):
+            window_trades = sorted_t[i - window:i]
+            avg_r         = np.mean([t.r_multiple for t in window_trades])
+            win_rate      = sum(1 for t in window_trades if t.pnl > 0) / window * 100
+            net_pnl       = sum(t.pnl for t in window_trades)
+            rows.append({
+                "exit_time":       sorted_t[i - 1].exit_time,
+                "rolling_avg_r":   round(avg_r, 4),
+                "rolling_win_rate":round(win_rate, 1),
+                "rolling_net_pnl": round(net_pnl, 2),
+            })
+        return pd.DataFrame(rows)
 
     def monthly_returns(self) -> pd.DataFrame:
         """
@@ -517,19 +397,19 @@ class BacktestResults:
         for month, grp in df.groupby("month"):
             winners = grp[grp["pnl"] > 0]
             rows.append({
-                "month":       str(month),
-                "trades":      len(grp),
-                "pnl":         grp["pnl"].sum(),
-                "win_rate":    len(winners) / len(grp) * 100 if len(grp) > 0 else 0.0,
-                "avg_r":       grp["r_multiple"].mean(),
-                "median_r":    grp["r_multiple"].median(),
-                "profitable":  grp["pnl"].sum() > 0,
+                "month":      str(month),
+                "trades":     len(grp),
+                "pnl":        grp["pnl"].sum(),
+                "win_rate":   len(winners) / len(grp) * 100 if len(grp) > 0 else 0.0,
+                "avg_r":      grp["r_multiple"].mean(),
+                "median_r":   grp["r_multiple"].median(),
+                "profitable": grp["pnl"].sum() > 0,
             })
 
         monthly = pd.DataFrame(rows)
-        monthly["cum_pnl"]      = monthly["pnl"].cumsum()
-        profitable_months       = monthly["profitable"].sum()
-        total_months            = len(monthly)
+        monthly["cum_pnl"]    = monthly["pnl"].cumsum()
+        profitable_months     = monthly["profitable"].sum()
+        total_months          = len(monthly)
 
         logger.info(
             f"Monthly returns: {profitable_months}/{total_months} profitable months "
@@ -537,35 +417,85 @@ class BacktestResults:
         )
         return monthly
 
+    def profit_concentration_check(self) -> dict:
+        """
+        FIX-4: Check whether profits are concentrated in ≤3 calendar months.
+
+        Reuses monthly_returns() and emits a WARNING when the top-3 months
+        account for >80% of total gross profit — indicating the backtest
+        edge is not broadly distributed across time and therefore unlikely
+        to be predictive in live trading.
+
+        Call this after run() alongside monthly_returns() for a full
+        time-period stability picture.
+
+        Returns dict:
+            top3_months          — [(year_month_str, pnl), ...]
+            top3_pct_of_total    — float [0–1]
+            total_profit_months  — int
+            warning              — bool  (True = concentration detected)
+        """
+        monthly = self.monthly_returns()
+        if monthly.empty:
+            return {"warning": False, "top3_months": [],
+                    "top3_pct_of_total": 0.0, "total_profit_months": 0}
+
+        total_gross = monthly.loc[monthly["pnl"] > 0, "pnl"].sum()
+        if total_gross <= 0:
+            return {"warning": False, "top3_months": [],
+                    "top3_pct_of_total": 0.0,
+                    "total_profit_months": int((monthly["pnl"] > 0).sum())}
+
+        top3      = monthly.nlargest(3, "pnl")
+        top3_pct  = top3["pnl"].sum() / total_gross
+        n_profit  = int((monthly["pnl"] > 0).sum())
+        top3_list = list(zip(top3["month"].tolist(), top3["pnl"].round(2).tolist()))
+        warning   = top3_pct > 0.80
+
+        logger.warning(
+            "TIME-PERIOD STABILITY: top-3 months = %.1f%% of total profit%s",
+            top3_pct * 100,
+            " — ⚠ CONCENTRATION RISK" if warning else " — OK",
+        )
+        return {
+            "top3_months":        top3_list,
+            "top3_pct_of_total":  round(top3_pct, 4),
+            "total_profit_months": n_profit,
+            "warning":            warning,
+        }
+
     # =========================================================================
     # DATA EXPORT
     # =========================================================================
 
     def to_dataframe(self, include_backtest_end: bool = True) -> pd.DataFrame:
         """Convert trades to a pandas DataFrame for further analysis."""
-        trades = self.trades if include_backtest_end else self._analysis_trades()
+        trades = self._analysis_trades()
         if not trades:
             return pd.DataFrame()
-        records = []
+
+        rows = []
         for t in trades:
-            records.append({
-                "strategy":        t.strategy,
-                "direction":       t.direction,
-                "entry_price":     t.entry_price,
-                "exit_price":      t.exit_price,
-                "entry_time":      t.entry_time,
-                "exit_time":       t.exit_time,
-                "lots":            t.lots,
-                "pnl":             t.pnl,
-                "pnl_gross":       t.pnl_gross,
-                "r_multiple":      t.r_multiple,
-                "exit_reason":     t.exit_reason,
-                "regime_at_entry": t.regime_at_entry,
-                "regime_at_exit":  t.regime_at_exit,
-                "stop_original":   t.stop_original,
-                "commission":      t.commission,
+            rows.append({
+                "strategy":      t.strategy,
+                "direction":     t.direction,
+                "entry_price":   t.entry_price,
+                "exit_price":    t.exit_price,
+                "entry_time":    t.entry_time,
+                "exit_time":     t.exit_time,
+                "lots":          t.lots,
+                "pnl":           t.pnl,
+                "pnl_gross":     t.pnl_gross,
+                "r_multiple":    t.r_multiple,
+                "exit_reason":   t.exit_reason,
+                "regime_entry":  t.regime_at_entry,
+                "regime_exit":   t.regime_at_exit,
+                "commission":    t.commission,
             })
-        return pd.DataFrame(records)
+        df = pd.DataFrame(rows)
+        if not include_backtest_end:
+            df = df[df["exit_reason"] != "SESSION_CLOSE"]
+        return df
 
     def equity_to_dataframe(self) -> pd.DataFrame:
         """Convert equity curve to a pandas DataFrame."""
@@ -577,102 +507,88 @@ class BacktestResults:
             for ep in self.equity_curve
         ])
 
-    def strategy_breakdown(self) -> dict[str, dict]:
-        """Returns metrics dict per strategy."""
-        result: dict[str, dict] = {}
-        strategy_trades: dict[str, list[TradeRecord]] = {}
-        for trade in self._analysis_trades():
-            strategy_trades.setdefault(trade.strategy, []).append(trade)
-        for strat, s_trades in strategy_trades.items():
-            result[strat] = self._compute_metrics(s_trades)
-        return result
+    def strategy_breakdown(self) -> dict:
+        """Per-strategy performance metrics."""
+        trades = self._analysis_trades()
+        breakdown = {}
+        strats = set(t.strategy for t in trades)
+        for strat in strats:
+            st     = [t for t in trades if t.strategy == strat]
+            m      = self._compute_metrics(st)
+            breakdown[strat] = m
+        return breakdown
 
     def exit_reason_breakdown(self) -> pd.DataFrame:
-        """Breakdown of trades by exit reason."""
-        if not self.trades:
-            return pd.DataFrame()
-        df = self.to_dataframe(include_backtest_end=False)
-        if df.empty:
-            return pd.DataFrame()
-        return df.groupby("exit_reason").agg(
-            count=("pnl", "count"),
-            total_pnl=("pnl", "sum"),
-            avg_pnl=("pnl", "mean"),
-            avg_r=("r_multiple", "mean"),
-        ).reset_index()
-
-    # =========================================================================
-    # EQUITY PLOT
-    # =========================================================================
-
-    def plot_equity(self, save_path: Optional[str] = None) -> None:
         """
-        Plot equity curve, drawdown, and rolling E(R).
-        Requires matplotlib.
+        P&L and win rate broken down by exit reason
+        (SL / TP / PARTIAL / BE / ATR_TRAIL / TIME_KILL / SESSION_CLOSE).
+        """
+        trades = self._analysis_trades()
+        if not trades:
+            return pd.DataFrame()
+
+        df = pd.DataFrame([
+            {"reason": t.exit_reason, "pnl": t.pnl,
+             "r": t.r_multiple, "win": t.pnl > 0}
+            for t in trades
+        ])
+        rows = []
+        for reason, grp in df.groupby("reason"):
+            winners = grp[grp["win"]]
+            rows.append({
+                "exit_reason": reason,
+                "n":           len(grp),
+                "win_rate":    round(len(winners) / len(grp) * 100, 1),
+                "avg_r":       round(grp["r"].mean(), 3),
+                "net_pnl":     round(grp["pnl"].sum(), 2),
+            })
+        return pd.DataFrame(rows).sort_values("net_pnl", ascending=False)
+
+    def plot_equity(
+        self,
+        save_path: Optional[str] = None,
+    ) -> None:
+        """
+        Plot equity curve using matplotlib.
+
+        Args:
+            save_path: If provided, saves the chart to this path (.png).
+                       Otherwise calls plt.show().
         """
         try:
             import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
-            import matplotlib.gridspec as gridspec
         except ImportError:
-            logger.warning("matplotlib not installed — cannot plot equity curve")
+            logger.warning("matplotlib not installed — cannot plot equity curve.")
             return
 
         eq_df = self.equity_to_dataframe()
         if eq_df.empty:
+            logger.warning("No equity curve data to plot.")
             return
 
-        roll_er = self.rolling_expectancy(window=20)
-
-        n_rows  = 3 if not roll_er.empty else 2
-        fig     = plt.figure(figsize=(15, 10))
-        gs      = gridspec.GridSpec(
-            n_rows, 1, height_ratios=[3, 1, 1][:n_rows], hspace=0.08
-        )
-        ax1 = fig.add_subplot(gs[0])
-        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
+                                        gridspec_kw={"height_ratios": [3, 1]})
 
         ax1.plot(eq_df["timestamp"], eq_df["equity"],
-                 color="steelblue", linewidth=1)
+                 color="#2196F3", linewidth=1.2, label="Equity")
         ax1.axhline(y=self.initial_balance, color="gray",
-                    linestyle="--", alpha=0.5, label="Initial balance")
+                    linestyle="--", linewidth=0.8, alpha=0.7, label="Initial Balance")
+        ax1.set_title("Backtest Equity Curve", fontsize=14, fontweight="bold")
         ax1.set_ylabel("Equity ($)")
-        ax1.set_title(
-            f"Backtest  {self.start_date.date()} → {self.end_date.date()}  "
-            f"| Return: {(eq_df['equity'].iloc[-1]-self.initial_balance)/self.initial_balance*100:+.1f}%  "
-            f"| Sharpe: {self.compute_sharpe():+.2f}  "
-            f"| Calmar: {self.compute_calmar():+.2f}"
-        )
+        ax1.legend(loc="upper left")
         ax1.grid(True, alpha=0.3)
-        ax1.legend(fontsize=8)
 
-        ax2.fill_between(eq_df["timestamp"],
-                         -eq_df["drawdown_pct"] * 100, 0,
-                         color="salmon", alpha=0.5)
+        ax2.fill_between(eq_df["timestamp"], eq_df["drawdown_pct"],
+                         color="#F44336", alpha=0.6)
         ax2.set_ylabel("Drawdown (%)")
+        ax2.set_xlabel("Date")
+        ax2.invert_yaxis()
         ax2.grid(True, alpha=0.3)
-        ax2.axhline(y=-12, color="red", linestyle=":",
-                    alpha=0.7, label="KS6 limit (-12%)")
-        ax2.legend(fontsize=8)
 
-        if not roll_er.empty and n_rows == 3:
-            ax3 = fig.add_subplot(gs[2], sharex=ax1)
-            ax3.plot(roll_er["entry_time"], roll_er["rolling_e_r"],
-                     color="darkorange", linewidth=1)
-            ax3.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-            ax3.set_ylabel("Rolling E(R)\n(20 trades)")
-            ax3.set_xlabel("Date")
-            ax3.grid(True, alpha=0.3)
-            ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        else:
-            ax2.set_xlabel("Date")
-            ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-
-        plt.xticks(rotation=45)
         plt.tight_layout()
-
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
-            logger.info(f"Equity curve saved to {save_path}")
+            logger.info(f"Equity chart saved to {save_path}")
         else:
             plt.show()
+        plt.close(fig)
