@@ -25,6 +25,13 @@ FIXES IN THIS REVISION:
           remaining-orders list. Prevents S6/S7 double-fills where both legs
           of the same OCO pair would otherwise independently fill on
           whipsaw bars.
+  GAP-3   check_partial_exit() and check_be_activation() now use the
+          intrabar EXTREME (bar high for LONG, bar low for SHORT) to
+          evaluate R-multiple thresholds, instead of bar close.
+          The live system evaluates these on every tick — the intrabar
+          extreme is the closest available OHLC approximation and
+          eliminates the systematic miss where price touched the
+          partial/BE level mid-bar but pulled back before close.
 """
 import logging
 from datetime import datetime
@@ -275,17 +282,37 @@ class ExecutionSimulator:
         """
         Check if partial exit condition is met (R-multiple threshold).
 
+        GAP-3 FIX: Use intrabar EXTREME instead of bar close.
+        For LONG positions the favourable extreme is bar["high"];
+        for SHORT positions it is bar["low"]. The live system evaluates
+        partial exit on every tick — using the bar extreme is the best
+        OHLC approximation and eliminates false negatives where price
+        touched the partial level intrabar but closed below it.
+
         Returns:
-            (should_partial, current_price)
+            (should_partial, exit_price)
+            exit_price is the partial_r level itself (not the extreme)
+            so that the simulated fill is realistic, not at the extreme.
         """
         if position.partial_done:
             return False, 0.0
 
-        price = bar["close"]
-        r = position.current_r(price)
+        # GAP-3 FIX: evaluate on intrabar extreme, not close
+        if position.direction == "LONG":
+            eval_price = bar["high"]
+        else:
+            eval_price = bar["low"]
+
+        r = position.current_r(eval_price)
 
         if r >= partial_r:
-            return True, price
+            # Fill at the exact partial_r price level, not the extreme
+            stop_dist = position.stop_distance
+            if position.direction == "LONG":
+                partial_price = round(position.entry_price + stop_dist * partial_r, 3)
+            else:
+                partial_price = round(position.entry_price - stop_dist * partial_r, 3)
+            return True, partial_price
 
         return False, 0.0
 
@@ -299,13 +326,25 @@ class ExecutionSimulator:
         Check if breakeven activation condition is met.
         Moves stop to entry price when R-multiple exceeds threshold.
 
+        GAP-3 FIX: Use intrabar EXTREME instead of bar close.
+        For LONG positions the favourable extreme is bar["high"];
+        for SHORT positions it is bar["low"]. This matches the live
+        system's tick-level BE activation — price only needs to reach
+        the BE threshold intrabar for BE to activate, regardless of
+        where price closes.
+
         Returns True if BE should be activated.
         """
         if position.be_activated:
             return False
 
-        price = bar["close"]
-        r = position.current_r(price)
+        # GAP-3 FIX: evaluate on intrabar extreme, not close
+        if position.direction == "LONG":
+            eval_price = bar["high"]
+        else:
+            eval_price = bar["low"]
+
+        r = position.current_r(eval_price)
 
         return r >= be_r
 
