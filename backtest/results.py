@@ -100,7 +100,7 @@ class BacktestResults:
 
         lines.append(f"── RISK METRICS ────────────────────────────────────────")
         lines.append(f"  Max Drawdown:    ${max_dd:,.2f} ({max_dd_pct:.2f}%)")
-        lines.append(f"  Sharpe Ratio:    {sharpe:+.3f}  (annualised, trade-based)")
+        lines.append(f"  Sharpe Ratio:    {sharpe:+.3f}  (annualised, trade-based daily P&L)")
         lines.append(f"  Sortino Ratio:   {sortino:+.3f}  (downside deviation)")
         lines.append(f"  Calmar Ratio:    {calmar:+.3f}  (CAGR / Max DD)")
         lines.append("=" * 80)
@@ -201,21 +201,37 @@ class BacktestResults:
 
     def _daily_pnl_series(self) -> pd.Series:
         """
-        Build daily P&L series from closed trades.
+        Build a tz-naive daily P&L series from closed trades.
 
-        FIX (was equity-curve resampling which inflated Sharpe with zero-return days):
-        Now sums net P&L of all trades closed each calendar day.
-        Days with no closed trades are assigned 0.0 so the denominator is correct.
+        BUG FIX: the previous implementation preserved timezone info on
+        exit_time when calling .dt.normalize(), producing a tz-aware index.
+        pd.date_range(self.start_date.date(), ...) always returns a tz-naive
+        index, so .reindex() found no matching keys and silently filled every
+        row with NaN.  std(NaN series) == NaN → Sharpe fell through to the
+        ``if std == 0`` guard and returned 0.0.
+
+        Fix: strip tz from exit_time with .dt.tz_convert(None) before
+        .dt.normalize() so both sides of .reindex() are always tz-naive.
         """
         analysis_trades = self._analysis_trades()
         if not analysis_trades:
             return pd.Series(dtype=float)
 
         df = self.to_dataframe(include_backtest_end=False)
-        df["date"] = pd.to_datetime(df["exit_time"]).dt.normalize()
+
+        # Ensure exit_time is tz-naive before extracting the date key.
+        exit_ts = pd.to_datetime(df["exit_time"])
+        if exit_ts.dt.tz is not None:
+            exit_ts = exit_ts.dt.tz_convert(None)
+        df["date"] = exit_ts.dt.normalize()
+
         daily = df.groupby("date")["pnl"].sum()
 
-        idx = pd.date_range(self.start_date.date(), self.end_date.date(), freq="D")
+        # Build a tz-naive index covering every calendar day in the backtest.
+        start = pd.Timestamp(self.start_date.date())
+        end   = pd.Timestamp(self.end_date.date())
+        idx   = pd.date_range(start, end, freq="D")
+
         daily = daily.reindex(idx, fill_value=0.0)
         return daily
 
@@ -223,9 +239,12 @@ class BacktestResults:
         """
         Annualised Sharpe ratio using trade-based daily P&L.
 
-        FIXED: old implementation resampled equity curve, which gave near-zero
-        returns on no-trade days and artificially inflated the ratio.
-        Now uses actual closed-trade P&L per day, normalised by initial balance.
+        Each calendar day's return = sum(closed-trade P&L that day) / initial_balance.
+        Days with no closed trades contribute a 0.0 return (they still count in the
+        denominator — this is the correct treatment for a system that is "live" every
+        trading day whether or not it fires a trade).
+
+        Annualisation factor: sqrt(252) — standard for daily returns.
         """
         daily = self._daily_pnl_series()
         if len(daily) < 2:
@@ -233,7 +252,7 @@ class BacktestResults:
 
         returns = daily / self.initial_balance
         std = returns.std()
-        if std == 0:
+        if std == 0 or np.isnan(std):
             return 0.0
 
         excess = returns.mean() - risk_free_rate / 252
@@ -259,7 +278,7 @@ class BacktestResults:
             return float("inf")
 
         downside_std = float(np.sqrt(np.mean(downside ** 2)))
-        if downside_std == 0:
+        if downside_std == 0 or np.isnan(downside_std):
             return 0.0
 
         excess = returns.mean() - risk_free_rate / 252
