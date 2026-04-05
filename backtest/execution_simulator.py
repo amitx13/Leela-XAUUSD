@@ -11,6 +11,15 @@ ExecutionSimulator handles:
 Contract spec (XAUUSD defaults):
   point = 0.01, tick_size = 0.01, tick_value = 1.0, contract_size = 100
   Commission: $3.50/lot/side = $7.00 round trip
+
+FIXES IN THIS REVISION:
+  HIGH-1  Same-bar SL/TP conflict: use proximity-to-open tie-break instead
+          of always picking SL. Whichever level is closer to the bar open
+          is assumed to have been touched first (matches MT5/QuantConnect
+          probabilistic model). Eliminates systematic win-rate understatement.
+  HIGH-2  ATR trailing stop now anchors to bar extreme (high for LONG,
+          low for SHORT) instead of bar close, matching the live
+          manage_s1_position() implementation.
 """
 import logging
 from datetime import datetime
@@ -36,9 +45,13 @@ class ExecutionSimulator:
       - MARKET orders: fill at bar open ± half_spread ± slippage
 
     SL/TP model:
-      - Checks bar high/low against SL and TP levels
-      - If both SL and TP could be hit in same bar, SL takes priority
-        (conservative assumption — worst case)
+      - Checks bar high/low against SL and TP levels.
+      - HIGH-1 FIX: If both SL and TP could be hit in the same bar,
+        the level CLOSER to bar open is assumed to have been touched
+        first and wins. This is the standard probabilistic tie-break
+        used by MT5, QuantConnect, and similar frameworks.
+        Previous behaviour (always pick SL) systematically understated
+        win rate by treating every same-bar case as a loss.
     """
 
     def __init__(self, slippage_points: float = 0.7):
@@ -157,19 +170,45 @@ class ExecutionSimulator:
             exit_price: Price at which position exits.
             reason: "SL", "TP", or "" if not closed.
 
-        Conservative assumption: if both SL and TP could be hit in the
-        same bar, SL takes priority (worst case for the trader).
+        HIGH-1 FIX — Same-bar SL/TP tie-break:
+            When both SL and TP are within the bar range, we cannot know
+            from OHLC data alone which was touched first. The previous
+            code always chose SL ("conservative worst-case"), which
+            systematically understated win rate.
+
+            Fix: compare the DISTANCE from bar open to each level.
+            The level closer to bar open is assumed to have been reached
+            first. This is the standard probabilistic model used by MT5
+            built-in backtester and QuantConnect.
+
+            For LONG:
+              dist_to_sl = open - SL    (SL is below open)
+              dist_to_tp = TP - open    (TP is above open)
+              if dist_to_sl <= dist_to_tp → SL hit first
+              else                        → TP hit first
+
+            For SHORT:
+              dist_to_sl = SL - open    (SL is above open)
+              dist_to_tp = open - TP    (TP is below open)
+              if dist_to_sl <= dist_to_tp → SL hit first
+              else                        → TP hit first
         """
         sl = position.current_sl
         tp = position.tp
+        bar_open = bar["open"]
 
         if position.direction == "LONG":
             sl_hit = bar["low"] <= sl if sl else False
             tp_hit = bar["high"] >= tp if tp else False
 
             if sl_hit and tp_hit:
-                # Both hit — conservative: SL wins
-                return True, sl, "SL"
+                # HIGH-1 FIX: proximity-to-open tie-break
+                dist_to_sl = abs(bar_open - sl)   # SL is below open for LONG
+                dist_to_tp = abs(tp - bar_open)   # TP is above open for LONG
+                if dist_to_sl <= dist_to_tp:
+                    return True, sl, "SL"
+                else:
+                    return True, tp, "TP"
             elif sl_hit:
                 return True, sl, "SL"
             elif tp_hit:
@@ -180,7 +219,13 @@ class ExecutionSimulator:
             tp_hit = bar["low"] <= tp if tp else False
 
             if sl_hit and tp_hit:
-                return True, sl, "SL"
+                # HIGH-1 FIX: proximity-to-open tie-break
+                dist_to_sl = abs(sl - bar_open)   # SL is above open for SHORT
+                dist_to_tp = abs(bar_open - tp)   # TP is below open for SHORT
+                if dist_to_sl <= dist_to_tp:
+                    return True, sl, "SL"
+                else:
+                    return True, tp, "TP"
             elif sl_hit:
                 return True, sl, "SL"
             elif tp_hit:
@@ -241,11 +286,33 @@ class ExecutionSimulator:
         """
         Compute ATR trailing stop level.
 
-        For LONG: new_sl = bar.close - atr_m15 * trail_mult
-        For SHORT: new_sl = bar.close + atr_m15 * trail_mult
+        HIGH-2 FIX — Anchor to bar EXTREME, not bar close:
+            Previous code used bar["close"] as the anchor point:
+              LONG:  new_sl = bar["close"] - atr * mult
+              SHORT: new_sl = bar["close"] + atr * mult
 
-        Only moves stop in favorable direction (never widens).
-        Returns new SL level or None if no update needed.
+            This lags behind on strong trending candles because close < high
+            (LONG) or close > low (SHORT), causing the trail to sit further
+            away from the current price than intended and leaving more open
+            risk than the live system.
+
+            The live manage_s1_position() anchors to the bar EXTREME:
+              LONG:  new_sl = bar["high"]  - atr * mult
+              SHORT: new_sl = bar["low"]   + atr * mult
+
+            Using the extreme matches the logic that "price reached that high
+            (or low) during this bar, so we can trail the stop up to that
+            level minus the buffer". The stop only moves in the favorable
+            direction (never widens).
+
+        Args:
+            position: Open SimPosition being managed.
+            bar:      Current M5 bar dict with open, high, low, close.
+            atr_m15:  Current ATR on M15 timeframe (in price points).
+            trail_mult: Multiplier applied to ATR for the buffer distance.
+
+        Returns:
+            New SL level (float) if the stop should be moved, else None.
         """
         if atr_m15 <= 0:
             return None
@@ -253,11 +320,13 @@ class ExecutionSimulator:
         trail_dist = atr_m15 * trail_mult
 
         if position.direction == "LONG":
-            new_sl = round(bar["close"] - trail_dist, 3)
+            # HIGH-2 FIX: anchor to bar high (extreme) not bar close
+            new_sl = round(bar["high"] - trail_dist, 3)
             if new_sl > position.current_sl:
                 return new_sl
         else:
-            new_sl = round(bar["close"] + trail_dist, 3)
+            # HIGH-2 FIX: anchor to bar low (extreme) not bar close
+            new_sl = round(bar["low"] + trail_dist, 3)
             if new_sl < position.current_sl:
                 return new_sl
 
