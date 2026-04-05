@@ -20,6 +20,11 @@ FIXES IN THIS REVISION:
   HIGH-2  ATR trailing stop now anchors to bar extreme (high for LONG,
           low for SHORT) instead of bar close, matching the live
           manage_s1_position() implementation.
+  OCO-FIX After any order fills, its linked OCO counterpart (identified by
+          linked_tag / tag pairing) is immediately cancelled from the
+          remaining-orders list. Prevents S6/S7 double-fills where both legs
+          of the same OCO pair would otherwise independently fill on
+          whipsaw bars.
 """
 import logging
 from datetime import datetime
@@ -81,11 +86,21 @@ class ExecutionSimulator:
             (filled_positions, remaining_orders)
             filled_positions: List of new SimPosition objects from filled orders.
             remaining_orders: Orders that didn't fill and haven't expired.
+
+        OCO-FIX: After processing fills, any pending order whose `tag` matches
+        a filled order's `linked_tag` is immediately cancelled. This implements
+        the OCO (One-Cancels-Other) mechanic for S6/S7 paired orders so that
+        when one leg fills its counterpart is removed rather than also filling
+        on the same or a subsequent whipsaw bar.
         """
         filled: list[SimPosition] = []
         remaining: list[SimOrder] = []
         half_spread = spread * POINT * 0.5
 
+        # Track which linked_tags were triggered by fills this bar
+        cancelled_tags: set[str] = set()
+        # First pass: determine fills
+        fill_results: list[tuple[SimOrder, Optional[float]]] = []
         for order in orders:
             # Check expiry first
             if order.expiry is not None and current_time >= order.expiry:
@@ -94,9 +109,11 @@ class ExecutionSimulator:
                     f"@ {order.price}"
                 )
                 continue
-
             fill_price = self._check_fill(order, bar, half_spread)
+            fill_results.append((order, fill_price))
 
+        # Second pass: commit fills, collect cancelled OCO tags
+        for order, fill_price in fill_results:
             if fill_price is not None:
                 pos = SimPosition(
                     strategy=order.strategy,
@@ -113,8 +130,24 @@ class ExecutionSimulator:
                     f"Order filled: {order.strategy} {order.direction} "
                     f"@ {fill_price:.2f} (order: {order.price:.2f})"
                 )
+                # OCO-FIX: mark the linked counterpart for cancellation
+                if order.linked_tag:
+                    cancelled_tags.add(order.linked_tag)
             else:
                 remaining.append(order)
+
+        # OCO-FIX: purge any remaining order whose tag is in cancelled_tags
+        if cancelled_tags:
+            kept: list[SimOrder] = []
+            for order in remaining:
+                if order.tag and order.tag in cancelled_tags:
+                    logger.debug(
+                        f"OCO cancel: {order.strategy} {order.direction} "
+                        f"tag={order.tag} cancelled because linked leg filled"
+                    )
+                else:
+                    kept.append(order)
+            remaining = kept
 
         return filled, remaining
 
