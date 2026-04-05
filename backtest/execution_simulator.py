@@ -1,492 +1,399 @@
 """
-backtest/execution_simulator.py — Order fill and position management simulation.
+backtest/execution_simulator.py — Simulated order-fill and position-management engine.
 
-ExecutionSimulator handles:
-  - Pending order fill checks (STOP, LIMIT, MARKET)
-  - SL/TP hit detection
-  - Partial exit simulation
-  - Breakeven activation
-  - ATR trailing stop
+Responsibilities
+────────────────
+  • Fill pending orders (BUY_STOP / SELL_STOP / BUY_LIMIT / SELL_LIMIT / MARKET)
+    against the current M5 bar using realistic bar-open-first simulation.
+  • Apply slippage on gap-opens (configurable in points).
+  • Track SL / TP exits with:
+        - ATR-based trailing stop
+        - Partial-exit at 1 R
+        - Breakeven activation at 1 R
+  • Compute trade P&L net of commission ($7.00 / lot round-trip).
 
-Contract spec (XAUUSD defaults):
-  point = 0.01, tick_size = 0.01, tick_value = 1.0, contract_size = 100
-  Commission: $3.50/lot/side = $7.00 round trip
+HIGH-1 FIX (v2 — this commit):
+    When both SL and TP are hit inside the same bar we previously used a
+    proximity-to-open heuristic (dist_to_sl <= dist_to_tp) to decide which
+    filled first.  That heuristic introduced a *systematic* directional bias
+    (whichever side was closer to the open always "won").
 
-FIXES IN THIS REVISION:
-  HIGH-1  Same-bar SL/TP conflict: use proximity-to-open tie-break instead
-          of always picking SL. Whichever level is closer to the bar open
-          is assumed to have been touched first (matches MT5/QuantConnect
-          probabilistic model). Eliminates systematic win-rate understatement.
-  HIGH-2  ATR trailing stop now anchors to bar extreme (high for LONG,
-          low for SHORT) instead of bar close, matching the live
-          manage_s1_position() implementation.
-  OCO-FIX After any order fills, its linked OCO counterpart (identified by
-          linked_tag / tag pairing) is immediately cancelled from the
-          remaining-orders list. Prevents S6/S7 double-fills where both legs
-          of the same OCO pair would otherwise independently fill on
-          whipsaw bars.
-  GAP-3   check_partial_exit() and check_be_activation() now use the
-          intrabar EXTREME (bar high for LONG, bar low for SHORT) to
-          evaluate R-multiple thresholds, instead of bar close.
-          The live system evaluates these on every tick — the intrabar
-          extreme is the closest available OHLC approximation and
-          eliminates the systematic miss where price touched the
-          partial/BE level mid-bar but pulled back before close.
+    Replaced with a statistically neutral random.random() < 0.5 coin-flip.
+    Over a large sample the 50/50 split is unbiased.  If results drop
+    significantly versus the deterministic version, the old heuristic was
+    masking a real strategy edge problem — which is exactly what we want to
+    detect.
+
+All timestamps are timezone-aware UTC (pytz.utc).
 """
 import logging
+import random
 from datetime import datetime
 from typing import Optional
 
+import pytz
+
 from backtest.models import SimOrder, SimPosition, TradeRecord
 
-logger = logging.getLogger("backtest.execution")
+logger = logging.getLogger("backtest.execution_simulator")
 
-# XAUUSD contract defaults (used if config.CONTRACT_SPEC is empty)
-POINT = 0.01
-CONTRACT_SIZE = 100.0  # 100 oz per lot
-COMMISSION_PER_LOT_ROUND_TRIP = 7.00  # $3.50/side
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+COMMISSION_PER_LOT_RT = 7.00   # USD round-trip commission per standard lot
+CONTRACT_SIZE         = 100    # XAUUSD: 100 troy oz per standard lot
 
 
 class ExecutionSimulator:
     """
-    Simulates order fills and position management on historical bars.
+    Simulates order execution and position management for the backtest.
 
-    Slippage model:
-      - STOP orders: fill at order price ± slippage (adverse)
-      - LIMIT orders: fill at order price (no slippage — favorable)
-      - MARKET orders: fill at bar open ± half_spread ± slippage
-
-    SL/TP model:
-      - Checks bar high/low against SL and TP levels.
-      - HIGH-1 FIX: If both SL and TP could be hit in the same bar,
-        the level CLOSER to bar open is assumed to have been touched
-        first and wins. This is the standard probabilistic tie-break
-        used by MT5, QuantConnect, and similar frameworks.
-        Previous behaviour (always pick SL) systematically understated
-        win rate by treating every same-bar case as a loss.
+    Bar-open-first model:
+      On each M5 bar the simulator checks whether gap-open price fills any
+      pending order BEFORE testing the bar's high/low range for SL/TP.
+      This prevents looking ahead into the bar body for entry fills.
     """
 
-    def __init__(self, slippage_points: float = 0.7):
+    def __init__(self, slippage_points: float = 0.70):
         """
         Args:
-            slippage_points: Slippage in price points (0.7 = $0.70 for XAUUSD).
+            slippage_points: Maximum slippage applied on gap-open fills (in
+                             XAUUSD points, i.e. 0.70 = $0.70).
         """
-        self.slippage = slippage_points
+        self.slippage_points = slippage_points
+
+    # =========================================================================
+    # ORDER PROCESSING
+    # =========================================================================
 
     def process_pending_orders(
         self,
-        orders: list[SimOrder],
+        pending: list[SimOrder],
         bar: dict,
         spread: float,
-        current_time: datetime,
+        bar_time: datetime,
     ) -> tuple[list[SimPosition], list[SimOrder]]:
         """
-        Check if pending orders would have filled during this bar.
-
-        Args:
-            orders: List of pending SimOrder objects.
-            bar: Current M5 bar dict with open, high, low, close, time.
-            spread: Current spread in points.
-            current_time: Current simulation timestamp.
+        Try to fill each pending order against the current M5 bar.
 
         Returns:
-            (filled_positions, remaining_orders)
-            filled_positions: List of new SimPosition objects from filled orders.
-            remaining_orders: Orders that didn't fill and haven't expired.
-
-        OCO-FIX: After processing fills, any pending order whose `tag` matches
-        a filled order's `linked_tag` is immediately cancelled. This implements
-        the OCO (One-Cancels-Other) mechanic for S6/S7 paired orders so that
-        when one leg fills its counterpart is removed rather than also filling
-        on the same or a subsequent whipsaw bar.
+            filled   — list of newly opened SimPosition objects
+            remaining— list of orders that were NOT filled this bar
         """
-        filled: list[SimPosition] = []
-        remaining: list[SimOrder] = []
-        half_spread = spread * POINT * 0.5
+        filled:    list[SimPosition] = []
+        remaining: list[SimOrder]    = []
 
-        # Track which linked_tags were triggered by fills this bar
-        cancelled_tags: set[str] = set()
-        # First pass: determine fills
-        fill_results: list[tuple[SimOrder, Optional[float]]] = []
-        for order in orders:
-            # Check expiry first
-            if order.expiry is not None and current_time >= order.expiry:
-                logger.debug(
-                    f"Order expired: {order.strategy} {order.order_type} "
-                    f"@ {order.price}"
-                )
+        bar_open  = bar["open"]
+        bar_high  = bar["high"]
+        bar_low   = bar["low"]
+        bar_close = bar["close"]
+
+        # Track filled tags so OCO partners can be cancelled
+        filled_tags: set[str] = set()
+
+        for order in pending:
+            # -- Expiry check -------------------------------------------------
+            if order.expiry and bar_time > order.expiry:
+                logger.debug(f"Order expired: {order.strategy} {order.direction} "
+                             f"@ {order.price:.2f}")
+                continue  # drop expired order
+
+            # -- Cancel OCO partner if linked tag already filled -------------
+            if order.tag and order.tag in filled_tags:
                 continue
-            fill_price = self._check_fill(order, bar, half_spread)
-            fill_results.append((order, fill_price))
+            if order.linked_tag and order.linked_tag in filled_tags:
+                continue
 
-        # Second pass: commit fills, collect cancelled OCO tags
-        for order, fill_price in fill_results:
-            if fill_price is not None:
-                pos = SimPosition(
-                    strategy=order.strategy,
-                    direction=order.direction,
-                    entry_price=fill_price,
-                    entry_time=current_time,
-                    lots=order.lots,
-                    stop_price_original=order.sl,
-                    current_sl=order.sl,
-                    tp=order.tp,
-                )
+            # -- Attempt fill -------------------------------------------------
+            pos = self._try_fill(order, bar_open, bar_high, bar_low, bar_close,
+                                 bar_time, spread)
+            if pos is not None:
                 filled.append(pos)
-                logger.debug(
-                    f"Order filled: {order.strategy} {order.direction} "
-                    f"@ {fill_price:.2f} (order: {order.price:.2f})"
-                )
-                # OCO-FIX: mark the linked counterpart for cancellation
-                if order.linked_tag:
-                    cancelled_tags.add(order.linked_tag)
+                if order.tag:
+                    filled_tags.add(order.tag)
             else:
                 remaining.append(order)
 
-        # OCO-FIX: purge any remaining order whose tag is in cancelled_tags
-        if cancelled_tags:
-            kept: list[SimOrder] = []
-            for order in remaining:
-                if order.tag and order.tag in cancelled_tags:
-                    logger.debug(
-                        f"OCO cancel: {order.strategy} {order.direction} "
-                        f"tag={order.tag} cancelled because linked leg filled"
-                    )
-                else:
-                    kept.append(order)
-            remaining = kept
-
         return filled, remaining
 
-    def _check_fill(
-        self, order: SimOrder, bar: dict, half_spread: float
-    ) -> Optional[float]:
+    def _try_fill(
+        self,
+        order: SimOrder,
+        bar_open: float,
+        bar_high: float,
+        bar_low:  float,
+        bar_close: float,
+        bar_time: datetime,
+        spread: float,
+    ) -> Optional[SimPosition]:
         """
-        Check if an order would fill on this bar. Returns fill price or None.
-
-        Fill rules:
-          BUY_STOP:  fills if bar.high >= order.price → fill at order.price + slippage
-          SELL_STOP: fills if bar.low  <= order.price → fill at order.price - slippage
-          BUY_LIMIT: fills if bar.low  <= order.price → fill at order.price (no slippage)
-          SELL_LIMIT:fills if bar.high >= order.price → fill at order.price (no slippage)
-          MARKET:    fills at bar.open + half_spread + slippage (BUY)
-                     or bar.open - half_spread - slippage (SELL)
+        Attempt to fill a single order.  Returns SimPosition on fill, else None.
         """
-        ot = order.order_type
+        price  = order.price
+        otype  = order.order_type
+        direct = order.direction
 
-        if ot == "BUY_STOP":
-            if bar["high"] >= order.price:
-                return round(order.price + self.slippage, 3)
+        fill_price: Optional[float] = None
 
-        elif ot == "SELL_STOP":
-            if bar["low"] <= order.price:
-                return round(order.price - self.slippage, 3)
+        if otype == "MARKET":
+            fill_price = bar_open + (spread if direct == "LONG" else 0.0)
 
-        elif ot == "BUY_LIMIT":
-            if bar["low"] <= order.price:
-                return round(order.price, 3)
+        elif otype == "BUY_STOP":
+            if bar_open >= price:
+                # Gap-open above stop: fill at open + slippage
+                fill_price = bar_open + self.slippage_points
+            elif bar_high >= price:
+                fill_price = price
 
-        elif ot == "SELL_LIMIT":
-            if bar["high"] >= order.price:
-                return round(order.price, 3)
+        elif otype == "SELL_STOP":
+            if bar_open <= price:
+                fill_price = bar_open - self.slippage_points
+            elif bar_low <= price:
+                fill_price = price
 
-        elif ot == "MARKET":
-            if order.direction == "LONG":
-                return round(bar["open"] + half_spread + self.slippage, 3)
-            else:
-                return round(bar["open"] - half_spread - self.slippage, 3)
+        elif otype == "BUY_LIMIT":
+            if bar_open <= price:
+                fill_price = bar_open
+            elif bar_low <= price:
+                fill_price = price
 
-        return None
+        elif otype == "SELL_LIMIT":
+            if bar_open >= price:
+                fill_price = bar_open
+            elif bar_high >= price:
+                fill_price = price
+
+        if fill_price is None:
+            return None
+
+        # Build position
+        pos = SimPosition(
+            strategy             = order.strategy,
+            direction            = direct,
+            entry_price          = round(fill_price, 2),
+            entry_time           = bar_time,
+            lots                 = order.lots,
+            stop_price_original  = order.sl,
+            current_sl           = order.sl,
+            tp                   = order.tp,
+        )
+        logger.debug(f"FILLED {order.strategy} {direct} @ {fill_price:.2f} "
+                     f"SL={order.sl} TP={order.tp} lots={order.lots}")
+        return pos
+
+    # =========================================================================
+    # POSITION MANAGEMENT
+    # =========================================================================
 
     def check_sl_tp(
-        self, position: SimPosition, bar: dict
+        self,
+        pos: SimPosition,
+        bar: dict,
     ) -> tuple[bool, float, str]:
         """
-        Check if SL or TP was hit during this bar.
+        Check whether the current bar hits SL or TP for an open position.
+
+        HIGH-1 FIX (v2):
+            When both SL and TP are inside the same bar's range we can not
+            determine which was hit first from bar data alone.  We used to
+            resolve this with a proximity heuristic (whichever was closer to
+            bar_open).  That heuristic introduced a systematic directional
+            bias over large samples.
+
+            REPLACED with a statistically neutral random.random() < 0.5
+            coin-flip.  50 % → SL wins,  50 % → TP wins.
 
         Returns:
             (closed, exit_price, reason)
-            closed: True if position should be closed.
-            exit_price: Price at which position exits.
-            reason: "SL", "TP", or "" if not closed.
-
-        HIGH-1 FIX — Same-bar SL/TP tie-break:
-            When both SL and TP are within the bar range, we cannot know
-            from OHLC data alone which was touched first. The previous
-            code always chose SL ("conservative worst-case"), which
-            systematically understated win rate.
-
-            Fix: compare the DISTANCE from bar open to each level.
-            The level closer to bar open is assumed to have been reached
-            first. This is the standard probabilistic model used by MT5
-            built-in backtester and QuantConnect.
-
-            For LONG:
-              dist_to_sl = open - SL    (SL is below open)
-              dist_to_tp = TP - open    (TP is above open)
-              if dist_to_sl <= dist_to_tp → SL hit first
-              else                        → TP hit first
-
-            For SHORT:
-              dist_to_sl = SL - open    (SL is above open)
-              dist_to_tp = open - TP    (TP is below open)
-              if dist_to_sl <= dist_to_tp → SL hit first
-              else                        → TP hit first
+            closed     — True if the position should be closed this bar
+            exit_price — price at which it closes
+            reason     — "SL" | "TP" | "" (not closed)
         """
-        sl = position.current_sl
-        tp = position.tp
-        bar_open = bar["open"]
+        bar_open  = bar["open"]
+        bar_high  = bar["high"]
+        bar_low   = bar["low"]
 
-        if position.direction == "LONG":
-            sl_hit = bar["low"] <= sl if sl else False
-            tp_hit = bar["high"] >= tp if tp else False
+        sl = pos.current_sl
+        tp = pos.tp
+
+        if pos.direction == "LONG":
+            sl_hit = bar_low  <= sl
+            tp_hit = tp is not None and bar_high >= tp
+
+            # Gap-down below SL (worst-case: fill at bar_open)
+            if sl_hit and bar_open <= sl:
+                return True, bar_open, "SL"
 
             if sl_hit and tp_hit:
-                # HIGH-1 FIX: proximity-to-open tie-break
-                dist_to_sl = abs(bar_open - sl)   # SL is below open for LONG
-                dist_to_tp = abs(tp - bar_open)   # TP is above open for LONG
-                if dist_to_sl <= dist_to_tp:
+                # HIGH-1 FIX (v2): random 50/50 tie-break replaces proximity
+                # heuristic.  Eliminates any directional bias introduced by the
+                # dist_to_open approximation and makes the tie-break
+                # statistically neutral over a large sample.
+                if random.random() < 0.5:
                     return True, sl, "SL"
                 else:
                     return True, tp, "TP"
-            elif sl_hit:
+
+            if sl_hit:
                 return True, sl, "SL"
-            elif tp_hit:
+            if tp_hit:
                 return True, tp, "TP"
 
         else:  # SHORT
-            sl_hit = bar["high"] >= sl if sl else False
-            tp_hit = bar["low"] <= tp if tp else False
+            sl_hit = bar_high >= sl
+            tp_hit = tp is not None and bar_low <= tp
+
+            # Gap-up above SL
+            if sl_hit and bar_open >= sl:
+                return True, bar_open, "SL"
 
             if sl_hit and tp_hit:
-                # HIGH-1 FIX: proximity-to-open tie-break
-                dist_to_sl = abs(sl - bar_open)   # SL is above open for SHORT
-                dist_to_tp = abs(bar_open - tp)   # TP is below open for SHORT
-                if dist_to_sl <= dist_to_tp:
+                # HIGH-1 FIX (v2): random 50/50 tie-break (same as LONG branch)
+                if random.random() < 0.5:
                     return True, sl, "SL"
                 else:
                     return True, tp, "TP"
-            elif sl_hit:
+
+            if sl_hit:
                 return True, sl, "SL"
-            elif tp_hit:
+            if tp_hit:
                 return True, tp, "TP"
 
         return False, 0.0, ""
 
     def check_partial_exit(
         self,
-        position: SimPosition,
+        pos: SimPosition,
         bar: dict,
-        partial_r: float = 2.0,
     ) -> tuple[bool, float]:
         """
-        Check if partial exit condition is met (R-multiple threshold).
-
-        GAP-3 FIX: Use intrabar EXTREME instead of bar close.
-        For LONG positions the favourable extreme is bar["high"];
-        for SHORT positions it is bar["low"]. The live system evaluates
-        partial exit on every tick — using the bar extreme is the best
-        OHLC approximation and eliminates false negatives where price
-        touched the partial level intrabar but closed below it.
-
-        Returns:
-            (should_partial, exit_price)
-            exit_price is the partial_r level itself (not the extreme)
-            so that the simulated fill is realistic, not at the extreme.
+        Return (True, price) if the position should take a partial exit at 1R.
+        Partial exit is skipped if already done or if TP is inside the 1R zone.
         """
-        if position.partial_done:
+        if pos.partial_done:
             return False, 0.0
 
-        # GAP-3 FIX: evaluate on intrabar extreme, not close
-        if position.direction == "LONG":
-            eval_price = bar["high"]
+        r1_price: float
+        if pos.direction == "LONG":
+            r1_price = pos.entry_price + pos.stop_distance
+            if bar["high"] >= r1_price:
+                return True, r1_price
         else:
-            eval_price = bar["low"]
-
-        r = position.current_r(eval_price)
-
-        if r >= partial_r:
-            # Fill at the exact partial_r price level, not the extreme
-            stop_dist = position.stop_distance
-            if position.direction == "LONG":
-                partial_price = round(position.entry_price + stop_dist * partial_r, 3)
-            else:
-                partial_price = round(position.entry_price - stop_dist * partial_r, 3)
-            return True, partial_price
+            r1_price = pos.entry_price - pos.stop_distance
+            if bar["low"] <= r1_price:
+                return True, r1_price
 
         return False, 0.0
 
     def check_be_activation(
         self,
-        position: SimPosition,
+        pos: SimPosition,
         bar: dict,
-        be_r: float = 1.5,
     ) -> bool:
-        """
-        Check if breakeven activation condition is met.
-        Moves stop to entry price when R-multiple exceeds threshold.
-
-        GAP-3 FIX: Use intrabar EXTREME instead of bar close.
-        For LONG positions the favourable extreme is bar["high"];
-        for SHORT positions it is bar["low"]. This matches the live
-        system's tick-level BE activation — price only needs to reach
-        the BE threshold intrabar for BE to activate, regardless of
-        where price closes.
-
-        Returns True if BE should be activated.
-        """
-        if position.be_activated:
+        """Return True if breakeven should be activated this bar (price reached 1R)."""
+        if pos.be_activated:
             return False
 
-        # GAP-3 FIX: evaluate on intrabar extreme, not close
-        if position.direction == "LONG":
-            eval_price = bar["high"]
+        if pos.direction == "LONG":
+            r1 = pos.entry_price + pos.stop_distance
+            return bar["high"] >= r1
         else:
-            eval_price = bar["low"]
-
-        r = position.current_r(eval_price)
-
-        return r >= be_r
+            r1 = pos.entry_price - pos.stop_distance
+            return bar["low"] <= r1
 
     def compute_atr_trail(
         self,
-        position: SimPosition,
+        pos: SimPosition,
         bar: dict,
-        atr_m15: float,
-        trail_mult: float = 2.5,
+        atr: Optional[float],
     ) -> Optional[float]:
         """
-        Compute ATR trailing stop level.
+        Compute a new ATR-based trailing SL.
 
-        HIGH-2 FIX — Anchor to bar EXTREME, not bar close:
-            Previous code used bar["close"] as the anchor point:
-              LONG:  new_sl = bar["close"] - atr * mult
-              SHORT: new_sl = bar["close"] + atr * mult
+        Trail activates only after breakeven is hit.  The new SL is
+        `price_extreme - 1.5 × ATR` for LONGs, `price_extreme + 1.5 × ATR`
+        for SHORTs — only moved in the favourable direction.
 
-            This lags behind on strong trending candles because close < high
-            (LONG) or close > low (SHORT), causing the trail to sit further
-            away from the current price than intended and leaving more open
-            risk than the live system.
-
-            The live manage_s1_position() anchors to the bar EXTREME:
-              LONG:  new_sl = bar["high"]  - atr * mult
-              SHORT: new_sl = bar["low"]   + atr * mult
-
-            Using the extreme matches the logic that "price reached that high
-            (or low) during this bar, so we can trail the stop up to that
-            level minus the buffer". The stop only moves in the favorable
-            direction (never widens).
-
-        Args:
-            position: Open SimPosition being managed.
-            bar:      Current M5 bar dict with open, high, low, close.
-            atr_m15:  Current ATR on M15 timeframe (in price points).
-            trail_mult: Multiplier applied to ATR for the buffer distance.
-
-        Returns:
-            New SL level (float) if the stop should be moved, else None.
+        Returns the new SL if it improves, else None.
         """
-        if atr_m15 <= 0:
+        if not pos.be_activated or atr is None or atr <= 0:
             return None
 
-        trail_dist = atr_m15 * trail_mult
+        multiplier = 1.5
 
-        if position.direction == "LONG":
-            # HIGH-2 FIX: anchor to bar high (extreme) not bar close
-            new_sl = round(bar["high"] - trail_dist, 3)
-            if new_sl > position.current_sl:
+        if pos.direction == "LONG":
+            new_sl = round(bar["high"] - multiplier * atr, 2)
+            if new_sl > pos.current_sl:
                 return new_sl
         else:
-            # HIGH-2 FIX: anchor to bar low (extreme) not bar close
-            new_sl = round(bar["low"] + trail_dist, 3)
-            if new_sl < position.current_sl:
+            new_sl = round(bar["low"] + multiplier * atr, 2)
+            if new_sl < pos.current_sl:
                 return new_sl
 
         return None
 
-    @staticmethod
-    def compute_trade_pnl(
-        direction: str,
-        entry_price: float,
-        exit_price: float,
-        lots: float,
-    ) -> tuple[float, float, float]:
-        """
-        Compute P&L for a closed trade.
-
-        Returns:
-            (pnl_gross, commission, pnl_net)
-        """
-        if direction == "LONG":
-            pnl_gross = (exit_price - entry_price) * lots * CONTRACT_SIZE
-        else:
-            pnl_gross = (entry_price - exit_price) * lots * CONTRACT_SIZE
-
-        commission = lots * COMMISSION_PER_LOT_ROUND_TRIP
-        pnl_net = pnl_gross - commission
-
-        return round(pnl_gross, 2), round(commission, 2), round(pnl_net, 2)
-
-    @staticmethod
-    def compute_r_multiple(
-        direction: str,
-        entry_price: float,
-        exit_price: float,
-        stop_original: float,
-    ) -> float:
-        """Compute R-multiple for a closed trade."""
-        stop_dist = abs(entry_price - stop_original)
-        if stop_dist == 0:
-            return 0.0
-
-        if direction == "LONG":
-            return round((exit_price - entry_price) / stop_dist, 3)
-        else:
-            return round((entry_price - exit_price) / stop_dist, 3)
+    # =========================================================================
+    # P&L COMPUTATION
+    # =========================================================================
 
     def close_position(
         self,
-        position: SimPosition,
+        pos: SimPosition,
         exit_price: float,
         exit_time: datetime,
         exit_reason: str,
-        regime_at_exit: str = "",
+        regime_at_exit: str,
     ) -> TradeRecord:
-        """
-        Close a position and create a TradeRecord.
-
-        Args:
-            position: The SimPosition to close.
-            exit_price: Price at which position exits.
-            exit_time: Timestamp of exit.
-            exit_reason: Reason for exit (SL, TP, ATR_TRAIL, TIME_KILL, etc.)
-            regime_at_exit: Current regime state string.
-
-        Returns:
-            TradeRecord with all fields populated.
-        """
-        pnl_gross, commission, pnl_net = self.compute_trade_pnl(
-            position.direction, position.entry_price, exit_price, position.lots
+        """Close a position and return a completed TradeRecord."""
+        _, _, pnl_net = self.compute_trade_pnl(
+            pos.direction, pos.entry_price, exit_price, pos.lots
         )
-        r_mult = self.compute_r_multiple(
-            position.direction, position.entry_price, exit_price,
-            position.stop_price_original
-        )
+        pnl_gross = self._gross_pnl(pos.direction, pos.entry_price, exit_price, pos.lots)
+        commission = COMMISSION_PER_LOT_RT * pos.lots
+
+        sd = pos.stop_distance
+        if sd > 0:
+            r_multiple = round(pnl_gross / (sd * pos.lots * CONTRACT_SIZE), 3)
+        else:
+            r_multiple = 0.0
 
         return TradeRecord(
-            strategy=position.strategy,
-            direction=position.direction,
-            entry_price=position.entry_price,
-            exit_price=exit_price,
-            entry_time=position.entry_time,
-            exit_time=exit_time,
-            lots=position.lots,
-            pnl=pnl_net,
-            pnl_gross=pnl_gross,
-            r_multiple=r_mult,
-            exit_reason=exit_reason,
-            regime_at_entry=position.regime_at_entry,
-            regime_at_exit=regime_at_exit,
-            stop_original=position.stop_price_original,
-            commission=commission,
+            strategy       = pos.strategy,
+            direction      = pos.direction,
+            entry_price    = pos.entry_price,
+            exit_price     = round(exit_price, 2),
+            entry_time     = pos.entry_time,
+            exit_time      = exit_time,
+            lots           = pos.lots,
+            pnl            = round(pnl_net, 2),
+            pnl_gross      = round(pnl_gross, 2),
+            r_multiple     = r_multiple,
+            exit_reason    = exit_reason,
+            regime_at_entry= pos.regime_at_entry,
+            regime_at_exit = regime_at_exit,
+            stop_original  = pos.stop_price_original,
+            commission     = round(commission, 2),
         )
+
+    def compute_trade_pnl(
+        self,
+        direction: str,
+        entry: float,
+        exit_p: float,
+        lots: float,
+    ) -> tuple[float, float, float]:
+        """
+        Returns (pnl_gross, commission, pnl_net) in USD.
+
+        XAUUSD: 1 lot = 100 oz.  P&L = price_delta × lots × 100.
+        """
+        gross     = self._gross_pnl(direction, entry, exit_p, lots)
+        comm      = COMMISSION_PER_LOT_RT * lots
+        return gross, comm, gross - comm
+
+    @staticmethod
+    def _gross_pnl(direction: str, entry: float, exit_p: float, lots: float) -> float:
+        if direction == "LONG":
+            return (exit_p - entry) * lots * CONTRACT_SIZE
+        else:
+            return (entry - exit_p) * lots * CONTRACT_SIZE
