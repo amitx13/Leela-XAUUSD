@@ -36,10 +36,23 @@ PARITY GAPS FIXED IN THIS REVISION:
   GAP-13 Deduct $7/lot round-trip commission per trade (live broker cost)
   GAP-14 KS4 cooldown: cap s1 family attempts to 2 after 3 consecutive losses
   GAP-15 Weekly PnL tracking accumulated per trade for KS5 gate
-  CRIT-4 Asian range now uses hard UTC 00:00–07:00 session filter instead of
+  CRIT-4 Asian range now uses hard UTC 00:00-07:00 session filter instead of
          last-84-bars approximation, matching live calculate_asian_range()
          exactly.  HIGH-1 and HIGH-2 were already correctly implemented in
          execution_simulator.py (confirmed via full file read).
+
+PARITY FIXES (v3.0 backtest sync):
+  FIX-2  S3: UNSTABLE regime now ALLOWED (stop-hunt prime territory).
+         Only NO_TRADE blocks S3. Mirrors live Change 3.3.
+  FIX-3  S6: UNSTABLE regime now BLOCKED (noisy Asian ranges).
+         Mirrors live Change 3.4.
+  FIX-4  S6/S7: ADX/DI leg filter — when ADX>25 and DI ratio>1.3,
+         counter-trend leg is suppressed. Mirrors live Changes 3.6/3.7.
+  FIX-5  S1F: H1 EMA20 direction check added before M5 entry logic.
+         Reject if price is on wrong side of H1 EMA20. Mirrors live
+         Change 3.5.
+  FIX-6  S4/S5: now use _can_trend_family_fire() — independent of
+         s1_family_attempts_today. Mirrors live Change 3.9.
 """
 import sys
 import os
@@ -73,9 +86,9 @@ except ImportError:
     config = None  # type: ignore
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # REGIME CLASSIFICATION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def classify_regime_backtest(
     adx_h4: float,
@@ -117,7 +130,7 @@ def classify_regime_backtest(
 
 def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
     """
-    Compute ATR percentile using EWMA weighting (λ=0.94).
+    Compute ATR percentile using EWMA weighting (lambda=0.94).
     Defined here (NOT in data_feed) — this is the authoritative location.
     """
     values = atr_series.dropna().values
@@ -132,13 +145,13 @@ def compute_atr_percentile(atr_series: pd.Series, current_atr: float) -> float:
     return float(np.dot(weights, below_current) * 100)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # STRATEGY HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optional[dict]:
     """
-    Compute Asian session range using a hard UTC 00:00–07:00 window.
+    Compute Asian session range using a hard UTC 00:00-07:00 window.
 
     CRIT-4 FIX: The previous implementation used the last 84 M5 bars as a
     proxy for the Asian session.  That approximation drifts when bars are
@@ -156,19 +169,15 @@ def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optio
 
     Falls back gracefully (returns None) when data is insufficient.
     """
-    # Obtain a large enough M5 history to cover the full Asian window.
-    # 84 bars = 7 h × 12 bars/h, so 100 gives a safe margin.
     m5_df = bar_buffer.get_series("M5", count=100)
     if m5_df.empty:
         return None
 
-    # Ensure the index / "time" column is timezone-aware UTC.
     if isinstance(m5_df.index, pd.DatetimeIndex):
         ts_series = m5_df.index.to_series()
     elif "time" in m5_df.columns:
         ts_series = m5_df["time"]
     else:
-        # Cannot determine bar timestamps — fall back to legacy behaviour.
         m5_df_fallback = m5_df.iloc[-84:]
         if len(m5_df_fallback) < 12:
             return None
@@ -186,13 +195,11 @@ def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optio
             "hunt_threshold": rs * hunt_threshold_pct,
         }
 
-    # Normalise timestamps to UTC-naive for comparison.
     if hasattr(ts_series.dtype, "tz") and ts_series.dtype.tz is not None:
         ts_utc = ts_series.dt.tz_convert("UTC").dt.tz_localize(None)
     else:
         ts_utc = ts_series
 
-    # Determine the UTC trading date from current_time.
     if current_time.tzinfo is not None:
         ct_utc = current_time.astimezone(pytz.utc).replace(tzinfo=None)
     else:
@@ -200,7 +207,6 @@ def _compute_asian_range(bar_buffer: BarBuffer, current_time: datetime) -> Optio
 
     trading_date = ct_utc.date()
 
-    # Hard session window: [00:00 UTC, 07:00 UTC) on the current trading date.
     session_start = datetime(trading_date.year, trading_date.month, trading_date.day, 0, 0, 0)
     session_end   = datetime(trading_date.year, trading_date.month, trading_date.day, 7, 0, 0)
 
@@ -239,17 +245,17 @@ def _get_prev_day_hl(bar_buffer: BarBuffer) -> Optional[dict]:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-11: MACRO BIAS GATE HELPER
 # In live system, calculate_macro_bias() runs at 09:00 IST daily and sets
 # state["macro_bias"] to "LONG_ONLY", "SHORT_ONLY", or "BOTH_PERMITTED".
 # The backtest cannot call the live TLT feed, so we approximate:
-#   - If EMA20_H1 is rising (close > EMA, ADX > 20, DI+ > DI-) → LONG_ONLY
-#   - If EMA20_H1 is falling (close < EMA, ADX > 20, DI- > DI+) → SHORT_ONLY
-#   - Otherwise → BOTH_PERMITTED
+#   - If EMA20_H1 is rising (close > EMA, ADX > 20, DI+ > DI-) -> LONG_ONLY
+#   - If EMA20_H1 is falling (close < EMA, ADX > 20, DI- > DI+) -> SHORT_ONLY
+#   - Otherwise -> BOTH_PERMITTED
 # This is a structural proxy that captures the same market regime the TLT
 # filter targets: don't trade against the prevailing trend direction.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _derive_macro_bias(
     price: float,
@@ -284,12 +290,33 @@ def _macro_permits(direction: str, macro_bias: str) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# FIX-6: SHARED TREND FAMILY GATE FOR S4/S5
+# S4 and S5 are trend-following strategies that belong to the trend family
+# but should NOT consume s1_family_attempts_today. They use their own
+# fired_today flags and check trend_family_occupied independently.
+# Mirrors live Change 3.9: _can_trend_family_fire().
+# -----------------------------------------------------------------------------
+
+def _can_trend_family_fire(state: "SimulatedState") -> bool:
+    """
+    FIX-6: Shared gate for S4/S5 — checks trend_family_occupied + regime.
+    Does NOT check s1_family_attempts_today (that counter is S1/S1B only).
+    Returns True if the trend family slot is free and regime allows trading.
+    """
+    if state.trend_family_occupied:
+        return False
+    if state.current_regime in ("NO_TRADE", "RANGING_CLEAR"):
+        return False
+    return True
+
+
+# -----------------------------------------------------------------------------
 # S1 — LONDON RANGE BREAKOUT
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s1(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     macro_bias: str = "BOTH_PERMITTED",
 ) -> list[SimOrder]:
@@ -363,15 +390,12 @@ def _evaluate_s1(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-1: S1b — FAILED BREAKOUT REVERSAL
-# Mirrors evaluate_s1b_signal() from engines/signal_engine.py.
-# Fires when: price returned inside range after a failed S1 breakout,
-# then breaks the OPPOSITE boundary.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s1b(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     macro_bias: str = "BOTH_PERMITTED",
 ) -> list[SimOrder]:
@@ -437,7 +461,7 @@ def _evaluate_s1b(
     return orders
 
 
-def _check_s1b_trigger(bar_buffer: BarBuffer, state: SimulatedState) -> None:
+def _check_s1b_trigger(bar_buffer: BarBuffer, state: "SimulatedState") -> None:
     """
     GAP-1: Check whether to SET failed_breakout_flag.
     Called on every M15 bar close. Condition: last S1 reached -0.5R
@@ -460,21 +484,19 @@ def _check_s1b_trigger(bar_buffer: BarBuffer, state: SimulatedState) -> None:
         logger.debug(f"S1b flag SET: orig_dir={state.last_s1_direction} max_r={state.last_s1_max_r:.2f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-2: S1d — M5 EMA20 PULLBACK RE-ENTRY
-# Fires when an open S1 family position is running and price pulls back to
-# EMA20 on M5 with a full body close in the trend direction.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s1d(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_m15: float,
     ema20_m15: Optional[float],
 ) -> list[SimOrder]:
     """
     GAP-2: S1d M5 EMA20 pullback re-entry.
     Requires: open S1 family position, EMA20 on M15, M5 body close in direction.
-    Max re-entries: SUPER=8, NORMAL=5. Size = 0.5× normal lots.
+    Max re-entries: SUPER=8, NORMAL=5. Size = 0.5x normal lots.
     """
     orders: list[SimOrder] = []
     if not state.trend_family_occupied:
@@ -491,7 +513,6 @@ def _evaluate_s1d(
         return orders
     if ema20_m15 is None or atr_m15 <= 0:
         return orders
-    # Respect M5 re-entry daily count
     max_m5 = 8 if state.current_regime == "SUPER_TRENDING" else 5
     if state.s1d_pyramid_count >= max_m5:
         return orders
@@ -516,7 +537,6 @@ def _evaluate_s1d(
         stop = round(entry + stop_dist, 3)
     base_lots = _calculate_lot_size(state.balance, stop_dist, state.size_multiplier)
     lots = max(0.01, round(base_lots * 0.5, 2))
-    # B4 Fix: 5-min expiry on limit order
     expiry_utc = current_time + timedelta(minutes=getattr(config, "M5_LIMIT_EXPIRY_MIN", 5))
     orders.append(SimOrder(
         strategy="S1D_PYRAMID", direction=direction,
@@ -528,18 +548,17 @@ def _evaluate_s1d(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-3: S1e — PYRAMID INTO CONFIRMED WINNERS
-# Fires after partial exit done AND stop at BE — one add per S1 only.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s1e(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, ema20_m15: Optional[float],
 ) -> list[SimOrder]:
     """
     GAP-3: S1e pyramid add after partial exit + BE activation.
-    Hard limit: one pyramid per S1 trade. Size = 0.5× original lots.
+    Hard limit: one pyramid per S1 trade. Size = 0.5x original lots.
     """
     orders: list[SimOrder] = []
     if state.s1e_pyramid_done:
@@ -591,20 +610,25 @@ def _evaluate_s1e(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-4: S1f — POST-TIME-KILL NY RE-ENTRY
-# After London 16:30 TK, re-enters in NY session on M5 EMA20 body close.
-# Uses own counter (s1f_attempts_today), max 1 per day.
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-5: Added H1 EMA20 direction check (mirrors live Change 3.5).
+# -----------------------------------------------------------------------------
 
 def _evaluate_s1f(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, ema20_m15: Optional[float],
     macro_bias: str = "BOTH_PERMITTED",
+    ema20_h1: Optional[float] = None,
 ) -> list[SimOrder]:
     """
     GAP-4: S1f post-time-kill NY re-entry.
     Requires London TK to have fired today. SUPER/NORMAL only. Max 1/day.
+
+    FIX-5: H1 EMA20 direction check added as macro safety gate.
+    Rejects S1F if current price is on the wrong side of H1 EMA20,
+    indicating the trend may have reversed since S1 fired.
+    H1 = macro safety gate. M5 = entry timing. Both required.
     """
     orders: list[SimOrder] = []
     # London TK must have fired — we check by whether it's past 16:30 London time
@@ -629,6 +653,23 @@ def _evaluate_s1f(
     direction = state.last_s1_direction
     if not direction:
         return orders
+    # FIX-5: H1 EMA20 direction validation — reject if trend reversed
+    # This is the macro safety gate. If price has crossed the H1 EMA20
+    # in the wrong direction, the original S1 trend is likely over.
+    if ema20_h1 is not None:
+        last_m5 = bar_buffer.get_last_bar("M5")
+        if last_m5 is not None:
+            current_price = last_m5["close"]
+            if direction == "LONG" and current_price < ema20_h1:
+                logger.debug(
+                    f"S1F rejected: LONG but price {current_price:.3f} < H1 EMA20 {ema20_h1:.3f}"
+                )
+                return orders
+            elif direction == "SHORT" and current_price > ema20_h1:
+                logger.debug(
+                    f"S1F rejected: SHORT but price {current_price:.3f} > H1 EMA20 {ema20_h1:.3f}"
+                )
+                return orders
     # GAP-11: macro bias gate
     if not _macro_permits(direction, macro_bias):
         return orders
@@ -661,12 +702,12 @@ def _evaluate_s1f(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # S2 — MEAN REVERSION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s2(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     ema20_h1: Optional[float], rsi_h1: Optional[float],
 ) -> list[SimOrder]:
@@ -713,17 +754,28 @@ def _evaluate_s2(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # S3 — STOP HUNT REVERSAL
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-2: UNSTABLE regime now ALLOWED. Only NO_TRADE blocks S3.
+# Rationale: UNSTABLE (85-95th ATR pct) is prime stop-hunt territory.
+# The 0.4x size multiplier already reduces risk in UNSTABLE.
+# -----------------------------------------------------------------------------
 
 def _evaluate_s3(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
 ) -> list[SimOrder]:
-    """S3: Stop Hunt Reversal — sweep + reclaim pattern."""
+    """
+    S3: Stop Hunt Reversal — sweep + reclaim pattern.
+
+    FIX-2: UNSTABLE regime is now ALLOWED (was previously blocked).
+    Only NO_TRADE blocks S3. UNSTABLE is prime stop-hunt territory
+    and the 0.4x size multiplier in UNSTABLE already limits risk.
+    Mirrors live Change 3.3.
+    """
     orders: list[SimOrder] = []
-    if state.current_regime in ("NO_TRADE", "UNSTABLE"):
+    # FIX-2: block only NO_TRADE (removed UNSTABLE from block list)
+    if state.current_regime == "NO_TRADE":
         return orders
     if state.current_session not in ("LONDON", "LONDON_NY_OVERLAP"):
         return orders
@@ -764,7 +816,7 @@ def _evaluate_s3(
     if sweep_depth_high >= atr_h1 * sweep_thresh:
         last_bar = recent.iloc[-1]
         if last_bar["close"] < rh:
-            entry     = round(float(last_bar["low"] ) - reclaim_offset, 3)
+            entry     = round(float(last_bar["low"]) - reclaim_offset, 3)
             stop      = round(sweep_high + atr_h1 * stop_mult, 3)
             stop_dist = abs(entry - stop)
             if stop_dist > 0:
@@ -778,22 +830,25 @@ def _evaluate_s3(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-5: S4 — LONDON EMA20 PULLBACK
-# Mirrors live evaluate_s4(): during London, in NORMAL/SUPER trend,
-# price pulls back to EMA20(H1) from the trend direction then bounces.
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-6: Now uses _can_trend_family_fire() — does NOT consume
+# s1_family_attempts_today. S4 has its own s4_fired_today gate.
+# -----------------------------------------------------------------------------
 
 def _evaluate_s4(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     ema20_h1: Optional[float], di_plus: Optional[float],
     di_minus: Optional[float], macro_bias: str = "BOTH_PERMITTED",
 ) -> list[SimOrder]:
     """
     GAP-5: S4 London EMA20 Pullback.
-    Entry: M15 close within 0.5×ATR of EMA20_H1 in trend direction.
-    Stop: 1.5×ATR beyond EMA20. TP: 2R.
+    Entry: M15 close within 0.5xATR of EMA20_H1 in trend direction.
+    Stop: 1.5xATR beyond EMA20. TP: 2R.
+
+    FIX-6: Uses _can_trend_family_fire() instead of S1 attempt counter.
+    S4 does not consume s1_family_attempts_today. Mirrors live Change 3.9.
     """
     orders: list[SimOrder] = []
     if state.s4_fired_today:
@@ -802,7 +857,8 @@ def _evaluate_s4(
         return orders
     if state.current_regime not in ("SUPER_TRENDING", "NORMAL_TRENDING"):
         return orders
-    if state.trend_family_occupied:
+    # FIX-6: use shared trend family gate (does NOT touch s1_family_attempts_today)
+    if not _can_trend_family_fire(state):
         return orders
     if ema20_h1 is None or atr_h1 <= 0:
         return orders
@@ -850,21 +906,24 @@ def _evaluate_s4(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-6: S5 — NY SESSION COMPRESSION BREAKOUT
-# Mirrors live evaluate_s5(): during NY session, when London range compressed
-# into tight consolidation, breakout of that tight NY range.
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-6: Now uses _can_trend_family_fire() — does NOT consume
+# s1_family_attempts_today. S5 has its own s5_fired_today gate.
+# -----------------------------------------------------------------------------
 
 def _evaluate_s5(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     macro_bias: str = "BOTH_PERMITTED",
 ) -> list[SimOrder]:
     """
     GAP-6: S5 NY Session Compression Breakout.
-    Requires NY session (13:00–17:00 UTC), NORMAL/SUPER regime.
+    Requires NY session (13:00-17:00 UTC), NORMAL/SUPER regime.
     Looks for tight 2-hour London consolidation and breakout.
+
+    FIX-6: Uses _can_trend_family_fire() instead of S1 attempt counter.
+    S5 does not consume s1_family_attempts_today. Mirrors live Change 3.9.
     """
     orders: list[SimOrder] = []
     if state.s5_fired_today:
@@ -873,23 +932,21 @@ def _evaluate_s5(
         return orders
     if state.current_regime not in ("SUPER_TRENDING", "NORMAL_TRENDING"):
         return orders
-    if state.trend_family_occupied:
+    # FIX-6: use shared trend family gate (does NOT touch s1_family_attempts_today)
+    if not _can_trend_family_fire(state):
         return orders
     utc_hour = current_time.hour
     if not (13 <= utc_hour <= 17):
         return orders
     if atr_h1 <= 0:
         return orders
-    # Get last 8 H1 bars (London session range)
-    m15_df = bar_buffer.get_series("M15", count=48)  # 12h = 48 M15 bars
+    m15_df = bar_buffer.get_series("M15", count=48)
     if len(m15_df) < 24:
         return orders
-    # Define NY compression: last 8 M15 bars (2 hours)
     ny_range_df = m15_df.iloc[-8:]
     ny_high = float(ny_range_df["high"].max())
     ny_low  = float(ny_range_df["low"].min())
     ny_range = ny_high - ny_low
-    # Must be compressed: range < 0.5× ATR (tight consolidation)
     if ny_range > atr_h1 * 0.5:
         return orders
     if ny_range <= 0:
@@ -928,19 +985,36 @@ def _evaluate_s5(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # S6 — ASIAN RANGE BREAKOUT OCO
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-3: UNSTABLE regime now BLOCKED (noisy Asian ranges).
+# FIX-4: ADX/DI leg filter — suppress counter-trend leg when ADX>25
+#         and DI ratio>1.3. Mirrors live Changes 3.4 and 3.6.
+# -----------------------------------------------------------------------------
 
 def _evaluate_s6(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_m15: float,
+    adx_h4: Optional[float] = None,
+    di_plus: Optional[float] = None,
+    di_minus: Optional[float] = None,
 ) -> list[SimOrder]:
-    """S6: Asian Range Breakout OCO pair."""
+    """
+    S6: Asian Range Breakout OCO pair.
+
+    FIX-3: UNSTABLE regime is now BLOCKED (was only blocking NO_TRADE).
+    In UNSTABLE, Asian session ranges are noisy and breakout levels are
+    unreliable. Mirrors live Change 3.4.
+
+    FIX-4: ADX/DI leg filter applied before placing each OCO leg.
+    When ADX>25 and DI ratio>1.3, the counter-trend leg is suppressed.
+    Mirrors live Change 3.6.
+    """
     orders: list[SimOrder] = []
     if state.s6_placed_today:
         return orders
-    if state.current_regime in ("NO_TRADE",):
+    # FIX-3: block both NO_TRADE and UNSTABLE
+    if state.current_regime in ("NO_TRADE", "UNSTABLE"):
         return orders
     utc_hour = current_time.hour
     utc_min  = current_time.minute
@@ -965,30 +1039,55 @@ def _evaluate_s6(
     expiry = current_time.replace(hour=8, minute=0, second=0)
     if expiry <= current_time:
         expiry += timedelta(days=1)
-    orders.append(SimOrder(
-        strategy="S6_ASIAN_BRK", direction="LONG", order_type="BUY_STOP",
-        price=buy_entry, sl=buy_stop, tp=round(buy_entry + stop_dist * 2.0, 3),
-        lots=buy_lots, expiry=expiry, placed_time=current_time,
-        tag="s6_buy_leg", linked_tag="s6_sell_leg",
-    ))
-    orders.append(SimOrder(
-        strategy="S6_ASIAN_BRK", direction="SHORT", order_type="SELL_STOP",
-        price=sell_entry, sl=sell_stop, tp=round(sell_entry - stop_dist * 2.0, 3),
-        lots=sell_lots, expiry=expiry, placed_time=current_time,
-        tag="s6_sell_leg", linked_tag="s6_buy_leg",
-    ))
+    # FIX-4: ADX/DI leg filter — determine which legs are permitted
+    place_buy  = True
+    place_sell = True
+    if adx_h4 is not None and adx_h4 > 25 and di_plus is not None and di_minus is not None:
+        di_ratio = (di_plus / di_minus) if di_minus > 0 else 999.0
+        if di_ratio > 1.3:
+            # Strong uptrend: suppress sell (counter-trend) leg
+            place_sell = False
+            logger.debug(f"S6 sell leg filtered: strong uptrend ADX={adx_h4:.1f} DI_ratio={di_ratio:.2f}")
+        elif di_ratio < (1.0 / 1.3):  # ~0.769
+            # Strong downtrend: suppress buy (counter-trend) leg
+            place_buy = False
+            logger.debug(f"S6 buy leg filtered: strong downtrend ADX={adx_h4:.1f} DI_ratio={di_ratio:.2f}")
+    if place_buy:
+        orders.append(SimOrder(
+            strategy="S6_ASIAN_BRK", direction="LONG", order_type="BUY_STOP",
+            price=buy_entry, sl=buy_stop, tp=round(buy_entry + stop_dist * 2.0, 3),
+            lots=buy_lots, expiry=expiry, placed_time=current_time,
+            tag="s6_buy_leg", linked_tag="s6_sell_leg" if place_sell else None,
+        ))
+    if place_sell:
+        orders.append(SimOrder(
+            strategy="S6_ASIAN_BRK", direction="SHORT", order_type="SELL_STOP",
+            price=sell_entry, sl=sell_stop, tp=round(sell_entry - stop_dist * 2.0, 3),
+            lots=sell_lots, expiry=expiry, placed_time=current_time,
+            tag="s6_sell_leg", linked_tag="s6_buy_leg" if place_buy else None,
+        ))
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # S7 — DAILY STRUCTURE BREAKOUT OCO
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-4: ADX/DI leg filter applied. Mirrors live Change 3.7.
+# -----------------------------------------------------------------------------
 
 def _evaluate_s7(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, daily_atr: Optional[float],
+    adx_h4: Optional[float] = None,
+    di_plus: Optional[float] = None,
+    di_minus: Optional[float] = None,
 ) -> list[SimOrder]:
-    """S7: Daily Structure Breakout OCO pair."""
+    """
+    S7: Daily Structure Breakout OCO pair.
+
+    FIX-4: ADX/DI leg filter applied before placing each OCO leg.
+    When ADX>25 and DI ratio>1.3, the counter-trend leg is suppressed.
+    Mirrors live Change 3.7.
+    """
     orders: list[SimOrder] = []
     if state.s7_placed_today:
         return orders
@@ -1011,38 +1110,50 @@ def _evaluate_s7(
     buy_entry  = round(ph + entry_offset, 3)
     sell_entry = round(pl - entry_offset, 3)
     expiry = current_time.replace(hour=23, minute=59, second=0)
-    orders.append(SimOrder(
-        strategy="S7_DAILY_STRUCT", direction="LONG", order_type="BUY_STOP",
-        price=buy_entry, sl=round(buy_entry - stop_dist, 3),
-        lots=_calculate_lot_size(state.balance, stop_dist, state.size_multiplier * size_mult),
-        expiry=expiry, placed_time=current_time, tag="s7_buy_leg", linked_tag="s7_sell_leg",
-    ))
-    orders.append(SimOrder(
-        strategy="S7_DAILY_STRUCT", direction="SHORT", order_type="SELL_STOP",
-        price=sell_entry, sl=round(sell_entry + stop_dist, 3),
-        lots=_calculate_lot_size(state.balance, stop_dist, state.size_multiplier * size_mult),
-        expiry=expiry, placed_time=current_time, tag="s7_sell_leg", linked_tag="s7_buy_leg",
-    ))
+    # FIX-4: ADX/DI leg filter — determine which legs are permitted
+    place_buy  = True
+    place_sell = True
+    if adx_h4 is not None and adx_h4 > 25 and di_plus is not None and di_minus is not None:
+        di_ratio = (di_plus / di_minus) if di_minus > 0 else 999.0
+        if di_ratio > 1.3:
+            place_sell = False
+            logger.debug(f"S7 sell leg filtered: strong uptrend ADX={adx_h4:.1f} DI_ratio={di_ratio:.2f}")
+        elif di_ratio < (1.0 / 1.3):  # ~0.769
+            place_buy = False
+            logger.debug(f"S7 buy leg filtered: strong downtrend ADX={adx_h4:.1f} DI_ratio={di_ratio:.2f}")
+    if place_buy:
+        orders.append(SimOrder(
+            strategy="S7_DAILY_STRUCT", direction="LONG", order_type="BUY_STOP",
+            price=buy_entry, sl=round(buy_entry - stop_dist, 3),
+            lots=_calculate_lot_size(state.balance, stop_dist, state.size_multiplier * size_mult),
+            expiry=expiry, placed_time=current_time,
+            tag="s7_buy_leg", linked_tag="s7_sell_leg" if place_sell else None,
+        ))
+    if place_sell:
+        orders.append(SimOrder(
+            strategy="S7_DAILY_STRUCT", direction="SHORT", order_type="SELL_STOP",
+            price=sell_entry, sl=round(sell_entry + stop_dist, 3),
+            lots=_calculate_lot_size(state.balance, stop_dist, state.size_multiplier * size_mult),
+            expiry=expiry, placed_time=current_time,
+            tag="s7_sell_leg", linked_tag="s7_buy_leg" if place_buy else None,
+        ))
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-7: S8 — ATR SPIKE CONTINUATION (INDEPENDENT LANE)
-# Mirrors live evaluate_s8(): fires when a large ATR spike candle forms and
-# the next M15 candle closes in the same direction. Independent lane —
-# does NOT block S1 family trades.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_s8(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     macro_bias: str = "BOTH_PERMITTED",
 ) -> list[SimOrder]:
     """
     GAP-7: S8 ATR Spike Continuation.
     Independent lane: fires alongside trend family if conditions met.
-    Trigger: M15 bar range >= 2×ATR(H1). Confirmation: next bar closes in same direction.
-    Stop: 0.5×ATR beyond spike low/high. TP: 1.5R. Max 1 per day.
+    Trigger: M15 bar range >= 2xATR(H1). Confirmation: next bar closes in same direction.
+    Stop: 0.5xATR beyond spike low/high. TP: 1.5R. Max 1 per day.
     """
     orders: list[SimOrder] = []
     if state.s8_fired_today:
@@ -1056,24 +1167,21 @@ def _evaluate_s8(
     m15_df = bar_buffer.get_series("M15", count=5)
     if len(m15_df) < 3:
         return orders
-    # Look at second-to-last closed bar as the "spike" bar
-    spike_bar  = m15_df.iloc[-3]
+    spike_bar   = m15_df.iloc[-3]
     confirm_bar = m15_df.iloc[-2]
     current_bar = m15_df.iloc[-1]
     spike_range = abs(spike_bar["high"] - spike_bar["low"])
     spike_thresh = getattr(config, "S8_SPIKE_ATR_MULTIPLIER", 2.0)
     if spike_range < atr_h1 * spike_thresh:
         return orders
-    # Determine spike direction by candle body
-    spike_bullish  = spike_bar["close"] > spike_bar["open"]
-    spike_bearish  = spike_bar["close"] < spike_bar["open"]
+    spike_bullish = spike_bar["close"] > spike_bar["open"]
+    spike_bearish = spike_bar["close"] < spike_bar["open"]
     if not spike_bullish and not spike_bearish:
         return orders
     direction = "LONG" if spike_bullish else "SHORT"
     # GAP-11: macro bias gate
     if not _macro_permits(direction, macro_bias):
         return orders
-    # Confirmation: next bar closes in same direction
     if direction == "LONG" and confirm_bar["close"] <= confirm_bar["open"]:
         return orders
     if direction == "SHORT" and confirm_bar["close"] >= confirm_bar["open"]:
@@ -1095,18 +1203,15 @@ def _evaluate_s8(
         tp=round(entry + actual_stop_dist * 1.5, 3) if direction == "LONG" else round(entry - actual_stop_dist * 1.5, 3),
         lots=lots, expiry=expiry_utc, placed_time=current_time,
     ))
-    state.s1e_pyramid_done = state.s1e_pyramid_done
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GAP-8: R3 — CALENDAR MOMENTUM (INDEPENDENT LANE)
-# Mirrors live evaluate_r3(): after a high-impact economic event,
-# rides the directional momentum for 30 minutes. Independent lane.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _evaluate_r3(
-    bar_buffer: BarBuffer, state: SimulatedState,
+    bar_buffer: BarBuffer, state: "SimulatedState",
     current_time: datetime, atr_h1: float,
     event_feed: Optional["HistoricalEventFeed"],
     macro_bias: str = "BOTH_PERMITTED",
@@ -1114,7 +1219,7 @@ def _evaluate_r3(
     """
     GAP-8: R3 Calendar Momentum.
     Independent lane — fires after high-impact event with strong M15 candle.
-    Uses r3_fired_today flag. Stop: 0.75×ATR. TP: 1.5R. Time-exit: 30 min.
+    Uses r3_fired_today flag. Stop: 0.75xATR. TP: 1.5R. Time-exit: 30 min.
     """
     orders: list[SimOrder] = []
     if state.r3_fired_today:
@@ -1123,20 +1228,17 @@ def _evaluate_r3(
         return orders
     if atr_h1 <= 0:
         return orders
-    # Check if we just passed a high-impact event (within last 30 min)
     if event_feed is None:
         return orders
     just_had_event = event_feed.had_recent_high_impact_event(current_time, lookback_minutes=30)
     if not just_had_event:
         return orders
-    # Look for strong momentum candle on M15
     m15_df = bar_buffer.get_series("M15", count=4)
     if len(m15_df) < 2:
         return orders
-    last_bar   = m15_df.iloc[-2]  # last closed bar
+    last_bar   = m15_df.iloc[-2]
     bar_range  = abs(last_bar["high"] - last_bar["low"])
     bar_body   = abs(last_bar["close"] - last_bar["open"])
-    # Must be a strong candle: body >= 60% of range, range >= 1.5×ATR
     if bar_range < atr_h1 * 1.5:
         return orders
     if bar_body < bar_range * 0.6:
@@ -1156,7 +1258,6 @@ def _evaluate_r3(
     if actual_stop_dist <= 0:
         return orders
     lots = _calculate_lot_size(state.balance, actual_stop_dist, state.size_multiplier)
-    # R3 time-exit: 30 minutes from entry
     expiry_utc = current_time + timedelta(minutes=30)
     orders.append(SimOrder(
         strategy="R3_CAL_MOMENTUM", direction=direction,
@@ -1167,9 +1268,9 @@ def _evaluate_r3(
     return orders
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # LOT SIZING
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _calculate_lot_size(
     balance: float,
@@ -1178,7 +1279,7 @@ def _calculate_lot_size(
 ) -> float:
     """
     Risk-based lot sizing mirroring live execution_engine._calculate_lot_size().
-    risk_pct × balance / (stop_dist × contract_size), capped at V1_LOT_HARD_CAP.
+    risk_pct x balance / (stop_dist x contract_size), capped at V1_LOT_HARD_CAP.
     """
     if stop_dist <= 0 or balance <= 0:
         return 0.01
