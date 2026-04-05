@@ -14,14 +14,19 @@ FIX-2: Macro bias now uses iloc[-2] (previous completed H1 bar), not iloc[-1].
 FIX-3: run_sensitivity_test() — BREAKOUT_DIST_PCT ±20%, ATR_PCT_UNSTABLE ±5.
 FIX-4: profit_concentration_check() — warns if >80% profit in ≤3 months.
 
-BUG-FIX (this commit):
+BUG-FIX (prev commit):
   has_upcoming_event() call in run() used wrong kwarg 'minutes_ahead' →
   corrected to 'pre_minutes=30, post_minutes=15'.
   get_events_near() call in _evaluate_r3() used wrong kwarg 'minutes_ahead' →
   corrected to 'window_minutes=90'.
+
+PROGRESS LOGGING (this commit):
+  run() now logs progress every 1000 bars with bar_time, % complete, and ETA.
+  Eliminates the "looks frozen" problem when processing 46k+ M5 bars.
 """
 import logging
 import math
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -1027,8 +1032,41 @@ class BacktestEngine:
         current_week = -1
         last_date    = None
 
-        for bar_dict in data_feed.iter_m5_bars():
+        # ── Pre-load all bars so we know the total count for ETA ──────────
+        all_bars   = list(data_feed.iter_m5_bars())
+        total_bars = len(all_bars)
+        LOG_EVERY  = 1_000   # print a line every N bars
+
+        logger.info(
+            f"Starting replay: {total_bars:,} M5 bars  "
+            f"({self.start_date.date()} → {self.end_date.date()})  "
+            f"— expect {total_bars // 1_000}–{total_bars // 500} log lines"
+        )
+
+        t_start = time.monotonic()
+
+        for bar_idx, bar_dict in enumerate(all_bars):
             bar_time: datetime = bar_dict["time"]
+
+            # ── Progress log ─────────────────────────────────────────────
+            if bar_idx % LOG_EVERY == 0:
+                elapsed   = time.monotonic() - t_start
+                pct       = bar_idx / total_bars * 100 if total_bars else 0
+                bars_left = total_bars - bar_idx
+                rate      = bar_idx / elapsed if elapsed > 0 else 0
+                eta_s     = bars_left / rate if rate > 0 else 0
+                eta_str   = (
+                    f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
+                    if eta_s >= 60 else f"{int(eta_s)}s"
+                )
+                logger.info(
+                    f"Progress  {bar_idx:>6,}/{total_bars:,}  "
+                    f"({pct:5.1f}%)  "
+                    f"bar={bar_time.strftime('%Y-%m-%d %H:%M')}  "
+                    f"equity=${state.equity:,.0f}  "
+                    f"trades={len(trades)}  "
+                    f"ETA={eta_str}"
+                )
 
             # ── Weekly reset (KS5) ────────────────────────────────────────
             week_num = bar_time.isocalendar()[1]
@@ -1289,6 +1327,13 @@ class BacktestEngine:
                 "SESSION_CLOSE", state.current_regime,
             )
             trades.append(rec)
+
+        elapsed_total = time.monotonic() - t_start
+        logger.info(
+            f"Replay complete — {total_bars:,} bars in "
+            f"{int(elapsed_total // 60)}m {int(elapsed_total % 60):02d}s  "
+            f"| trades={len(trades)}  final_equity=${state.equity:,.2f}"
+        )
 
         from backtest.results import BacktestResults
         return BacktestResults(
