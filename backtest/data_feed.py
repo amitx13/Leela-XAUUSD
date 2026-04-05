@@ -1,14 +1,26 @@
 """
 backtest/data_feed.py — Historical data providers for the backtesting framework.
 
-HistoricalDataFeed:  Fetches M5 bars from MT5 or local cache (parquet/pickle).
-BarBuffer:           Accumulates M5 bars into M15, H1, H4, D1 candles.
+HistoricalDataFeed:   Fetches M5 bars from MT5 or local cache (parquet/pickle).
+BarBuffer:            Accumulates M5 bars into M15, H1, H4, D1 candles.
 HistoricalSpreadFeed: Provides historical spread data.
 HistoricalEventFeed:  Provides historical economic event data.
+
+  CRIT-1 FIX: HistoricalEventFeed now loads real event timestamps from
+  backtest_data/events.csv when that file is present, falling back to
+  the approximate pattern-based generator with a clear WARNING so the
+  operator always knows which source is active.
+
+  CSV schema (comma or tab separated, header row required):
+    datetime_utc,name,impact
+    2024-01-26 13:30:00,Non-Farm Payrolls,HIGH
+
+  Run tools/fetch_events_history.py to build the CSV from Forex Factory.
 
 All timestamps are timezone-aware UTC (pytz.utc).
 """
 import os
+import csv
 import pytz
 import logging
 import numpy as np
@@ -37,6 +49,12 @@ TF_RESAMPLE_RULE = {
     "H4":  "4h",
     "D1":  "1D",
 }
+
+# ---------------------------------------------------------------------------
+# Default path for the real-events CSV (relative to repo root).
+# Override by setting the env-var LEELA_EVENTS_CSV before running.
+# ---------------------------------------------------------------------------
+_DEFAULT_EVENTS_CSV = Path(__file__).parent.parent / "backtest_data" / "events.csv"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,17 +334,191 @@ class HistoricalEventFeed:
     """
     Provides historical economic event data for event blackout simulation.
 
-    Uses config.HARDCODED_EVENT_PATTERNS to generate approximate event
-    timestamps for the backtest period.
+    CRIT-1 FIX — Real event timestamps vs. approximate pattern generator
+    ─────────────────────────────────────────────────────────────────────
+    Source priority:
+      1. Real CSV  — backtest_data/events.csv (or LEELA_EVENTS_CSV env-var path)
+                     Built by tools/fetch_events_history.py from Forex Factory.
+                     When this file is present, ONLY its rows are used — the
+                     pattern generator is skipped entirely.
+      2. Patterns  — config.HARDCODED_EVENT_PATTERNS generates approximate
+                     timestamps based on typical release schedules.
+                     A WARNING is emitted so the operator knows data is
+                     approximate. This is the fallback for historical periods
+                     not yet covered by the CSV.
+
+    CSV schema (comma or tab-separated, header required):
+        datetime_utc,name,impact
+        2024-01-26 13:30:00,Non-Farm Payrolls,HIGH
+        2024-01-26 19:00:00,FOMC Statement,HIGH
+
+    datetime_utc must be parseable by pd.to_datetime. Timezone-naive values
+    are treated as UTC. Only rows where impact == "HIGH" (case-insensitive)
+    are included in the blackout window checks.
     """
 
     def __init__(self, start_date: datetime, end_date: datetime):
         self.start_date = start_date
         self.end_date   = end_date
         self._events: list[dict] = []
+        self._source: str = "UNKNOWN"   # "CSV" or "PATTERN" — logged at build time
         self._build_event_calendar()
 
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_events_near(
+        self, timestamp: datetime, window_minutes: int = 45
+    ) -> list[dict]:
+        """Returns list of HIGH-impact events within window_minutes of timestamp."""
+        window = timedelta(minutes=window_minutes)
+        return [
+            e for e in self._events
+            if abs((e["time"] - timestamp).total_seconds()) <= window.total_seconds()
+        ]
+
+    def has_upcoming_event(
+        self, timestamp: datetime, pre_minutes: int = 45, post_minutes: int = 20
+    ) -> bool:
+        """
+        Returns True if there is a HIGH-impact event within the blackout window.
+        pre_minutes before OR post_minutes after the event.
+        """
+        for event in self._events:
+            delta = (event["time"] - timestamp).total_seconds() / 60.0
+            if 0 < delta <= pre_minutes:
+                return True
+            if -post_minutes <= delta <= 0:
+                return True
+        return False
+
+    def had_recent_high_impact_event(
+        self, timestamp: datetime, lookback_minutes: int = 30
+    ) -> bool:
+        """
+        Returns True if a HIGH-impact event occurred within the last
+        lookback_minutes before timestamp.
+
+        Called by _evaluate_r3() in engine.py to detect the post-event
+        momentum window for R3 (Calendar Momentum) trades.
+        """
+        for event in self._events:
+            if event.get("impact", "HIGH") != "HIGH":
+                continue
+            seconds_ago = (timestamp - event["time"]).total_seconds()
+            if 0 < seconds_ago <= lookback_minutes * 60:
+                return True
+        return False
+
+    @property
+    def source(self) -> str:
+        """Returns 'CSV' if real data was loaded, 'PATTERN' if approximate."""
+        return self._source
+
+    # ── Internal builders ─────────────────────────────────────────────────────
+
     def _build_event_calendar(self) -> None:
+        """
+        Build self._events from the best available source.
+        Sets self._source to 'CSV' or 'PATTERN' accordingly.
+        """
+        csv_path = Path(os.environ.get("LEELA_EVENTS_CSV", str(_DEFAULT_EVENTS_CSV)))
+
+        if csv_path.exists():
+            loaded = self._load_from_csv(csv_path)
+            if loaded is not None:
+                self._events = loaded
+                self._source = "CSV"
+                logger.info(
+                    f"[CRIT-1 FIXED] Event feed loaded from REAL CSV: {csv_path} "
+                    f"— {len(self._events)} HIGH-impact events in window "
+                    f"({self.start_date.date()} → {self.end_date.date()})"
+                )
+                return
+            else:
+                logger.warning(
+                    f"events.csv found at {csv_path} but failed to parse — "
+                    "falling back to pattern generator."
+                )
+
+        # ── Fallback: approximate pattern-based generator ──────────────────
+        logger.warning(
+            "[CRIT-1 OPEN] HistoricalEventFeed is using the APPROXIMATE pattern "
+            "generator — event blackouts will not match real release times exactly. "
+            "Run tools/fetch_events_history.py to build backtest_data/events.csv "
+            "and eliminate this gap."
+        )
+        self._source = "PATTERN"
+        self._events = self._build_from_patterns()
+        logger.info(
+            f"Pattern-based event calendar: {len(self._events)} events "
+            f"({self.start_date.date()} → {self.end_date.date()})"
+        )
+
+    def _load_from_csv(self, path: Path) -> Optional[list[dict]]:
+        """
+        Load events from a real CSV file.
+
+        CSV must have columns: datetime_utc, name, impact
+        Timezone-naive datetimes are assumed UTC.
+        Only rows with impact == 'HIGH' (case-insensitive) are kept.
+        Returns None if parsing fails.
+        """
+        try:
+            # Auto-detect separator (comma or tab)
+            with open(path, "r", encoding="utf-8") as f:
+                sample = f.read(2048)
+            sep = "\t" if sample.count("\t") > sample.count(",") else ","
+
+            df = pd.read_csv(path, sep=sep, dtype=str)
+            df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+            # Accept 'datetime_utc' or 'time' or 'date' as timestamp column
+            ts_col = None
+            for candidate in ("datetime_utc", "time", "datetime", "date"):
+                if candidate in df.columns:
+                    ts_col = candidate
+                    break
+            if ts_col is None:
+                logger.error(f"events.csv has no recognised timestamp column. Columns: {df.columns.tolist()}")
+                return None
+
+            impact_col = "impact" if "impact" in df.columns else None
+            name_col   = "name"   if "name"   in df.columns else None
+
+            df["_ts"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+            df = df.dropna(subset=["_ts"])
+
+            # Filter to HIGH impact only
+            if impact_col:
+                df = df[df[impact_col].str.strip().str.upper() == "HIGH"]
+
+            # Filter to backtest window
+            start_utc = self.start_date
+            end_utc   = self.end_date
+            if start_utc.tzinfo is None:
+                start_utc = pytz.utc.localize(start_utc)
+            if end_utc.tzinfo is None:
+                end_utc = pytz.utc.localize(end_utc)
+
+            df = df[(df["_ts"] >= start_utc) & (df["_ts"] <= end_utc)]
+
+            events = []
+            for _, row in df.iterrows():
+                events.append({
+                    "name":   str(row[name_col]) if name_col else "HIGH_IMPACT",
+                    "time":   row["_ts"].to_pydatetime(),
+                    "impact": "HIGH",
+                })
+
+            events.sort(key=lambda e: e["time"])
+            return events
+
+        except Exception as exc:
+            logger.error(f"Failed to parse events.csv ({path}): {exc}")
+            return None
+
+    def _build_from_patterns(self) -> list[dict]:
+        """Approximate event calendar from config.HARDCODED_EVENT_PATTERNS."""
         try:
             import config
             patterns = config.HARDCODED_EVENT_PATTERNS
@@ -335,13 +527,14 @@ class HistoricalEventFeed:
 
         ist_tz  = pytz.timezone("Asia/Kolkata")
         current = self.start_date.replace(day=1)
+        events: list[dict] = []
 
         while current <= self.end_date:
             year, month = current.year, current.month
             for pattern in patterns:
                 event_time = self._resolve_pattern(pattern, year, month, ist_tz)
                 if event_time and self.start_date <= event_time <= self.end_date:
-                    self._events.append({
+                    events.append({
                         "name":   pattern["name"],
                         "time":   event_time,
                         "impact": pattern.get("impact", "HIGH"),
@@ -351,8 +544,8 @@ class HistoricalEventFeed:
             else:
                 current = current.replace(month=month + 1)
 
-        self._events.sort(key=lambda e: e["time"])
-        logger.info(f"Built event calendar with {len(self._events)} events")
+        events.sort(key=lambda e: e["time"])
+        return events
 
     @staticmethod
     def _resolve_pattern(
@@ -389,59 +582,3 @@ class HistoricalEventFeed:
                         except ValueError:
                             return None
         return None
-
-    def get_events_near(
-        self, timestamp: datetime, window_minutes: int = 45
-    ) -> list[dict]:
-        """
-        Returns list of HIGH-impact events within window_minutes of timestamp.
-        """
-        window = timedelta(minutes=window_minutes)
-        return [
-            e for e in self._events
-            if abs((e["time"] - timestamp).total_seconds()) <= window.total_seconds()
-        ]
-
-    def has_upcoming_event(
-        self, timestamp: datetime, pre_minutes: int = 45, post_minutes: int = 20
-    ) -> bool:
-        """
-        Returns True if there is a HIGH-impact event within the blackout window.
-        pre_minutes before OR post_minutes after the event.
-        """
-        for event in self._events:
-            delta = (event["time"] - timestamp).total_seconds() / 60.0
-            if 0 < delta <= pre_minutes:
-                return True
-            if -post_minutes <= delta <= 0:
-                return True
-        return False
-
-    def had_recent_high_impact_event(
-        self, timestamp: datetime, lookback_minutes: int = 30
-    ) -> bool:
-        """
-        Returns True if a HIGH-impact event occurred within the last
-        lookback_minutes before timestamp.
-
-        Called by _evaluate_r3() in engine.py to detect the post-event
-        momentum window for R3 (Calendar Momentum) trades.
-
-        Args:
-            timestamp:        Current bar time (UTC, tz-aware).
-            lookback_minutes: How far back to look for a completed event.
-                              Default 30 matches R3's post-event window.
-
-        Returns:
-            True  — at least one HIGH-impact event completed within the window.
-            False — no recent event found.
-        """
-        for event in self._events:
-            # Only HIGH impact events trigger R3
-            if event.get("impact", "HIGH") != "HIGH":
-                continue
-            seconds_ago = (timestamp - event["time"]).total_seconds()
-            # Event must be in the past (seconds_ago > 0) and within lookback
-            if 0 < seconds_ago <= lookback_minutes * 60:
-                return True
-        return False

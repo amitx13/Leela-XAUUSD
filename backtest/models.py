@@ -6,6 +6,15 @@ SimPosition: Represents an open position being tracked.
 TradeRecord: Immutable record of a completed (closed) trade.
 
 All timestamps are timezone-aware UTC (pytz.utc).
+
+CRIT-3 FIX: SimulatedState gains two new fields:
+  corr_throttle_active: bool  — set True when any strategy pair correlation
+                                 exceeds config.PORTFOLIO_CORR_THRESHOLD.
+  corr_throttle_pairs:  list  — list of (s1, s2, corr_value) tuples for the
+                                 pairs currently above threshold.
+These are read by _evaluate_strategies() in engine.py to apply the 0.65×
+lot-size reduction that the live check_portfolio_risk() SIZE-5 correlation
+kill applies for same-family same-direction concurrent entries.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -123,6 +132,11 @@ class SimulatedState:
     
     Tracks all strategy state, risk management, and position data.
     Mirrors the live system's state structure for perfect parity.
+
+    CRIT-3 fields added:
+      corr_throttle_active  — True when _run_portfolio_correlation_check()
+                              finds any pair above config.PORTFOLIO_CORR_THRESHOLD.
+      corr_throttle_pairs   — list of (strat_a, strat_b, corr_float) tuples.
     """
     # Account metrics
     balance: float = 10000.0
@@ -260,6 +274,18 @@ class SimulatedState:
     total_pnl_gross: float = 0.0
     total_commission: float = 0.0
 
+    # ── CRIT-3: Portfolio correlation kill ────────────────────────────────────
+    # Set by _run_portfolio_correlation_check() in engine.py every time a
+    # position closes (mirrors live portfolio_risk.run_correlation_check).
+    # Read by _evaluate_strategies() to apply 0.65× lot reduction for
+    # same-family same-direction concurrent entries.
+    corr_throttle_active: bool = False
+    corr_throttle_pairs: list = field(default_factory=list)
+    # Counter: how many trades have closed since the last correlation check.
+    # Check runs every PORTFOLIO_CORR_CHECK_EVERY_N trades (default 5).
+    _corr_check_trade_counter: int = field(default=0, repr=False)
+    # ─────────────────────────────────────────────────────────────────────────
+
     def to_dict(self) -> dict:
         """Convert to dict for compatibility with strategy evaluation functions."""
         return {
@@ -390,4 +416,8 @@ class SimulatedState:
             "total_losses": self.total_losses,
             "total_pnl_gross": self.total_pnl_gross,
             "total_commission": self.total_commission,
+
+            # CRIT-3 correlation kill
+            "corr_throttle_active": self.corr_throttle_active,
+            "corr_throttle_pairs":  self.corr_throttle_pairs,
         }
