@@ -15,6 +15,12 @@ CRIT-3 FIX: SimulatedState gains two new fields:
 These are read by _evaluate_strategies() in engine.py to apply the 0.65×
 lot-size reduction that the live check_portfolio_risk() SIZE-5 correlation
 kill applies for same-family same-direction concurrent entries.
+
+BUG-5 FIX: SimulatedState.size_multiplier initialised to 0.5 (was 0.0).
+  On the very first bar, before classify_regime_backtest() has populated
+  size_multiplier, _calc_lots was receiving 0.0 and silently falling back
+  to the 0.5 guard.  Starting at 0.5 (the RANGING/low-liquidity default)
+  is the correct, explicit initial value and matches live state.py.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -137,6 +143,9 @@ class SimulatedState:
       corr_throttle_active  — True when _run_portfolio_correlation_check()
                               finds any pair above config.PORTFOLIO_CORR_THRESHOLD.
       corr_throttle_pairs   — list of (strat_a, strat_b, corr_float) tuples.
+
+    BUG-5 FIX: size_multiplier initialised to 0.5 (was 0.0).
+      0.5 is the RANGING/low-liquidity safe default, matching live state.py.
     """
     # Account metrics
     balance: float = 10000.0
@@ -145,7 +154,10 @@ class SimulatedState:
 
     # Regime state (from live regime_engine.py)
     current_regime: str = "NO_TRADE"
-    size_multiplier: float = 0.0
+    # BUG-5 FIX: was 0.0 — caused _calc_lots to silently use the fallback
+    # guard (0.5) on the first bar instead of the intended sizing.
+    # 0.5 is the correct safe default (RANGING / low-liquidity multiplier).
+    size_multiplier: float = 0.5
     consecutive_regime_readings: int = 0
     pending_regime_state: Optional[str] = None
     last_adx_h4: float = 0.0
