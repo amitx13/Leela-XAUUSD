@@ -16,11 +16,10 @@ These are read by _evaluate_strategies() in engine.py to apply the 0.65×
 lot-size reduction that the live check_portfolio_risk() SIZE-5 correlation
 kill applies for same-family same-direction concurrent entries.
 
-BUG-5 FIX: SimulatedState.size_multiplier initialised to 0.5 (was 0.0).
-  On the very first bar, before classify_regime_backtest() has populated
-  size_multiplier, _calc_lots was receiving 0.0 and silently falling back
-  to the 0.5 guard.  Starting at 0.5 (the RANGING/low-liquidity default)
-  is the correct, explicit initial value and matches live state.py.
+BUG-5 FIX: SimulatedState.size_multiplier default changed 0.0 → 0.5.
+  Initialising at 0.5 (the RANGING/ASIAN floor) makes intent explicit and
+  removes the fragile dependency on classify_regime_backtest() having already
+  run before the first _calc_lots() call on bar-0.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -144,8 +143,10 @@ class SimulatedState:
                               finds any pair above config.PORTFOLIO_CORR_THRESHOLD.
       corr_throttle_pairs   — list of (strat_a, strat_b, corr_float) tuples.
 
-    BUG-5 FIX: size_multiplier initialised to 0.5 (was 0.0).
-      0.5 is the RANGING/low-liquidity safe default, matching live state.py.
+    BUG-5 FIX:
+      size_multiplier initialised to 0.5 (RANGING/ASIAN floor) instead of 0.0.
+      Prevents _calc_lots() from receiving a zero multiplier on bar-0 before
+      the first classify_regime_backtest() call has executed.
     """
     # Account metrics
     balance: float = 10000.0
@@ -154,9 +155,8 @@ class SimulatedState:
 
     # Regime state (from live regime_engine.py)
     current_regime: str = "NO_TRADE"
-    # BUG-5 FIX: was 0.0 — caused _calc_lots to silently use the fallback
-    # guard (0.5) on the first bar instead of the intended sizing.
-    # 0.5 is the correct safe default (RANGING / low-liquidity multiplier).
+    # BUG-5 FIX: was 0.0 — initialise to 0.5 (RANGING floor) so bar-0
+    # lot sizing is safe even before classify_regime_backtest() runs.
     size_multiplier: float = 0.5
     consecutive_regime_readings: int = 0
     pending_regime_state: Optional[str] = None
@@ -224,6 +224,11 @@ class SimulatedState:
     original_lot_size: float = 0.0
     open_trade_id: Optional[str] = None
     open_campaign_id: Optional[str] = None
+    # BUG-6 NOTE: last_s1_direction and last_s1_max_r are intentionally NOT
+    # reset in _daily_reset. They persist across UTC midnight so that an S1
+    # trade filled late on Day N can still qualify S1b on Day N+1 (08:00–14:00
+    # UTC window). They are only overwritten when a new S1 order fills or when
+    # the trend family closes — both handled in the run loop.
     last_s1_direction: Optional[str] = None
     last_s1_max_r: float = 0.0
     position_partial_done: bool = False
