@@ -9,9 +9,26 @@ Usage:
     python -m backtest.run --start 2025-01-01 --end 2026-03-31 --balance 25000 --slippage 1.0
     python -m backtest.run --start 2025-01-01 --end 2026-03-31 --plot equity_curve.png
     python -m backtest.run --start 2025-01-01 --end 2026-03-31 --export trades.csv
+    python -m backtest.run --start 2025-01-01 --end 2026-03-31 --sensitivity
 
 Run from the repo root:
     cd xauusd_algo && python -m backtest.run --start 2025-01-01 --end 2026-03-31
+
+Progress logging
+────────────────
+The engine emits an INFO-level line every 1 000 M5 bars showing:
+
+    Progress    3000/46080  ( 6.5%)  bar=2025-02-14 09:25  equity=$10 241  ETA=4m 12s
+
+These lines appear immediately because setup_logging() forces flush=True on the
+StreamHandler.  When you redirect stdout/stderr to a file use --verbose or pipe
+through `stdbuf -oL` to keep real-time output.
+
+FIX-4 (time-period stability)
+─────────────────────────────
+profit_concentration_check() is called automatically after every run so the
+stability report is always printed.  Pass --sensitivity to also run the FIX-3
+parameter sweep (5 extra backtests — adds ~5× wall-clock time).
 """
 import sys
 import os
@@ -66,16 +83,45 @@ def parse_args() -> argparse.Namespace:
                         help="Run Risk-of-Ruin Monte Carlo simulation after backtest")
     parser.add_argument("--mc-sims", type=int, default=10000,
                         help="Number of Monte Carlo simulations (default: 10000)")
+    # FIX-3: parameter sensitivity sweep flag
+    parser.add_argument(
+        "--sensitivity", action="store_true",
+        help=(
+            "Run FIX-3 parameter sensitivity sweep after the main backtest. "
+            "Varies BREAKOUT_DIST_PCT ±20%% and ATR_PCT_UNSTABLE_THRESHOLD ±5 pts "
+            "across 5 backtests and flags ⚠ OVERFIT if any variant drops >40%% P&L."
+        ),
+    )
     return parser.parse_args()
 
 
 def setup_logging(verbose: bool = False) -> None:
+    """
+    Configure root logger with a StreamHandler that flushes immediately.
+
+    Without flush=True, progress lines may be buffered when stdout is piped
+    (e.g. tee, nohup) — they would all appear at once at the end instead of
+    live.  force=True lets us reconfigure if basicConfig was already called
+    by an imported module.
+    """
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    handler.flush = sys.stdout.flush          # ensure immediate flush per record
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Remove any pre-existing handlers (e.g. from basicConfig in imports)
+    root.handlers.clear()
+    root.addHandler(handler)
+
+    # Quieten noisy third-party loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
@@ -136,6 +182,11 @@ def main() -> None:
     print()
     results.summary()
 
+    # FIX-4: Time-period stability check — always run after every backtest.
+    # Warns when >80% of gross profit is concentrated in ≤3 calendar months.
+    print()
+    BacktestEngine.profit_concentration_check(results)
+
     # Walk-forward analysis
     if args.walk_forward:
         print()
@@ -143,6 +194,15 @@ def main() -> None:
             train_months=args.train_months,
             test_months=args.test_months,
         )
+
+    # FIX-3: Parameter sensitivity sweep (opt-in via --sensitivity flag)
+    # Runs 5 extra backtests varying BREAKOUT_DIST_PCT ±20% and
+    # ATR_PCT_UNSTABLE_THRESHOLD ±5 pts.  Prints ⚠ OVERFIT WARNING if any
+    # variant drops >40% vs baseline — indicating the strategy is over-tuned.
+    if args.sensitivity:
+        print()
+        logger.info("Running FIX-3 parameter sensitivity sweep (5 variants × full backtest)...")
+        engine.run_sensitivity_test()
 
     # Export trades
     if args.export:
