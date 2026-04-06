@@ -55,14 +55,14 @@ PREPLACEMENT_SPREAD_MULTIPLIER = 1.2  # block S1 pending if spread > 1.2× sessi
 S1_PREPLACEMENT_SPREAD_WINDOW_START_MIN_UTC = 7 * 60 + 45   # 07:45
 S1_PREPLACEMENT_SPREAD_WINDOW_END_MIN_UTC = 8 * 60 + 5      # 08:05
 S1_PREPLACEMENT_SPREAD_LOOKBACK_TRADING_DAYS = 5
-KS3_DAILY_LOSS_LIMIT_PCT   = -0.040  # KS-1 FIX: was -0.030 — too tight, fires after 2-3 trades
-# OPT-1.1: KS3 graduated response — throttle tier before full shutdown
-KS3_THROTTLE_THRESHOLD_PCT = -0.025  # 2.5% daily loss → half size (continue trading)
-KS3_THROTTLE_SIZE_MULT     = 0.50    # lot size multiplier when throttled
+KS3_DAILY_LOSS_LIMIT_PCT   = -0.070  # full daily halt at -7% vs start-of-day equity
+# KS3 graduated response — throttle tier before full shutdown
+KS3_THROTTLE_THRESHOLD_PCT = -0.040  # -4% daily → reduce size (continue trading)
+KS3_THROTTLE_SIZE_MULT     = 0.60    # retain 60% of sized lots = 40% reduction
 KS4_LOSS_STREAK_COUNT      = 6       # KS-3 FIX: was 4 — 4 consecutive losses is normal for breakout systems
 KS4_REDUCED_TRADES         = 3       # KS-3 FIX: was 5 — shorter penalty duration
-KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.120  # v3.0 FIX: was -0.100 — widened to match weekly volatility profile
-KS6_DRAWDOWN_LIMIT_PCT     = 0.20    # v3.0 FIX: was 0.12 — 12% DD too tight for gold trend-following
+KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.150  # weekly net vs start-of-week equity (IST week); Fri uses 0.8× this
+KS6_DRAWDOWN_LIMIT_PCT     = 0.20    # equity vs rolling peak (see persistence.update_peak_equity)
 KS6_RECOVERY_SIZE_MULT     = 0.50    # OPT-1.4: lot size multiplier during recovery
 KS6_RECOVERY_WINS_NEEDED   = 3       # OPT-1.4: consecutive wins to exit recovery
 KS7_SPREAD_RESUME_MULTIPLIER = 1.5   # OPT-1.5: spread must be < 1.5x session avg to resume

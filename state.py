@@ -135,7 +135,7 @@ def build_initial_state() -> dict:
 
         # ── KS4 countdown ─────────────────────────────────────────────────────
         "ks4_reduced_trades_remaining": 0,
-        "ks3_throttled":                False,  # OPT-1.1: True when daily P&L < -2.5%
+        "ks3_throttled":                False,  # True when daily P&L below KS3_THROTTLE_THRESHOLD_PCT
         "ks6_recovery_mode":            False,  # OPT-1.4: KS6 drawdown recovery mode
         "ks6_recovery_wins":            0,      # OPT-1.4: KS6 consecutive wins during recovery
 

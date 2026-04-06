@@ -134,7 +134,7 @@ def calculate_lot_size(
                   trades_remaining=state["ks4_reduced_trades_remaining"],
                   new_base_risk=base_risk)
 
-    # OPT-1.1: KS3 throttle — halve lot size when daily P&L < -2.5%
+    # KS3 throttle — multiply base_risk by KS3_THROTTLE_SIZE_MULT when daily P&L below threshold
     if state.get("ks3_throttled"):
         base_risk *= config.KS3_THROTTLE_SIZE_MULT
         log_event("KS3_THROTTLE_SIZE_APPLIED",
@@ -561,13 +561,12 @@ def get_vol_scalar(state: dict) -> float:
 
 def check_ks3_daily_loss(state: dict) -> tuple[bool, str]:
     """
-    KS3 — Daily loss limit with graduated response (OPT-1.1).
+    KS3 — Daily loss limit with graduated response.
 
-    Tier 1 (Throttle): daily P&L < -2.5% → lot sizes halved, trading continues.
-    Tier 2 (Shutdown): daily P&L < -4.0% → full halt + email.
+    Tier 1 (Throttle): daily P&L < KS3_THROTTLE_THRESHOLD_PCT → multiply lots by
+    KS3_THROTTLE_SIZE_MULT, trading continues.
+    Tier 2 (Shutdown): daily P&L < KS3_DAILY_LOSS_LIMIT_PCT → full halt + email.
 
-    The throttle tier allows recovery trades on trend days that started with
-    early losses. These are statistically the highest-expectancy trades.
     Auto-resets at midnight IST (handled by reset_daily_state).
     """
     daily_pnl = state["daily_net_pnl_pct"]
@@ -588,7 +587,7 @@ def check_ks3_daily_loss(state: dict) -> tuple[bool, str]:
                       daily_pnl_pct=round(daily_pnl, 4))
         return False, "KS3_DAILY_LOSS_LIMIT_REACHED"
 
-    # ── OPT-1.1: Tier 1: Throttle — half lot size, continue trading ──────
+    # ── Tier 1: Throttle — reduced lot size, continue trading ───────────
     if daily_pnl < config.KS3_THROTTLE_THRESHOLD_PCT:
         if not state.get("ks3_throttled"):
             state["ks3_throttled"] = True
@@ -596,10 +595,12 @@ def check_ks3_daily_loss(state: dict) -> tuple[bool, str]:
                       daily_pnl_pct=round(daily_pnl, 4),
                       throttle_mult=config.KS3_THROTTLE_SIZE_MULT)
             from utils.alerts import send_ks_alert
+            _pct_kept = config.KS3_THROTTLE_SIZE_MULT * 100
             send_ks_alert("KS3_THROTTLE", (
                 f"Daily net P&L = {daily_pnl:.2%} "
                 f"< throttle {config.KS3_THROTTLE_THRESHOLD_PCT:.2%}. "
-                f"Lot sizes halved. Full shutdown at {config.KS3_DAILY_LOSS_LIMIT_PCT:.2%}."
+                f"Lot sizing scaled to {_pct_kept:.0f}% of normal. "
+                f"Full shutdown at {config.KS3_DAILY_LOSS_LIMIT_PCT:.2%}."
             ))
         return True, "KS3_THROTTLED"
     else:
@@ -615,8 +616,8 @@ def check_ks3_daily_loss(state: dict) -> tuple[bool, str]:
 
 def check_ks5_weekly_loss(state: dict) -> tuple[bool, str]:
     """
-    KS5 — Weekly loss limit.
-    Net weekly P&L < -4.0% → 7-day pause + email.
+    KS5 — Weekly loss limit (net closed P&L vs start-of-week equity).
+    Below KS5_WEEKLY_LOSS_LIMIT_PCT (tighter on Fridays) → halt + email.
     Requires MANUAL restart (unlike KS3 which auto-resets).
     """
     weekly_pnl = get_weekly_net_pnl_pct()
