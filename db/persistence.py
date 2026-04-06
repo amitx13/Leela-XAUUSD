@@ -365,7 +365,14 @@ def get_weekly_net_pnl_pct() -> float:
     if info is None or info.equity == 0:
         return 0.0
 
-    return float(rows[0]["weekly_pnl"]) / float(info.equity)
+    # HIGH-4 FIX: Use start-of-week equity to prevent KS5 drift.
+    # Current equity denominator understates drawdown after partial recovery.
+    from main import STATE
+    week_start_equity = STATE.get("equity_at_week_start", float(info.equity))
+    if week_start_equity <= 0:
+        week_start_equity = float(info.equity)
+
+    return float(rows[0]["weekly_pnl"]) / week_start_equity
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WEEKLY REVIEW — Fix 2 + Truth Engine

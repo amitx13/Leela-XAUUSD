@@ -1,8 +1,7 @@
 """
 engines/signal_engine_phase2.py — Phase 2 Strategies: R3, S4, S5
 
-This is a standalone module. Import and wire into main.py directly.
-See main_phase2_wiring.py for exact wiring instructions.
+This is a standalone module, imported and wired into main.py directly.
 
 REQUIRED ADDITIONS to engines/signal_engine.py's SignalType enum
 (add these 3 lines inside the class body):
@@ -10,12 +9,9 @@ REQUIRED ADDITIONS to engines/signal_engine.py's SignalType enum
     S4_LONDON_PULL  = "S4_LONDON_PULL"
     S5_NY_COMPRESS  = "S5_NY_COMPRESS"
 
-REQUIRED ADDITION to engines/regime_engine.py:
-    Add get_adx_h4_slope() — see regime_engine_adx_slope.py
-
-REQUIRED PATCH to engines/execution_engine.py:
-    on_trade_opened() needs R3 branch — see execution_engine_r3_patch.py
-    place_order() needs TP support — see execution_engine_r3_patch.py
+get_adx_h4_slope() is implemented in engines/regime_engine.py.
+R3 execution state is wired in on_trade_opened()/on_trade_closed()
+of engines/execution_engine.py.
 """
 
 import pytz
@@ -56,9 +52,13 @@ from engines.data_engine import fetch_ohlcv
 # INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_ema20_m15_value() -> float | None:
+def _get_ema20_m15_value(context: 'MarketContext' = None) -> float | None:
     """EMA(20) on M15 bars. Used by S4 touch detection."""
-    df = fetch_ohlcv("M15", count=30)
+    if context and context.data_m15 is not None:
+        df = context.data_m15
+    else:
+        df = fetch_ohlcv("M15", count=30)
+    
     if df is None or df.empty:
         return None
     df["ema20"] = ta.ema(df["close"], length=20)
@@ -175,7 +175,7 @@ def _can_s5_fire(state: dict) -> tuple[bool, str]:
 # R3 — CALENDAR MOMENTUM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def arm_r3_if_ready(state: dict) -> None:
+def arm_r3_if_ready(state: dict, context: 'MarketContext' = None) -> None:
     """
     Called on every M5 close from m5_mgmt_job.
 
@@ -212,7 +212,7 @@ def arm_r3_if_ready(state: dict) -> None:
                   event=event.get("event_name", "UNKNOWN"))
         return
 
-    bar = get_last_m5_bar()
+    bar = get_last_m5_bar(context=context)
     if bar is None:
         return
 
@@ -221,7 +221,7 @@ def arm_r3_if_ready(state: dict) -> None:
 
     # Direction confirmation: require minimum move of R3_DIRECTION_MIN_MOVE_RATIO × H1 ATR
     # to avoid arming on noise when price barely moved after the event.
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     min_move = (atr_h1 * config.R3_DIRECTION_MIN_MOVE_RATIO) if atr_h1 else 2.0
 
     if abs(price_diff) < min_move:
@@ -237,16 +237,17 @@ def arm_r3_if_ready(state: dict) -> None:
     state["r3_arm_time"]            = datetime.now(pytz.utc)
     state["r3_direction"]           = direction
     state["r3_event_scheduled_utc"] = event["scheduled_utc"]
+    state["r3_event_name"]          = event.get("event_name", "UNKNOWN")
 
     log_event("R3_ARMED",
-              event=event.get("event_name", "UNKNOWN"),
+              event=state["r3_event_name"],
               direction=direction,
               pre_event_price=round(pre_event_price, 3),
               current_close=round(current_close, 3),
               price_diff=round(price_diff, 3))
 
 
-def evaluate_r3_signal(state: dict) -> dict | None:
+def evaluate_r3_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     R3 entry evaluation. Called on M5 close when r3_armed = True.
 
@@ -282,7 +283,7 @@ def evaluate_r3_signal(state: dict) -> dict | None:
     if not direction:
         return None
 
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     if atr_h1 is None:
         log_warning("R3_NO_ATR_H1")
         return None
@@ -411,10 +412,20 @@ def check_r3_hard_exit(state: dict) -> bool:
         return False
 
     elapsed_min = (datetime.now(pytz.utc) - r3_open_time).total_seconds() / 60
-    if elapsed_min >= config.R3_MAX_HOLD_MIN:
+
+    # OPT-3.9: Event-dependent Hold Time
+    event_name = state.get("r3_event_name", "").upper()
+    if "NFP" in event_name or "NONFARM" in event_name:
+        max_hold = config.R3_MAX_HOLD_MIN_NFP
+    elif "CPI" in event_name:
+        max_hold = config.R3_MAX_HOLD_MIN_CPI
+    else:
+        max_hold = config.R3_MAX_HOLD_MIN_DEFAULT
+
+    if elapsed_min >= max_hold:
         log_event("R3_HARD_EXIT_TRIGGERED",
                   elapsed_min=round(elapsed_min, 1),
-                  limit=config.R3_MAX_HOLD_MIN)
+                  limit=max_hold)
         return True
     return False
 
@@ -478,7 +489,7 @@ def _finalize_r3_close(ticket: int, exit_price: float,
 # S4 — LONDON PULLBACK
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_s4_ema_touch(state: dict) -> None:
+def check_s4_ema_touch(state: dict, context: 'MarketContext' = None) -> None:
     """
     Called on every M15 close during London session (07:00-12:00 UTC).
 
@@ -501,15 +512,15 @@ def check_s4_ema_touch(state: dict) -> None:
     if not (config.S4_SESSION_START_HOUR_UTC <= now_utc.hour < config.S4_SESSION_END_HOUR_UTC):
         return
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)
     if bar is None:
         return
 
-    ema20 = _get_ema20_m15_value()
+    ema20 = _get_ema20_m15_value(context=context)
     if ema20 is None:
         return
 
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     if atr_h1 is None:
         return
 
@@ -537,7 +548,7 @@ def check_s4_ema_touch(state: dict) -> None:
                   touch_zone=round(touch_zone, 2))
 
 
-def evaluate_s4_signal(state: dict) -> dict | None:
+def evaluate_s4_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S4 London Pullback — fires on the M15 bar AFTER the EMA20 touch is confirmed.
 
@@ -563,7 +574,7 @@ def evaluate_s4_signal(state: dict) -> dict | None:
         return None
 
     # ADX gate: trend must be present AND accelerating
-    adx_current, adx_increasing = get_adx_h4_slope()
+    adx_current, adx_increasing = get_adx_h4_slope(context=context)
     if adx_current is None:
         return None
     if adx_current < config.S4_ADX_MIN_THRESHOLD:
@@ -574,11 +585,11 @@ def evaluate_s4_signal(state: dict) -> dict | None:
         log_event("S4_ADX_NOT_INCREASING", adx=round(adx_current, 2))
         return None
 
-    ema20 = _get_ema20_m15_value()
+    ema20 = _get_ema20_m15_value(context=context)
     if ema20 is None:
         return None
 
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     if atr_h1 is None:
         return None
 
@@ -672,20 +683,20 @@ def check_s4_hard_exit(state: dict) -> bool:
 # S5 — NY COMPRESSION BREAKOUT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def update_london_session_tracking(state: dict) -> None:
+def update_london_session_tracking(state: dict, context: 'MarketContext' = None) -> None:
     """
     Called on every M15 close during London session (07:00-12:00 UTC).
 
     Maintains running high/low of the London session for S5 compression check.
     Initialized on first bar of session (london_session_tracking_active = False).
     The tracking flag is cleared after the noon compression check runs.
-    Reset at midnight by reset_daily_counters().
+    Reset at midnight by reset_daily_state().
     """
     now_utc = datetime.now(pytz.utc)
     if not (config.S4_SESSION_START_HOUR_UTC <= now_utc.hour < config.S4_SESSION_END_HOUR_UTC):
         return
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)
     if bar is None:
         return
 
@@ -743,7 +754,7 @@ def check_s5_compression_at_noon(state: dict) -> None:
               threshold=config.S5_COMPRESSION_RATIO)
 
 
-def evaluate_s5_signal(state: dict) -> dict | None:
+def evaluate_s5_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S5 NY Compression Breakout.
 
@@ -767,7 +778,7 @@ def evaluate_s5_signal(state: dict) -> dict | None:
     if not permitted:
         return None
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)
     if bar is None:
         return None
 
@@ -778,7 +789,7 @@ def evaluate_s5_signal(state: dict) -> dict | None:
     if london_range <= 0 or london_low <= 0:
         return None
 
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     if atr_h1 is None:
         return None
 

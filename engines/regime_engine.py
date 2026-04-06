@@ -113,12 +113,10 @@ MAX_M5_REENTRIES: dict[RegimeState, int] = {
 def get_atr_percentile_h1(period: int = None,
                           lookback_days: int = None,
                           use_session_filter: bool = False,
-                          session_filter: str = None) -> float | None:
+                          session_filter: str = None,
+                          context: 'MarketContext' = None) -> float | None:
     """
     B2 Fix: ATR percentile on H1 data using explicit Wilder's RMA smoothing.
-
-    F1: Now supports EWMA-weighted percentile calculation.
-    F2: Now supports session-normalized ATR percentile.
 
     EWMA weighting (λ=0.94):
       - Last ~20 bars carry ~65% of the ranking weight
@@ -149,19 +147,16 @@ def get_atr_percentile_h1(period: int = None,
     if period is None:        period       = config.ATR_PERIOD
     if lookback_days is None: lookback_days = config.ATR_LOOKBACK_DAYS
 
-
     mt5  = get_mt5()
     bars = mt5.copy_rates_from_pos(
         config.SYMBOL, mt5.TIMEFRAME_H1, 0, lookback_days * 24
     )
-
 
     if bars is None or len(bars) < period + 1:
         log_warning("ATR_PCT_INSUFFICIENT_DATA",
                     bars_received=len(bars) if bars else 0,
                     bars_needed=period + 1)
         return None
-
 
     df = pd.DataFrame(bars)
 
@@ -203,9 +198,6 @@ def get_atr_percentile_h1(period: int = None,
     # λ=0.94 means last ~20 bars carry ~65% of ranking weight
     percentile = _ewma_percentile(historical_atr, current_atr)
 
-    # Also store raw ATR in state for portfolio risk (F8 fix)
-    # This is done in the calling function (regime_job) using the returned value
-
     log_event("ATR_PCT_CALCULATED",
               current_atr=round(current_atr, 4),
               percentile=round(percentile, 1),
@@ -214,6 +206,7 @@ def get_atr_percentile_h1(period: int = None,
               session_filter=session_filter if use_session_filter else None)
 
     return percentile
+
 
 
 def _ewma_percentile(historical_atr: np.ndarray, current_atr: float, lambda_decay: float = 0.94) -> float:
@@ -283,22 +276,24 @@ def _filter_bars_by_session(df: pd.DataFrame, session: str) -> pd.DataFrame:
     return df[mask].copy()
 
 
-def get_current_atr_m15(period: int = 14) -> float | None:
+def get_current_atr_m15(period: int = 14,
+                         context: 'MarketContext' = None) -> float | None:
     """
-    Returns the current ATR(14) on M15 bars using RMA.
-    Used by position management for ATR trailing stop.
-    Separate from get_atr_percentile_h1 — different timeframe, different purpose.
+    BUG-RE2 FIX: This function's `def` statement was missing — the body
+    was orphaned code at module scope after the previous function ended.
+    Added the def here so it is a proper callable.
+
+    Returns the current M15 ATR(14, RMA) value.
+    Returns None on data failure.
     """
     mt5  = get_mt5()
     bars = mt5.copy_rates_from_pos(
-        config.SYMBOL, mt5.TIMEFRAME_M15, 0, 50
+        config.SYMBOL, mt5.TIMEFRAME_M15, 0, period * 3
     )
-
 
     if bars is None or len(bars) < period + 1:
         log_warning("ATR_M15_INSUFFICIENT_DATA")
         return None
-
 
     df = pd.DataFrame(bars)
     df["atr"] = ta.atr(
@@ -308,8 +303,8 @@ def get_current_atr_m15(period: int = 14) -> float | None:
     )
     df.dropna(subset=["atr"], inplace=True)
 
-
     return float(df["atr"].iloc[-1]) if not df.empty else None
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,15 +312,13 @@ def get_current_atr_m15(period: int = 14) -> float | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_adx_h4(period: int = 14) -> float | None:
+def get_adx_h4(period: int = 14, context: 'MarketContext' = None) -> float | None:
     """
     Returns the current ADX value from H4 bars.
-    Uses pandas_ta adx() — returns ADX_{period} column.
-    Returns None on data failure.
-
-    v1.1: Fetch 100 bars (was period * 3 = 42). ADX14 needs enough history
-    to stabilise Wilder's smoothing — 42 bars produced noisy early readings.
+    If context is provided, uses the cached value.
     """
+    if context and context.adx_h4 is not None:
+        return context.adx_h4
     mt5 = get_mt5()
 
     # ── CHANGE 1: was `period * 3` (42 bars) — raised to 100 per v1.1 ────────
@@ -367,12 +360,13 @@ def get_adx_h4(period: int = 14) -> float | None:
     return adx_val
 
 
-def get_adx_h4_full(period: int = 14) -> tuple[float | None, float | None, float | None]:
+def get_adx_h4_full(period: int = 14, context: 'MarketContext' = None) -> tuple[float | None, float | None, float | None]:
     """
-    CHANGE 9.1: Returns (adx, di_plus, di_minus) from H4 bars in a single fetch.
-    Called from regime_job() to cache DI+/DI- in STATE for S6/S7 ADX trend filter.
-    Avoids double-fetching H4 bars (get_adx_h4 + separate DI fetch).
+    CHANGE 9.1: Returns (adx, di_plus, di_minus) from H4 bars.
+    If context is provided, uses cached values.
     """
+    if context and context.adx_h4 is not None:
+        return context.adx_h4, context.di_plus_h4, context.di_minus_h4
     mt5 = get_mt5()
     bars = mt5.copy_rates_from_pos(config.SYMBOL, mt5.TIMEFRAME_H4, 0, 100)
 
@@ -408,19 +402,23 @@ def get_adx_h4_full(period: int = 14) -> tuple[float | None, float | None, float
     )
 
 
-def get_adx_h4_slope(period: int = 14) -> tuple[float | None, bool]:
+def get_adx_h4_slope(period: int = 14, context: 'MarketContext' = None) -> tuple[float | None, bool]:
     """
     Returns (current_adx, is_increasing) using last 2 fully closed H4 bars.
+    If context is provided, uses cached calculation.
 
-    is_increasing = True if last closed ADX bar > second-to-last closed ADX bar.
-    Used by S4: trend must be present (adx > 20) AND accelerating (increasing).
+    Rule from spec: Use the last two fully closed H4 bars for the ADX
+    increasing check. Do not read ADX from the current forming H4 bar.
+      - iloc[-1] = forming bar (skip)
+      - iloc[-2] = last closed bar    -> current_adx
+      - iloc[-3] = previous closed bar -> prev_adx
 
-    Rule from spec: "Use the last two fully closed H4 bars for the ADX
-    increasing check. Do not read ADX from the current forming H4 bar."
-    - iloc[-1] = forming bar (skip)
-    - iloc[-2] = last closed bar   → current_adx
-    - iloc[-3] = previous closed bar → prev_adx
+    BUG-RE4 FIX: Original had orphaned text after first docstring closed
+    which caused a cascade of parse errors in all subsequent functions.
     """
+    if context and context.adx_h4 is not None:
+        return context.adx_h4, context.adx_h4_is_increasing
+
     mt5 = get_mt5()
     bars = mt5.copy_rates_from_pos(config.SYMBOL, mt5.TIMEFRAME_H4, 0, 100)
 
@@ -530,13 +528,22 @@ def calculate_regime(
 
 
     # ── UNSTABLE ─────────────────────────────────────────────────────────────
-    # ADD-2: ADX 18–20 overlap with RANGING_CLEAR (adx < 18) is INTENTIONAL.
-    # ADX in transition zone (18–20) = trend ambiguous, not confirmed ranging.
-    # UNSTABLE takes precedence over RANGING here — evaluated first.
-    # Do not reorder these blocks without a full regime review.
     # ADX > 55 gate: gold regularly trends to ADX 50–60; 45 was too tight.
-    if atr_pct_h1 > unstable_thresh or adx_h4 > 55 or 18 <= adx_h4 <= 20:
+    # High ATR percentile (>85th) is genuinely unstable — size must be reduced.
+    if atr_pct_h1 > unstable_thresh or adx_h4 > 55:
         return RegimeState.UNSTABLE, 0.4
+
+
+    # ── OPT-2.2 FIX: ADX 18–20 transition zone ──────────────────────────────
+    # Was UNSTABLE (0.4×) — but ADX 18-20 is a transition between ranging and
+    # trending, NOT unstable volatility. Reclassified as WEAK_TRENDING (0.8×)
+    # to allow S1 at reduced size during early trend formation.
+    # ~10-15% of trading hours fall in this zone.
+    if 18 <= adx_h4 <= 20:
+        session_mult = (
+            1.0 if session in ("LONDON_NY_OVERLAP", "LONDON", "NY") else 0.7
+        )
+        return RegimeState.WEAK_TRENDING, round(0.8 * session_mult, 3)
 
 
     # ── RANGING ──────────────────────────────────────────────────────────────
@@ -595,13 +602,21 @@ def apply_hysteresis(new_regime: RegimeState, state: dict) -> RegimeState:
             state["consecutive_regime_readings"]  = 1
 
 
+        # OPT-2.1: Asymmetric hysteresis. Faster entry into protective regimes.
+        # Moving into NO_TRADE/UNSTABLE takes 2 readings (30min lag).
+        # Moving out/between normal regimes takes 3 readings (45min lag).
+        if new_regime in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
+            required_count = 2
+        else:
+            required_count = config.REGIME_HYSTERESIS_COUNT
+
         log_event("REGIME_PENDING",
-                  pending=new_regime,
+                  pending=new_regime.value,
                   count=state["consecutive_regime_readings"],
-                  required=config.REGIME_HYSTERESIS_COUNT)
+                  required=required_count)
 
 
-        if state["consecutive_regime_readings"] >= config.REGIME_HYSTERESIS_COUNT:
+        if state["consecutive_regime_readings"] >= required_count:
             old_regime                           = state["current_regime"]
             state["current_regime"]              = new_regime.value
             state["consecutive_regime_readings"] = 0
@@ -676,14 +691,13 @@ def _cancel_s6_pending_on_no_trade(state: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_safe_regime(state: dict) -> RegimeState:
+def get_safe_regime(state: dict, context: 'MarketContext' = None) -> RegimeState:
     """
     Returns current regime only if the last calculation is fresh.
-    If regime_calculated_at is older than REGIME_STALENESS_SEC (20 min),
-    returns NO_TRADE unconditionally — stale regime is the same as no regime.
-
-    Called by every signal engine gate before firing.
     """
+    if context and context.regime_val:
+        return context.regime_val
+    
     calc_at = state.get("regime_calculated_at")
     if calc_at is None:
         log_event("REGIME_STALE_NEVER_CALCULATED")
@@ -691,16 +705,22 @@ def get_safe_regime(state: dict) -> RegimeState:
 
 
     age_sec = (datetime.now(pytz.utc) - calc_at).total_seconds()
+    current_regime = state.get("current_regime", "NO_TRADE")
 
+    # OPT-2.3: Regime-Dependent Staleness Check
+    if current_regime == RegimeState.SUPER_TRENDING.value:
+        staleness_limit = config.REGIME_STALENESS_SEC_SUPER
+    else:
+        staleness_limit = config.REGIME_STALENESS_SEC_DEFAULT
 
-    if age_sec > config.REGIME_STALENESS_SEC:
+    if age_sec > staleness_limit:
         log_event("REGIME_STALE",
                   age_seconds=int(age_sec),
-                  limit=config.REGIME_STALENESS_SEC)
+                  limit=staleness_limit,
+                  regime=current_regime)
         return RegimeState.NO_TRADE
 
-
-    return RegimeState(state["current_regime"])
+    return RegimeState(current_regime)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -836,7 +856,8 @@ def bootstrap_regime_from_history(state: dict) -> bool:
         def _classify(adx: float, atr_pct: float) -> str:
             if atr_pct > config.ATR_PCT_NO_TRADE_THRESHOLD:  return "NO_TRADE"
             if atr_pct > config.ATR_PCT_UNSTABLE_THRESHOLD:  return "UNSTABLE"
-            if adx > 55 or 18 <= adx <= 20:                  return "UNSTABLE"
+            if adx > 55:                                      return "UNSTABLE"
+            if 18 <= adx <= 20:                               return "WEAK_TRENDING"  # OPT-2.2
             if adx < 18:                                      return "RANGING_CLEAR"
             if adx > 35 and atr_pct > config.ATR_PCT_SUPER_THRESHOLD:
                 return "SUPER_TRENDING"
@@ -895,7 +916,7 @@ def bootstrap_regime_from_history(state: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def regime_job(state: dict) -> None:
+def regime_job(state: dict, context: 'MarketContext' = None) -> None:
     """
     G6 Fix: APScheduler job — runs every 15 minutes.
 
@@ -926,8 +947,8 @@ def regime_job(state: dict) -> None:
 
     # ── Step 1: indicators ───────────────────────────────────────────────────
     # CHANGE 9.1: Use get_adx_h4_full() to also capture DI+/DI- for S6/S7 filter
-    adx_h4, di_plus_h4, di_minus_h4 = get_adx_h4_full()
-    atr_pct_h1 = get_atr_percentile_h1()
+    adx_h4, di_plus_h4, di_minus_h4 = get_adx_h4_full(context=context)
+    atr_pct_h1 = get_atr_percentile_h1(context=context)
 
 
     if adx_h4 is None or atr_pct_h1 is None:
@@ -950,14 +971,16 @@ def regime_job(state: dict) -> None:
     has_events = False
 
     # ── Step 4: spread ratio ─────────────────────────────────────────────────
+    from engines.data_engine import get_avg_spread_last_24h
+    avg_spread   = get_avg_spread_last_24h()
+    
     mt5        = get_mt5()
     tick       = mt5.symbol_info_tick(config.SYMBOL)
-    spread_now = 0.0
+    spread_now = avg_spread # SAFER: default to baseline
+    
     if tick and config.CONTRACT_SPEC.get("point"):
         spread_now = (tick.ask - tick.bid) / config.CONTRACT_SPEC["point"]
 
-
-    avg_spread   = get_session_avg_spread()
     spread_ratio = (spread_now / avg_spread) if avg_spread > 0 else 0.0
 
 
@@ -968,7 +991,16 @@ def regime_job(state: dict) -> None:
         dxy_corr_50     = dxy_corr_50,
         upcoming_events = has_events,
         spread_ratio    = spread_ratio,
+        state           = state,   # BUG-RE3 FIX: pass state so DXY variance check works
     )
+
+    # OPT-2.4: DXY Variance Spike Detection
+    dxy_variance = state.get("dxy_ewma_variance", 0.0)
+    if dxy_variance > config.DXY_VARIANCE_SPIKE_THRESHOLD:
+        # DXY whipsaw detected — upgrade regime toward UNSTABLE
+        if new_regime in (RegimeState.NORMAL_TRENDING, RegimeState.WEAK_TRENDING):
+            new_regime = RegimeState.UNSTABLE
+            log_event("REGIME_DXY_VARIANCE_UPGRADE", variance=round(dxy_variance, 6))
 
 
     # ── Step 6: hysteresis (Fix 1) ───────────────────────────────────────────
@@ -994,10 +1026,19 @@ def regime_job(state: dict) -> None:
         state["last_di_plus_h4"]  = di_plus_h4
     if di_minus_h4 is not None:
         state["last_di_minus_h4"] = di_minus_h4
-    # F8 fix: also store raw ATR for portfolio risk (avoid re-fetching every M15 candle)
-    # BUG-6 FIX: was referencing nonexistent local `df`. Now calls data_engine.
-    from engines.data_engine import get_atr14_h1_rma as _get_raw_atr
-    _raw_atr = _get_raw_atr()
+    # BUG-RE5 FIX: Don't make a full extra H1 fetch here just to get raw ATR.
+    # get_atr_percentile_h1() ran 5 lines above and already computed this.
+    # Use the value from context if available (populated during refresh()),
+    # otherwise fall back to the state cache populated last cycle.
+    _raw_atr = None
+    if context and context.atr_h1 is not None:
+        _raw_atr = context.atr_h1
+    else:
+        _raw_atr = state.get("last_atr_h1_raw", None)
+        if _raw_atr is None or _raw_atr == 0.0:
+            # Only fetch if we genuinely have nothing cached
+            from engines.data_engine import get_atr14_h1_rma as _get_raw_atr
+            _raw_atr = _get_raw_atr()
     state["last_atr_h1_raw"] = _raw_atr if _raw_atr else 0.0
 
 

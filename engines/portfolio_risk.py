@@ -73,10 +73,23 @@ def check_portfolio_risk(candidate: dict, state: dict) -> tuple[bool, str]:
                   equity=round(equity, 2))
         return False, "DAILY_VAR_LIMIT_REACHED"
 
-    # ── Session lots cap ───────────────────────────────────────────────────────
+    # ── OPT-4.5: Dynamic Session lots cap ──────────────────────────────────────
     final_lots = candidate["lot_size"]
-
-    if get_total_open_lots() + final_lots > config.MAX_SESSION_LOTS:
+    total_open = get_total_open_lots()
+    
+    # Scale session cap based on account size (Phase 2+ growth)
+    session_cap = config.MAX_SESSION_LOTS_BASE
+    if equity > 100000:
+        session_cap = 0.30
+    elif equity > 50000:
+        session_cap = 0.20
+        
+    if total_open + final_lots > session_cap:
+        log_event("SESSION_LOT_CAP_BLOCKED",
+                  current=round(total_open, 2),
+                  new=round(final_lots, 2),
+                  cap=session_cap,
+                  equity=round(equity, 0))
         return False, "SESSION_LOT_CAP_REACHED"
 
     # SIZE-4 FIX: Removed SUPER_TRENDING double-halving. The regime multiplier
@@ -97,13 +110,26 @@ def check_portfolio_risk(candidate: dict, state: dict) -> tuple[bool, str]:
     )
 
     if same_family_same_dir:
+        # OPT-4.3: Proportional Correlation Kill
+        # Scale the reduction based on actual measured correlation if available.
+        # Otherwise fallback to a standard 0.65x reduction for family overlap.
+        high_pairs = state.get("high_corr_pairs", [])
+        max_corr = max((c for _, _, c in high_pairs), default=0.65)
+        
+        # If max_corr is documented but low (<0.50), use a safer baseline for overlap
+        if max_corr < 0.65:
+            max_corr = 0.65
+            
+        reduction = 1.0 - (max_corr - 0.50)  # Linear scale (0.80 corr -> 0.70x mult)
+        
         candidate["lot_size"] = max(
             config.CONTRACT_SPEC.get("volume_min", 0.01),
-            round(candidate["lot_size"] * 0.65, 2)
+            round(candidate["lot_size"] * reduction, 2)
         )
-        log_event("CORRELATION_KILL_SAME_FAMILY",
+        log_event("CORRELATION_KILL_PROPORTIONAL",
                   lots=candidate["lot_size"],
-                  same_direction=direction,
+                  reduction=round(reduction, 2),
+                  max_corr=round(max_corr, 2),
                   signal=candidate_signal)
 
     return True, "OK"

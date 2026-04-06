@@ -134,6 +134,21 @@ def calculate_lot_size(
                   trades_remaining=state["ks4_reduced_trades_remaining"],
                   new_base_risk=base_risk)
 
+    # OPT-1.1: KS3 throttle — halve lot size when daily P&L < -2.5%
+    if state.get("ks3_throttled"):
+        base_risk *= config.KS3_THROTTLE_SIZE_MULT
+        log_event("KS3_THROTTLE_SIZE_APPLIED",
+                  throttle_mult=config.KS3_THROTTLE_SIZE_MULT,
+                  new_base_risk=base_risk)
+
+    # OPT-1.4: KS6 Recovery mode — halve lot size until 3 consecutive wins
+    if state.get("ks6_recovery_mode"):
+        base_risk *= config.KS6_RECOVERY_SIZE_MULT
+        log_event("KS6_RECOVERY_SIZE_APPLIED",
+                  wins=state.get("ks6_recovery_wins", 0),
+                  required=config.KS6_RECOVERY_WINS_NEEDED,
+                  new_base_risk=base_risk)
+
     # F5: Apply severity multiplier from economic event risk
     severity_score = state.get("ks7_severity_score", 0.0)
     severity_mult = get_severity_multiplier(severity_score)
@@ -148,8 +163,20 @@ def calculate_lot_size(
     spread_mult = get_spread_multiplier(state)
     if spread_mult < 1.0:
         base_risk *= spread_mult
+        # CRIT-4 FIX: Log spread reduction outside Friday block — was silently
+        # applied Mon-Thu with no audit trail. Now fires every day when active.
         log_event("KS2_SPREAD_REDUCED_SIZE",
                   multiplier=spread_mult,
+                  new_base_risk=base_risk)
+
+    # OPT-6.3: Friday Afternoon Risk Tapering
+    now_utc = datetime.now(pytz.utc)
+    if now_utc.weekday() == 4 and now_utc.hour >= 14:
+        taper_mult = 0.5
+        base_risk *= taper_mult
+        log_event("FRIDAY_AFTERNOON_TAPER_APPLIED",
+                  hour_utc=now_utc.hour,
+                  multiplier=taper_mult,
                   new_base_risk=base_risk)
 
     # F3: Apply vol_scalar from EWMA ATR percentile
@@ -253,6 +280,12 @@ def calculate_lot_size(
               final_lots=final_lots,
               phase=1 if live_count < 50 else 2)
 
+    # OPT-4.2: Add Contract Spec Validation
+    # Ensure final lot size snaps strictly to the volume step allowed by the broker
+    volume_step = config.CONTRACT_SPEC.get("volume_step", 0.01)
+    if volume_step > 0:
+        final_lots = round(final_lots / volume_step) * volume_step
+        final_lots = round(final_lots, 2)  # prevent floating point slop
 
     return final_lots
 
@@ -273,14 +306,34 @@ def trigger_ks4_countdown(state: dict) -> None:
     Halving is then enforced in calculate_lot_size() for the next 5 trades.
     """
     if state["consecutive_losses"] >= config.KS4_LOSS_STREAK_COUNT:
-        state["ks4_reduced_trades_remaining"] = config.KS4_REDUCED_TRADE_COUNT
+        # OPT-1.3 KS4 Severity-Weighted Countdown
+        recent_r = state.get("recent_loss_r_multiples", [])
+        if recent_r:
+            avg_loss_r = abs(sum(recent_r) / len(recent_r))
+        else:
+            avg_loss_r = 1.0  # safe default if tracking missed
+
+        if avg_loss_r > 0.7:
+            trades_remaining = 5
+            severity = "SEVERE"
+        elif avg_loss_r > 0.4:
+            trades_remaining = 3
+            severity = "MODERATE"
+        else:
+            trades_remaining = 1
+            severity = "MINOR"
+
+        state["ks4_reduced_trades_remaining"] = trades_remaining
         log_event("KS4_COUNTDOWN_STARTED",
                   consecutive_losses=state["consecutive_losses"],
-                  trades_remaining=config.KS4_REDUCED_TRADE_COUNT)
+                  avg_loss_r=round(avg_loss_r, 2),
+                  severity_tier=severity,
+                  trades_remaining=trades_remaining)
         from utils.alerts import send_ks_alert
         send_ks_alert("KS4", (
-            f"Loss streak = {state['consecutive_losses']} trades. "
-            f"Lot size halved for next {config.KS4_REDUCED_TRADE_COUNT} trades."
+            f"Loss streak = {state['consecutive_losses']} trades "
+            f"(Avg Loss = {avg_loss_r:.2f}R - {severity}). "
+            f"Lot size halved for next {trades_remaining} trades."
         ))
 
 
@@ -375,7 +428,7 @@ def calculate_atr_trail(current_price: float, direction: str) -> float | None:
 
 def check_ks2_spread(state: dict) -> tuple[bool, str]:
     """
-    F6: KS2 — Spread guard with rolling median and 2-consecutive-check persistence.
+    F6 / OPT-1.2: KS2 — Spread guard with 2-consecutive-check persistence.
 
     Tiers:
     - ratio > 2.5×: HARD BLOCK (KS2 hard kill switch)
@@ -388,13 +441,16 @@ def check_ks2_spread(state: dict) -> tuple[bool, str]:
     constantly. Two consecutive checks (2-minute confirmation) is required
     before applying the 50% reduction.
 
-    Rolling MEDIAN is more robust to spike contamination than average.
-    Uses get_spread_rolling_median() instead of get_avg_spread_last_24h().
+    OPT-1.2: Uses get_session_avg_spread() instead of 24h rolling median.
+    Asian session spreads are naturally 1.5-2x London spreads. Using a 24h
+    average inflates the London baseline, making KS2 too lenient when it
+    matters most. Falls back to get_spread_rolling_median() if session
+    isn't available.
 
     Returns (permitted: bool, reason: str).
     Stores spread_multiplier and elevated reading count in state for lot sizing.
     """
-    from engines.data_engine import get_spread_rolling_median
+    from engines.data_engine import get_session_avg_spread, get_spread_rolling_median
 
     mt5  = get_mt5()
     tick = mt5.symbol_info_tick(config.SYMBOL)
@@ -404,9 +460,13 @@ def check_ks2_spread(state: dict) -> tuple[bool, str]:
     point      = config.CONTRACT_SPEC.get("point", 0.01)
     spread_now = (tick.ask - tick.bid) / point
 
-    # F6: Use rolling MEDIAN instead of average
-    median_spread = get_spread_rolling_median()
-    ratio         = spread_now / median_spread if median_spread > 0 else 999
+    # OPT-1.2: Use session-specific baseline instead of 24h rolling median
+    baseline_spread = get_session_avg_spread()
+    if baseline_spread <= 0:
+        # Fallback if session data is not available (e.g. startup)
+        baseline_spread = get_spread_rolling_median()
+
+    ratio = spread_now / baseline_spread if baseline_spread > 0 else 999
 
     # Store for debugging
     state["spread_elevated_last_ratio"] = ratio
@@ -417,7 +477,7 @@ def check_ks2_spread(state: dict) -> tuple[bool, str]:
         state["spread_multiplier"] = 0.0
         log_event("KS2_REJECTED",
                   spread_now=round(spread_now, 1),
-                  median_spread=round(median_spread, 1),
+                  baseline_spread=round(baseline_spread, 1),
                   ratio=round(ratio, 2))
         return False, "KS2_SPREAD_TOO_WIDE"
 
@@ -428,7 +488,7 @@ def check_ks2_spread(state: dict) -> tuple[bool, str]:
             state["spread_multiplier"] = 0.5
             log_event("KS2_REDUCTION_TIER",
                       spread_now=round(spread_now, 1),
-                      median_spread=round(median_spread, 1),
+                      baseline_spread=round(baseline_spread, 1),
                       ratio=round(ratio, 2),
                       consecutive_checks=state["spread_elevated_reading_count"])
             return True, "KS2_REDUCTION_50PCT"
@@ -501,24 +561,54 @@ def get_vol_scalar(state: dict) -> float:
 
 def check_ks3_daily_loss(state: dict) -> tuple[bool, str]:
     """
-    KS3 — Daily loss limit.
-    Net P&L today (after commission) < -1.5% → halt + email.
-    Auto-resets at midnight IST (handled by reset_daily_counters).
+    KS3 — Daily loss limit with graduated response (OPT-1.1).
+
+    Tier 1 (Throttle): daily P&L < -2.5% → lot sizes halved, trading continues.
+    Tier 2 (Shutdown): daily P&L < -4.0% → full halt + email.
+
+    The throttle tier allows recovery trades on trend days that started with
+    early losses. These are statistically the highest-expectancy trades.
+    Auto-resets at midnight IST (handled by reset_daily_state).
     """
-    if state["daily_net_pnl_pct"] < config.KS3_DAILY_LOSS_LIMIT_PCT:
+    daily_pnl = state["daily_net_pnl_pct"]
+
+    # ── Tier 2: Full shutdown (existing behavior) ─────────────────────────
+    if daily_pnl < config.KS3_DAILY_LOSS_LIMIT_PCT:
         if state["trading_enabled"]:
             state["trading_enabled"] = False
             state["shutdown_reason"] = "KS3_DAILY_LOSS_LIMIT"
             persist_critical_state(state)
             from utils.alerts import send_ks_alert
             send_ks_alert("KS3", (
-                f"Daily net P&L = {state['daily_net_pnl_pct']:.2%} "
+                f"Daily net P&L = {daily_pnl:.2%} "
                 f"< limit {config.KS3_DAILY_LOSS_LIMIT_PCT:.2%}. "
                 f"Trading halted. Auto-resets at midnight IST."
             ))
             log_event("KS3_FIRED",
-                      daily_pnl_pct=round(state["daily_net_pnl_pct"], 4))
+                      daily_pnl_pct=round(daily_pnl, 4))
         return False, "KS3_DAILY_LOSS_LIMIT_REACHED"
+
+    # ── OPT-1.1: Tier 1: Throttle — half lot size, continue trading ──────
+    if daily_pnl < config.KS3_THROTTLE_THRESHOLD_PCT:
+        if not state.get("ks3_throttled"):
+            state["ks3_throttled"] = True
+            log_event("KS3_THROTTLED",
+                      daily_pnl_pct=round(daily_pnl, 4),
+                      throttle_mult=config.KS3_THROTTLE_SIZE_MULT)
+            from utils.alerts import send_ks_alert
+            send_ks_alert("KS3_THROTTLE", (
+                f"Daily net P&L = {daily_pnl:.2%} "
+                f"< throttle {config.KS3_THROTTLE_THRESHOLD_PCT:.2%}. "
+                f"Lot sizes halved. Full shutdown at {config.KS3_DAILY_LOSS_LIMIT_PCT:.2%}."
+            ))
+        return True, "KS3_THROTTLED"
+    else:
+        # P&L recovered above throttle threshold — clear throttle
+        if state.get("ks3_throttled"):
+            state["ks3_throttled"] = False
+            log_event("KS3_THROTTLE_CLEARED",
+                      daily_pnl_pct=round(daily_pnl, 4))
+
     return True, "OK"
 
 
@@ -532,8 +622,13 @@ def check_ks5_weekly_loss(state: dict) -> tuple[bool, str]:
     weekly_pnl = get_weekly_net_pnl_pct()
     state["weekly_net_pnl_pct"] = weekly_pnl
 
+    # OPT-1.7: KS5 Day-of-Week Awareness
+    # Tighten weekly loss limit by 20% on Fridays to avoid weekend gap risk
+    effective_limit = config.KS5_WEEKLY_LOSS_LIMIT_PCT
+    if datetime.now(pytz.utc).weekday() == 4:  # Friday
+        effective_limit *= 0.80
 
-    if weekly_pnl < config.KS5_WEEKLY_LOSS_LIMIT_PCT:
+    if weekly_pnl < effective_limit:
         if state["trading_enabled"]:
             state["trading_enabled"] = False
             state["shutdown_reason"] = "KS5_WEEKLY_LOSS_LIMIT"
@@ -541,10 +636,12 @@ def check_ks5_weekly_loss(state: dict) -> tuple[bool, str]:
             from utils.alerts import send_ks_alert
             send_ks_alert("KS5", (
                 f"Weekly net P&L = {weekly_pnl:.2%} "
-                f"< limit {config.KS5_WEEKLY_LOSS_LIMIT_PCT:.2%}. "
+                f"< limit {effective_limit:.2%}. "
                 f"7-day pause. Manual restart required after written review."
             ))
-            log_event("KS5_FIRED", weekly_pnl_pct=round(weekly_pnl, 4))
+            log_event("KS5_FIRED",
+                      weekly_pnl_pct=round(weekly_pnl, 4),
+                      effective_limit=round(effective_limit, 4))
         return False, "KS5_WEEKLY_LOSS_LIMIT_REACHED"
     return True, "OK"
 
@@ -577,6 +674,9 @@ def check_ks6_drawdown(state: dict) -> tuple[bool, str]:
         if state["trading_enabled"]:
             state["trading_enabled"] = False
             state["shutdown_reason"] = "KS6_DRAWDOWN_CIRCUIT_BREAKER"
+            # OPT-1.4: Activate recovery mode for when trading is re-enabled
+            state["ks6_recovery_mode"] = True
+            state["ks6_recovery_wins"] = 0
             persist_critical_state(state)
             from utils.alerts import send_ks_alert
             send_ks_alert("KS6", (
@@ -648,9 +748,27 @@ def check_ks7_event_blackout(state: dict) -> tuple[bool, str]:
                       pre_event_atr=state["ks7_pre_event_atr"])
         return False, f"KS7_HARD_HALT_SEVERITY_{severity_score:.0f}"
 
-    # Severity is < 60 — check post-event ATR resume condition
+    # Severity is < 60 — check post-event ATR & Spread resume conditions
     if state.get("ks7_active"):
         minutes_since = get_minutes_since_last_event()
+
+        # OPT-1.5: Spread normalization check
+        # Spreads must return to near-normal before we resume trading.
+        from engines.data_engine import get_session_avg_spread
+        avg_spread = get_session_avg_spread()
+        if avg_spread > 0:
+            mt5_s = get_mt5()
+            tick_s = mt5_s.symbol_info_tick(config.SYMBOL)
+            if tick_s:
+                point = config.CONTRACT_SPEC.get("point", 0.01)
+                current_spread = (tick_s.ask - tick_s.bid) / point
+                spread_ratio = current_spread / avg_spread
+                if spread_ratio > config.KS7_SPREAD_RESUME_MULTIPLIER:
+                    log_event("KS7_SPREAD_STILL_ELEVATED",
+                              current=round(current_spread, 1),
+                              avg=round(avg_spread, 1),
+                              ratio=round(spread_ratio, 2))
+                    return False, "KS7_SPREAD_STILL_ELEVATED"
 
         # ATR check: current ATR must be < 130% of pre-event ATR
         if state["ks7_pre_event_atr"] > 0:
@@ -665,6 +783,7 @@ def check_ks7_event_blackout(state: dict) -> tuple[bool, str]:
                 # (severity score handles the risk scaling)
 
         # Deactivate the "active" flag now that severity is below threshold
+        # and spread has normalized
         if severity_score < 30:
             state["ks7_active"]        = False
             state["ks7_pre_event_atr"] = 0.0
@@ -708,6 +827,13 @@ def run_pre_trade_kill_switches(state: dict) -> tuple[bool, str]:
     if not state["trading_enabled"]:
         return False, f"TRADING_DISABLED_{state.get('shutdown_reason', 'UNKNOWN')}"
 
+    # MED-2 FIX: Gate new entries during cold-start regime warm-up.
+    # Existing positions are managed as normal, but new ones are blocked.
+    from datetime import datetime
+    import pytz
+    cold_start_until = state.get("regime_cold_start_until")
+    if cold_start_until and datetime.now(pytz.utc) < cold_start_until:
+        return False, "REGIME_WARMING_UP"
 
     checks = [
         ("KS3", check_ks3_daily_loss),

@@ -29,6 +29,9 @@ import sys
 import time
 import argparse
 import pytz
+import os
+import signal
+import threading
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -97,7 +100,8 @@ from engines.execution_engine import (
     modify_stop,
     reconcile_live_positions,  # ENHANCED: Add reconciliation function import
 )
-from state import reset_daily_counters   # BUG-1 FIX: use state.py version (resets Phase 2 + S8 daily flags)
+from state import reset_daily_state
+from engines.context import MarketContext
 from engines.portfolio_risk import check_portfolio_risk, run_correlation_check
 from engines.starvation_tracker import StarvationTracker
 from engines.truth_engine import daily_edge_check
@@ -126,7 +130,7 @@ from engines.signal_engine_phase2 import (
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-STATE              = build_initial_state()
+STATE              = build_initial_state()   # BUG-1 FIX: single init only
 PAPER_MODE         = False
 STARVATION_TRACKER = StarvationTracker()
 
@@ -137,17 +141,33 @@ _prev_session:  str | None      = None   # session boundary detection for starva
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILS
 # ─────────────────────────────────────────────────────────────────────────────
-
+# Global State Lock (STATE already initialised above — do NOT re-call build_initial_state here)
+STATE_LOCK = threading.RLock()
 def _is_market_hours() -> bool:
     from utils.session import is_trading_hours
     return is_trading_hours()
 
 
 def _safe_execute(job_name: str, fn, *args, **kwargs):
+    import time
+    # HIGH-1 FIX: Verify MT5 is alive before running any job.
+    # Without this, stale rpyc data from a dead connection is undetectable.
+    from utils.mt5_client import ensure_mt5_connected
+    if not ensure_mt5_connected():
+        log_critical(f"JOB_SKIPPED_MT5_DOWN_{job_name}")
+        return
+    start_time = time.monotonic()
     try:
-        fn(*args, **kwargs)
+        with STATE_LOCK:
+            fn(*args, **kwargs)
     except Exception as e:
         log_warning(f"JOB_EXCEPTION_{job_name}", error=str(e))
+    finally:
+        elapsed = time.monotonic() - start_time
+        if elapsed > 5.0:
+            log_warning("JOB_SLOW_EXECUTION",
+                        job=job_name,
+                        elapsed_sec=round(elapsed, 2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,7 +212,12 @@ def pre_london_range_job() -> None:
 def regime_job() -> None:
     log_event("JOB_START", job="regime")
     validate_state_keys(STATE)
-    regime_engine_job(STATE)
+    
+    # Create context and refresh only H1/H4 for regime
+    ctx = MarketContext(STATE)
+    ctx.refresh(tfs=["H1", "H4"])
+    
+    regime_engine_job(STATE, context=ctx)
     log_event("REGIME_JOB_DONE",
               regime=STATE["current_regime"],
               size_mult=round(STATE["size_multiplier"], 3))
@@ -254,31 +279,7 @@ def midnight_reset_job() -> None:
         STATE["shutdown_reason"] = None
         log_event("KS3_AUTO_RESET_MIDNIGHT")
 
-    reset_daily_counters(STATE)
-
-    # Spread tracking reset for new session
-    STATE["session_spread_initialized"] = False
-    STATE["spread_fallback_active"]     = True
-
-    # ── v1.1: daily flag resets ──────────────────────────────────────────────
-    STATE["s1d_ema_touched_today"]    = False   # S1d first-touch guard
-    STATE["s1d_fired_today"]          = False   # S1d fired guard
-    STATE["s3_sweep_candle_time"]     = None    # S3 window anchor
-    STATE["s3_sweep_low"]             = 0.0
-    STATE["s3_sweep_high"]            = 0.0
-    STATE["s3_fired_today"]           = False
-    STATE["reversal_family_occupied"] = False   # S1b/S3 reversal family
-    STATE["s1b_pending_ticket"]       = None    # safety clear on new day
-    STATE["s6_fired_today"]           = False
-    STATE["s7_fired_today"]           = False
-    # FIX: explicit daily reset for S8 flags (also reset by reset_daily_counters
-    # in state.py but logged here for audit trail)
-    STATE["s8_fired_today"]           = False
-    STATE["s8_armed"]                 = False
-    STATE["s8_arm_time"]              = None
-    STATE["s8_arm_candle_time"]       = None
-    STATE["s8_spike_candle_idx"]      = None
-    log_event("S8_DAILY_FLAGS_RESET")
+    reset_daily_state(STATE)
 
     try:
         d1_atr = get_daily_atr14()
@@ -339,9 +340,12 @@ def asian_range_job() -> None:
     if not PAPER_MODE:
         _safe_execute("s6_place_orders", place_s6_pending_orders, STATE, s6_result)
     else:
+        # CRIT-3 FIX: Guard against None candidates when ADX filter nulls one leg.
+        _s6_buy  = s6_result.get("buy_candidate")
+        _s6_sell = s6_result.get("sell_candidate")
         log_event("PAPER_MODE_S6_SKIPPED",
-                  buy_entry=s6_result["buy_candidate"]["entry_level"],
-                  sell_entry=s6_result["sell_candidate"]["entry_level"])
+                  buy_entry=_s6_buy["entry_level"] if _s6_buy else "FILTERED",
+                  sell_entry=_s6_sell["entry_level"] if _s6_sell else "FILTERED")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,11 +374,15 @@ def m15_dispatch_job() -> None:
     if not STATE.get("trading_enabled"):
         return
 
-    df = fetch_ohlcv("M15", count=3)
-    if df is None or len(df) < 2:
+    # Create shared context for this cycle
+    ctx = MarketContext(STATE)
+    ctx.refresh(tfs=["M15", "M5", "H1", "H4"])
+    
+    bar_m15 = ctx.get_last_closed_bar("M15")
+    if bar_m15 is None:
         return
 
-    bar_time = df["time"].iloc[-2]
+    bar_time = bar_m15["time"]
     if bar_time == _last_m15_time:
         return
     _last_m15_time = bar_time
@@ -410,22 +418,27 @@ def m15_dispatch_job() -> None:
 
     # ── 2. Stop hunt detection ────────────────────────────────────────────────
     if regime not in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
-        _safe_execute("s1c_detect", detect_stop_hunt, STATE)
+        _safe_execute("s1c_detect", detect_stop_hunt, STATE, context=ctx)
 
     # ── 3. S1b candle counter reset ───────────────────────────────────────────
     _safe_execute("s1b_reset", auto_reset_s1b_counter, STATE)
 
     # ── ★ S4: EMA20 touch detection (London session only, 07:00-12:00 UTC) ────
-    _safe_execute("s4_touch_check", check_s4_ema_touch, STATE)
+    _safe_execute("s4_touch_check", check_s4_ema_touch, STATE, context=ctx)
 
     # ── ★ S5: London session range tracking (07:00-12:00 UTC) ─────────────────
-    _safe_execute("s5_tracking", update_london_session_tracking, STATE)
+    _safe_execute("s5_tracking", update_london_session_tracking, STATE, context=ctx)
 
-    # ── ★ S5: Noon compression check — triggers once at 12:00 UTC ─────────────
+    # ── ★ S5: Noon compression check — triggers ONCE at 12:00 UTC ──────────────
+    # ISSUE-6 FIX: guard with s5_noon_checked_today so it fires only once per day
+    # (not up to 4x during the 12:00 UTC hour).
     import pytz as _pytz
     _now_utc = datetime.now(_pytz.utc)
-    if _now_utc.hour == 12 and not STATE.get("s5_compression_confirmed"):
+    if (_now_utc.hour == 12
+            and not STATE.get("s5_noon_checked_today")
+            and not STATE.get("s5_compression_confirmed")):
         _safe_execute("s5_noon_check", check_s5_compression_at_noon, STATE)
+        STATE["s5_noon_checked_today"] = True
 
     # ── 4. S1: London Breakout — pending order architecture ──────────────────
     if not STATE.get("trend_family_occupied") and not STATE.get("open_position"):
@@ -443,7 +456,7 @@ def m15_dispatch_job() -> None:
                     log_event("S1_PENDING_PLACED_LATE", regime=regime.value)
                 else:
                     STARVATION_TRACKER.record_evaluation()
-                    candidate = evaluate_s1_signal(STATE)
+                    candidate = evaluate_s1_signal(STATE, context=ctx)
                     if candidate:
                         STARVATION_TRACKER.record_signal()
                         _dispatch_candidate(candidate)
@@ -454,7 +467,7 @@ def m15_dispatch_job() -> None:
             and not STATE.get("trend_family_occupied")
             and not STATE.get("reversal_family_occupied")):
         STARVATION_TRACKER.record_evaluation()
-        candidate = evaluate_s1b_signal(STATE)
+        candidate = evaluate_s1b_signal(STATE, context=ctx)
         if candidate:
             STARVATION_TRACKER.record_signal()
             _dispatch_candidate(candidate)
@@ -466,7 +479,7 @@ def m15_dispatch_job() -> None:
             and not STATE.get("reversal_family_occupied")
             and not STATE.get("s3_fired_today")):
         STARVATION_TRACKER.record_evaluation()
-        candidate = evaluate_s3_signal(STATE)
+        candidate = evaluate_s3_signal(STATE, context=ctx)
         if candidate:
             STARVATION_TRACKER.record_signal()
             STATE["s3_fired_today"]           = True
@@ -477,7 +490,7 @@ def m15_dispatch_job() -> None:
     # ── 6. S2: Mean Reversion ─────────────────────────────────────────────────
     if regime == RegimeState.RANGING_CLEAR and not STATE.get("trend_family_occupied"):
         STARVATION_TRACKER.record_evaluation()
-        candidate = evaluate_s2_signal(STATE)
+        candidate = evaluate_s2_signal(STATE, context=ctx)
         if candidate:
             STARVATION_TRACKER.record_signal()
             _dispatch_candidate(candidate)
@@ -547,11 +560,15 @@ def m5_mgmt_job() -> None:
     if not STATE.get("trading_enabled"):
         return
 
-    df = fetch_ohlcv("M5", count=3)
-    if df is None or len(df) < 2:
+    # Create shared context for this cycle
+    ctx = MarketContext(STATE)
+    ctx.refresh(tfs=["M5", "H1"])  # S1d/S1e/S1f/R3/S8 all M5-based
+    
+    bar_m5 = ctx.get_last_closed_bar("M5")
+    if bar_m5 is None:
         return
 
-    bar_time = df["time"].iloc[-2]
+    bar_time = bar_m5["time"]
     if bar_time == _last_m5_time:
         return
     _last_m5_time = bar_time
@@ -568,7 +585,7 @@ def m5_mgmt_job() -> None:
     if STATE.get("s8_open_ticket"):
         _safe_execute("s8_mgmt", manage_s8_position, STATE)
     elif not STATE.get("s8_fired_today"):
-        s8_candidate = evaluate_s8_signal(STATE)
+        s8_candidate = evaluate_s8_signal(STATE, context=ctx)
         if s8_candidate:
             ks_permitted, ks_reason = run_pre_trade_kill_switches(STATE)
             if ks_permitted:
@@ -589,7 +606,7 @@ def m5_mgmt_job() -> None:
 
     # ── ★ 5. R3: Attempt to arm on this M5 close ─────────────────────────────
     if not STATE.get("r3_fired_today"):
-        _safe_execute("r3_arm", arm_r3_if_ready, STATE)
+        _safe_execute("r3_arm", arm_r3_if_ready, STATE, context=ctx)
 
     # ── ★ 6. R3: Check if broker closed the R3 position (SL or TP hit) ────────
     if STATE.get("r3_open_ticket"):
@@ -602,7 +619,7 @@ def m5_mgmt_job() -> None:
 
     # ── ★ 8. R3: Signal evaluation (fires market order if all gates pass) ──────
     if STATE.get("r3_armed") and not STATE.get("r3_open_ticket"):
-        candidate = evaluate_r3_signal(STATE)
+        candidate = evaluate_r3_signal(STATE, context=ctx)
         if candidate:
             if not PAPER_MODE:
                 _dispatch_candidate(candidate)
@@ -614,11 +631,11 @@ def m5_mgmt_job() -> None:
     # ── 9. Main trend family position management (unchanged) ─────────────────
     if not STATE.get("open_position"):
         if STATE.get("trend_family_occupied"):
-            _evaluate_addon_signals()
+            _evaluate_addon_signals(context=ctx)
         return
 
     validate_state_keys(STATE)
-    action_dict = manage_open_position(STATE)
+    action_dict = manage_open_position(STATE, context=ctx)
     action      = action_dict.get("action", "NONE")
 
     if action == "NONE":
@@ -632,7 +649,7 @@ def m5_mgmt_job() -> None:
         _safe_execute("be_activation", _execute_be_activation)
     elif action == "CYCLE_EXIT":
         _safe_execute("cycle_exit", _execute_cycle_exit)
-        _safe_execute("s1d_reentry", _evaluate_addon_signals)
+        _safe_execute("s1d_reentry", _evaluate_addon_signals, context=ctx)
     elif action == "S2_FORCE_EXIT":
         _safe_execute("s2_exit", _execute_s2_force_exit)
 
@@ -916,12 +933,12 @@ def _check_for_s7_pending_fill() -> None:
 # POSITION MANAGEMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _evaluate_addon_signals() -> None:
-    candidate = evaluate_s1d_reentry(STATE)
+def _evaluate_addon_signals(context: 'MarketContext' = None) -> None:
+    candidate = evaluate_s1d_reentry(STATE, context=context)
     if candidate:
         _dispatch_candidate(candidate)
         return
-    candidate = evaluate_s1e_pyramid(STATE)
+    candidate = evaluate_s1e_pyramid(STATE, context=context)
     if candidate:
         _dispatch_candidate(candidate)
 
@@ -1466,8 +1483,16 @@ def main():
             log_event("STARTUP_REGIME_BOOTSTRAPPED",
                       regime=STATE.get("current_regime"))
         else:
+            # MED-2 FIX: Block new entries during warm-up period.
+            # On cold start, regime is computed from stale bars — trades taken
+            # in the first few readings may be classified under wrong regime.
+            warm_up_minutes = 15
+            STATE["regime_cold_start_until"] = (
+                datetime.now(pytz.utc) + __import__('datetime').timedelta(minutes=warm_up_minutes)
+            )
             log_event("STARTUP_BOOTSTRAP_PARTIAL",
-                      note="Needs 1-2 live regime readings, max 30 min wait")
+                      note=f"Needs 1-2 live regime readings. New entries blocked for {warm_up_minutes}min.",
+                      cold_start_until=STATE["regime_cold_start_until"].isoformat())
 
     except ConnectionError as e:
         log_critical("STARTUP_MT5_FAILED", error=str(e))
@@ -1524,10 +1549,25 @@ def main():
     print(f"Scheduler running — {len(scheduler.get_jobs())} jobs active.")
     print("Press Ctrl+C to stop.")
 
+    # INFRA-2 FIX: Register SIGTERM handler so `kill` triggers graceful shutdown.
+    def _graceful_shutdown_handler(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _graceful_shutdown_handler)
+
     # ── Main loop — heartbeat every 5 min ────────────────────────────────────
     try:
         while True:
             time.sleep(300)
+
+            # INFRA-1 FIX: Write heartbeat file for external watchdog.
+            # Watchdog checks file age — if > 10 min, system is dead.
+            try:
+                _hb_path = os.path.join(os.path.dirname(__file__), "logs", "heartbeat")
+                with open(_hb_path, "w") as _hb:
+                    _hb.write(datetime.now(pytz.utc).isoformat())
+            except Exception:
+                pass  # Heartbeat failure must never crash the system
+
             if STATE.get("trading_enabled"):
                 log_event("SYSTEM_ALIVE",
                           regime=STATE["current_regime"],
