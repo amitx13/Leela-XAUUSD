@@ -160,6 +160,7 @@ def build_initial_state() -> dict:
         "s7_fired_today":               False,
         "s7_daily_atr":                 0.0,
         "high_corr_pairs":              [],
+        "reconcile_ghost_streak":       0,   # consecutive reconcile passes seeing ghost tickets
 
         # ── S8 ATR Spike Trade (F7) — signal/arm state ─────────────────────────
         "s8_armed":                     False,
@@ -356,6 +357,7 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "s7_fired_today":               bool,
     "s7_daily_atr":                 float,
     "high_corr_pairs":              list,
+    "reconcile_ghost_streak":       int,
 
     # S8 signal/arm state (F7)
     "s8_armed":                     bool,
@@ -410,14 +412,16 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
 
 def validate_state_keys(state: dict) -> None:
     for key, expected_type in REQUIRED_STATE_KEYS.items():
-        assert key in state, (
-            f"STATE_KEY_MISSING: '{key}' not found in state. "
-            f"Add it to both build_initial_state() and REQUIRED_STATE_KEYS."
-        )
-        assert isinstance(state[key], expected_type), (
-            f"STATE_TYPE_ERROR: '{key}' expected {expected_type}, "
-            f"got {type(state[key]).__name__} = {state[key]!r}"
-        )
+        if key not in state:
+            raise KeyError(
+                f"STATE_KEY_MISSING: '{key}' not found in state. "
+                f"Add it to both build_initial_state() and REQUIRED_STATE_KEYS."
+            )
+        if not isinstance(state[key], expected_type):
+            raise TypeError(
+                f"STATE_TYPE_ERROR: '{key}' expected {expected_type}, "
+                f"got {type(state[key]).__name__} = {state[key]!r}"
+            )
     extra_keys = set(state.keys()) - set(REQUIRED_STATE_KEYS.keys())
     if extra_keys:
         log_event("STATE_EXTRA_KEYS_WARNING",

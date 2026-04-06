@@ -162,7 +162,16 @@ def reconcile_live_positions(state: dict) -> None:
         # 3. Ghost positions: we think open, MT5 says closed
         ghosts = believed_tickets - live_tickets
         if ghosts:
-            # Enhanced ghost analysis with recovery suggestions
+            streak = int(state.get("reconcile_ghost_streak", 0) or 0) + 1
+            state["reconcile_ghost_streak"] = streak
+            log_warning("GHOST_POSITIONS_DETECTED_PASS",
+                        ghost_count=len(ghosts),
+                        streak=streak,
+                        ghost_tickets=list(ghosts))
+            if streak < 2:
+                return
+
+            # Enhanced ghost analysis with recovery suggestions (2 consecutive passes)
             ghost_details = []
             for ticket in ghosts:
                 details = position_details.get(ticket, {"lane": "unknown", "source": "unknown"})
@@ -172,7 +181,7 @@ def reconcile_live_positions(state: dict) -> None:
                     "source": details["source"],
                     "possible_causes": ["stop_out", "margin_call", "manual_close", "broker_error"]
                 })
-            
+
             log_critical("GHOST_POSITIONS_DETECTED_ENHANCED",
                         ghost_count=len(ghosts),
                         ghost_tickets=list(ghosts),
@@ -180,13 +189,14 @@ def reconcile_live_positions(state: dict) -> None:
                         live_tickets=list(live_tickets),
                         believed_tickets=list(believed_tickets),
                         recovery_action="EMERGENCY_SHUTDOWN_REQUIRED")
-            
+
             send_ks_alert("EMERGENCY_SHUTDOWN",
                           f"CRITICAL: Ghost positions detected! System thinks {len(ghosts)} positions are open but broker shows none. "
                           f"Ghost tickets: {ghosts}. "
                           f"Immediate system shutdown to prevent state corruption. "
                           f"Manual investigation required before restart.")
-            
+
+            state["reconcile_ghost_streak"] = 0
             emergency_shutdown("GHOST_POSITIONS_DETECTED_ENHANCED", state)
             return
         
@@ -248,6 +258,9 @@ def reconcile_live_positions(state: dict) -> None:
                         note="Other EAs or manual trades with different magic numbers")
         
         # 7. Final reconciliation status
+        if not ghosts:
+            state["reconcile_ghost_streak"] = 0
+
         log_event("RECONCILIATION_COMPLETE_ENHANCED",
                   total_live_positions=len(live_tickets),
                   total_system_positions=len(believed_tickets),
@@ -318,11 +331,16 @@ def initialize_system(state: dict) -> None:
     restore_critical_state(state)
     _reconcile_position_manager_from_db()
 
-    # 4. Live equity sync
+    # 4. Live equity sync + backfill KS3/KS5 denominators if still zero (Day-1 / missed midnight)
     info = mt5.account_info()
     if info:
         equity = float(info.equity)
         state["current_equity"] = equity
+        if equity > 0:
+            if float(state.get("equity_at_day_start") or 0) <= 0:
+                state["equity_at_day_start"] = equity
+            if float(state.get("equity_at_week_start") or 0) <= 0:
+                state["equity_at_week_start"] = equity
         update_peak_equity(state)
         log_event("EQUITY_SYNCED_AT_STARTUP",
                   balance=round(info.balance, 2),
@@ -707,6 +725,12 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
     Sunday skip handled by caller (midnight_reset_job).
     No KS2 check: placed off-hours, fills during active London/NY sessions.
     """
+    from engines.risk_engine import run_pre_trade_kill_switches
+    ks_stack_ok, ks_stack_reason = run_pre_trade_kill_switches(state)
+    if not ks_stack_ok:
+        log_event("S7_PENDING_BLOCKED_KILL_SWITCH", reason=ks_stack_reason)
+        return
+
     ks7_ok, ks7_reason = check_ks7_event_blackout(state)
     if not ks7_ok:
         log_event("KS7_BLOCKED_NEW_PLACEMENT", reason=ks7_reason, path="place_s7_pending")

@@ -30,8 +30,8 @@ def can_open(strategy_id: str, direction: str, lot_size: float,
       3. strategy already has open position
       4. breakout family same-direction exposure cap
 
-    NOTE: MAX_SESSION_LOTS is NOT checked here — it is enforced by
-    check_portfolio_risk() in risk_engine.py before every order placement.
+    NOTE: Session lot cap is NOT checked here — it is enforced by
+    engines.portfolio_risk.check_portfolio_risk before every order placement.
     """
     # Only primary trend entries compete for trend_family_occupied.
     # S1d/S1e are add-ons while an S1-family core trade is already open.

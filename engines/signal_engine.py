@@ -480,10 +480,12 @@ def evaluate_s1_signal(state: dict, context: 'MarketContext' = None) -> dict | N
         return None
 
 
-    # LOOP-1 FIX: ATR-based stop buffer instead of thin range-percentage.
-    # 0.3× H1 ATR or minimum 5 points — prevents noise wicks from clipping stops.
+    # LOOP-1 FIX: ATR-based stop buffer; hard floor in points so ATR=0 never yields sub-spread stops.
     atr_h1 = state.get("last_atr_h1_raw", 0.0)
-    stop_buffer = max(atr_h1 * 0.3, 5.0) if atr_h1 > 0 else rs * 0.15
+    _pt = config.CONTRACT_SPEC.get("point", 0.01)
+    _min_buf = config.S1_STOP_BUFFER_MIN_POINTS * _pt
+    base_buf = max(atr_h1 * 0.3, 5.0) if atr_h1 > 0 else rs * 0.15
+    stop_buffer = max(base_buf, _min_buf)
 
     if direction == "LONG":
         entry = rh + threshold
@@ -644,9 +646,11 @@ def evaluate_s1b_signal(state: dict, context: 'MarketContext' = None) -> dict | 
 
 
     # ISSUE-5 FIX: Apply ATR-based stop buffer matching S1 (LOOP-1 fix).
-    # Fixed rs*0.10 on a 20pt range = 2pt stop — wiped by spread alone.
     atr_h1_s1b = state.get("last_atr_h1_raw", 0.0)
-    stop_buffer_s1b = max(atr_h1_s1b * 0.3, 5.0) if atr_h1_s1b > 0 else rs * 0.15
+    _pt = config.CONTRACT_SPEC.get("point", 0.01)
+    _min_buf = config.S1_STOP_BUFFER_MIN_POINTS * _pt
+    base_buf = max(atr_h1_s1b * 0.3, 5.0) if atr_h1_s1b > 0 else rs * 0.15
+    stop_buffer_s1b = max(base_buf, _min_buf)
 
     if direction == "LONG":
         entry = rh + bd
@@ -808,13 +812,6 @@ def evaluate_s1d_reentry(state: dict, context: 'MarketContext' = None) -> dict |
     session = get_current_session()
     if session not in ("LONDON", "LONDON_NY_OVERLAP"):
         return None
-
-    # OPT-3.7: ADX Gate for Pyramids
-    # Do not add to positions if trend is weakening (ADX < 25)
-    adx_h4 = state.get("last_adx_h4", 0.0)
-    if adx_h4 < 25:
-        return None
-
 
     ema20 = get_ema20_m5(context=context)
     if ema20 is None:
@@ -2090,12 +2087,10 @@ def manage_s8_position(state: dict) -> None:
     # ── Position closed by SL/TP on broker side? ──────────────────────────────
     if not positions:
         log_event("S8_POSITION_CLOSED_BROKER", ticket=ticket)
-        deals = mt5_s8.history_deals_get(position=ticket) or []
-        exit_price = state.get("s8_entry_price", 0.0)
-        for d in deals:
-            if d.entry == mt5_s8.DEAL_ENTRY_OUT:
-                exit_price = d.price
-                break
+        from utils.mt5_client import get_exit_price_from_deal_history
+        exit_price = get_exit_price_from_deal_history(mt5_s8, ticket)
+        if exit_price is None:
+            exit_price = state.get("s8_entry_price", 0.0)
         # Deferred import to avoid circular dependency
         from engines.execution_engine import on_trade_closed
         on_trade_closed(ticket, exit_price, "S8_BROKER_CLOSE", state)
@@ -2145,9 +2140,15 @@ def _on_s8_closed(state: dict) -> None:
     state["s8_open_time_utc"]       = None
 
 
+def _partial_exit_r_for_state(state: dict) -> float:
+    if state.get("trend_family_strategy") == SignalType.S2_MEAN_REV.value:
+        return config.PARTIAL_EXIT_R_S2
+    return config.PARTIAL_EXIT_R
+
+
 def check_partial_exit_condition(state: dict) -> bool:
     """
-    WEAK_TRENDING hybrid exit: partial close 50% at 1.0R.
+    WEAK_TRENDING hybrid exit: partial close 50% at R threshold (S2 uses earlier partial).
     Returns True when condition is met and partial not yet done.
     Execution engine handles the actual close.
     """
@@ -2172,7 +2173,7 @@ def check_partial_exit_condition(state: dict) -> bool:
 
 
     r_now = calculate_r_multiple(entry, pos.price_current, stop_original, direction)
-    return r_now >= config.PARTIAL_EXIT_R  # EXP-3 FIX: was hardcoded 1.0, now uses config (2.0)
+    return r_now >= _partial_exit_r_for_state(state)
 
 
 
@@ -2324,12 +2325,21 @@ def manage_open_position(state: dict, context: 'MarketContext' = None) -> dict: 
       "S2_FORCE_EXIT"  — S2 regime-change exit
       "S1D_REENTRY"    — candidate dict for S1d re-entry after cycle exit
     """
-    # S2 does not use trend_family_occupied — still needs regime-based exit.
+    # S2: regime exit + earlier partial (0.8R) + BE + ATR trail (1.5× vs trend 2.5×)
     if (state.get("open_position")
             and state.get("trend_family_strategy") == SignalType.S2_MEAN_REV.value):
         if check_s2_regime_exit(state):
             log_event("S2_REGIME_CHANGE_EXIT")
             return {"action": "S2_FORCE_EXIT"}
+        if not state.get("position_partial_done"):
+            if check_partial_exit_condition(state):
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy="S2_MEAN_REV",
+                          r_threshold=_partial_exit_r_for_state(state))
+                return {"action": "PARTIAL_EXIT"}
+        if not state.get("position_be_activated"):
+            if check_be_activation_condition(state):
+                log_event("BE_ACTIVATION_TRIGGERED", strategy="S2_MEAN_REV")
+                return {"action": "ACTIVATE_BE"}
         return {"action": "NONE"}
 
     if not state.get("trend_family_occupied"):
@@ -2353,7 +2363,8 @@ def manage_open_position(state: dict, context: 'MarketContext' = None) -> dict: 
         # Partial exit for S4/S5 in WEAK regime
         if regime == RegimeState.WEAK_TRENDING:
             if check_partial_exit_condition(state):
-                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy, r_threshold=config.PARTIAL_EXIT_R)
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy,
+                          r_threshold=_partial_exit_r_for_state(state))
                 return {"action": "PARTIAL_EXIT"}
         return {"action": "NONE"}
 
@@ -2365,7 +2376,8 @@ def manage_open_position(state: dict, context: 'MarketContext' = None) -> dict: 
                 return {"action": "ACTIVATE_BE"}
         if not state.get("position_partial_done"):
             if check_partial_exit_condition(state):
-                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy, r_threshold=config.PARTIAL_EXIT_R)
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy,
+                          r_threshold=_partial_exit_r_for_state(state))
                 return {"action": "PARTIAL_EXIT"}
         return {"action": "NONE"}
 
@@ -2378,7 +2390,7 @@ def manage_open_position(state: dict, context: 'MarketContext' = None) -> dict: 
 
     elif regime == RegimeState.WEAK_TRENDING:
         if check_partial_exit_condition(state):
-            log_event("PARTIAL_EXIT_TRIGGERED", r_threshold=config.PARTIAL_EXIT_R)
+            log_event("PARTIAL_EXIT_TRIGGERED", r_threshold=_partial_exit_r_for_state(state))
             return {"action": "PARTIAL_EXIT"}
         if check_be_activation_condition(state):
             log_event("BE_ACTIVATION_TRIGGERED")

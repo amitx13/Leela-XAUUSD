@@ -348,7 +348,7 @@ def update_peak_equity(state: dict, live_equity: float | None = None) -> None:
 # ANALYTICS (Truth Engine queries — used by risk engine + weekly review)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_weekly_net_pnl_pct() -> float:
+def get_weekly_net_pnl_pct(state: dict | None = None) -> float:
     """Net P&L as % for the current calendar week (Mon–Sun IST)."""
     rows = execute_query(
         """SELECT SUM(pnl_net_dollars) as weekly_pnl
@@ -366,9 +366,9 @@ def get_weekly_net_pnl_pct() -> float:
         return 0.0
 
     # HIGH-4 FIX: Use start-of-week equity to prevent KS5 drift.
-    # Current equity denominator understates drawdown after partial recovery.
-    from main import STATE
-    week_start_equity = STATE.get("equity_at_week_start", float(info.equity))
+    week_start_equity = 0.0
+    if state is not None:
+        week_start_equity = float(state.get("equity_at_week_start") or 0.0)
     if week_start_equity <= 0:
         week_start_equity = float(info.equity)
 

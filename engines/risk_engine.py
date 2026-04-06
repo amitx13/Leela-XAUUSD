@@ -12,7 +12,7 @@ Fixes implemented:
   v1.1   — KS4 uses 5-trade countdown (not live streak check)
   v1.1   — KS2 uses 24h spread baseline (not session avg)
   v1.1   — Added gates for S1b/S3 reversal family, S6, S7
-  v1.1   — Added check_portfolio_risk() Portfolio Risk Brain gate
+  v1.1   — Portfolio Risk Brain: engines.portfolio_risk (wrapper below for imports)
 
 Kill switches KS1–KS7:
   KS1    Trade-level hard stop (placed before fill, never moved against)
@@ -393,10 +393,14 @@ def calculate_r_multiple(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def calculate_atr_trail(current_price: float, direction: str) -> float | None:
+def calculate_atr_trail(
+    current_price: float,
+    direction: str,
+    atr_multiplier: float | None = None,
+) -> float | None:
     """
     ATR trailing stop on M15 using Wilder's RMA (pinned — matches TV + MT5).
-    Multiplier: 1.5× ATR(14, M15).
+    Multiplier: config.ATR_TRAIL_MULTIPLIER by default; S2 uses ATR_TRAIL_MULTIPLIER_S2.
 
     Activation rule (spec Part 7 — WEAK_TRENDING hybrid exit):
     Trail activates only AFTER breakeven is activated.
@@ -410,8 +414,8 @@ def calculate_atr_trail(current_price: float, direction: str) -> float | None:
         log_warning("ATR_TRAIL_CALC_FAILED_NO_ATR")
         return None
 
-
-    trail_distance = atr_m15 * config.ATR_TRAIL_MULTIPLIER   # 1.5×
+    mult = config.ATR_TRAIL_MULTIPLIER if atr_multiplier is None else atr_multiplier
+    trail_distance = atr_m15 * mult
 
 
     if direction == "LONG":
@@ -620,7 +624,7 @@ def check_ks5_weekly_loss(state: dict) -> tuple[bool, str]:
     Below KS5_WEEKLY_LOSS_LIMIT_PCT (tighter on Fridays) → halt + email.
     Requires MANUAL restart (unlike KS3 which auto-resets).
     """
-    weekly_pnl = get_weekly_net_pnl_pct()
+    weekly_pnl = get_weekly_net_pnl_pct(state)
     state["weekly_net_pnl_pct"] = weekly_pnl
 
     # OPT-1.7: KS5 Day-of-Week Awareness
@@ -827,6 +831,10 @@ def run_pre_trade_kill_switches(state: dict) -> tuple[bool, str]:
     """
     if not state["trading_enabled"]:
         return False, f"TRADING_DISABLED_{state.get('shutdown_reason', 'UNKNOWN')}"
+
+    mt5_info = get_mt5().account_info()
+    if mt5_info is None or float(getattr(mt5_info, "equity", 0) or 0) <= 0:
+        return False, "BROKER_ACCOUNT_UNAVAILABLE"
 
     # MED-2 FIX: Gate new entries during cold-start regime warm-up.
     # Existing positions are managed as normal, but new ones are blocked.
@@ -1050,73 +1058,17 @@ def can_s7_fire(state: dict) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PORTFOLIO RISK BRAIN — v1.1 (CHANGE 7)
+# PORTFOLIO RISK BRAIN — single implementation in engines.portfolio_risk
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def check_portfolio_risk(candidate: dict, state: dict) -> tuple[bool, str]:
     """
-    v1.1 Portfolio Risk Brain — duplicate of portfolio_risk.check_portfolio_risk;
-    main path uses engines.portfolio_risk. Kept for reference / tests.
-
-    Gate 1 — MAX_SESSION_LOTS (0.15).
-    Gate 2 — MAX_DAILY_VAR_PCT (2%).
-
-    Returns (permitted, reason).
+    Delegates to engines.portfolio_risk.check_portfolio_risk (VAR, dynamic session
+    lot cap, correlation). Kept so any legacy import from risk_engine still works.
     """
-    mt5  = get_mt5()
-    info = mt5.account_info()
-
-    if info is None:
-        log_warning("PORTFOLIO_RISK_ACCOUNT_INFO_FAILED")
-        return True, "OK"   # can't check → don't block
-
-
-    equity = float(info.equity)
-    spec   = config.CONTRACT_SPEC
-
-    # ── Gate 1: MAX_SESSION_LOTS ─────────────────────────────────────────────
-    positions    = mt5.positions_get(symbol=config.SYMBOL)
-    our_positions = [p for p in (positions or [])
-                     if p.magic == config.MAGIC]
-    current_lots  = sum(p.volume for p in our_positions)
-    new_lots      = candidate.get("lot_size", 0.0)
-
-    if current_lots + new_lots > config.MAX_SESSION_LOTS:
-        log_event("PORTFOLIO_MAX_SESSION_LOTS_BLOCKED",
-                  current_lots=round(current_lots, 3),
-                  new_lots=round(new_lots, 3),
-                  limit=config.MAX_SESSION_LOTS)
-        return False, "PORTFOLIO_MAX_SESSION_LOTS_EXCEEDED"
-
-
-    # ── Gate 2: MAX_DAILY_VAR_PCT ─────────────────────────────────────────────
-    entry_level = candidate.get("entry_level", 0.0)
-    stop_level  = candidate.get("stop_level", 0.0)
-    stop_dist   = abs(entry_level - stop_level)
-
-    tick_size  = spec.get("tick_size", 0.01)
-    tick_value = spec.get("tick_value", 1.0)
-
-    if tick_size > 0 and tick_value > 0 and equity > 0 and stop_dist > 0:
-        ticks_in_stop  = stop_dist / tick_size
-        trade_risk_usd = ticks_in_stop * tick_value * new_lots
-        risk_pct       = trade_risk_usd / equity
-
-        if risk_pct > config.MAX_DAILY_VAR_PCT:
-            log_event("PORTFOLIO_MAX_DAILY_VAR_BLOCKED",
-                      risk_pct=round(risk_pct, 4),
-                      limit=config.MAX_DAILY_VAR_PCT,
-                      trade_risk_usd=round(trade_risk_usd, 2))
-            return False, "PORTFOLIO_MAX_DAILY_VAR_EXCEEDED"
-
-
-    log_event("PORTFOLIO_RISK_PASSED",
-              current_lots=round(current_lots, 3),
-              new_lots=round(new_lots, 3),
-              daily_pnl_pct=round(state.get("daily_net_pnl_pct", 0.0), 4))
-
-    return True, "OK"
+    from engines.portfolio_risk import check_portfolio_risk as _portfolio_gate
+    return _portfolio_gate(candidate, state)
 
 
 

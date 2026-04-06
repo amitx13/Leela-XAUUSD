@@ -383,13 +383,9 @@ def check_r3_closed_by_broker(state: dict) -> None:
     if r3_ticket in open_tickets:
         return  # Still open — no action
 
-    # Position is gone from MT5 — find exit price from deal history
-    deals      = mt5.history_deals_get(position=r3_ticket) or []
-    exit_price = None
-    for d in deals:
-        if d.entry == mt5.DEAL_ENTRY_OUT:
-            exit_price = d.price
-            break
+    # Position is gone from MT5 — find exit price from deal history (bounded window)
+    from utils.mt5_client import get_exit_price_from_deal_history
+    exit_price = get_exit_price_from_deal_history(mt5, r3_ticket)
 
     if exit_price is None:
         tick       = mt5.symbol_info_tick(config.SYMBOL)

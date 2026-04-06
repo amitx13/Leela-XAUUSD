@@ -10,6 +10,9 @@ Architecture note:
   host/port set in config.py and read from .env.
 """
 import time
+from datetime import datetime, timedelta
+
+import pytz
 from mt5linux import MetaTrader5
 import config
 from utils.logger import log_event, log_critical
@@ -77,3 +80,28 @@ def reset_mt5_connection() -> None:
     global _mt5
     _mt5 = None
     log_event("MT5_CONNECTION_RESET")
+
+
+def get_exit_price_from_deal_history(mt5: MetaTrader5, position_ticket: int,
+                                     days: int = 90) -> float | None:
+    """
+    Last OUT deal price for position_ticket within [now-days, now].
+    history_deals_get(position=...) without a window can miss deals on busy accounts;
+    bounded query keeps exit PnL / R-multiple stats correct.
+    """
+    date_to   = datetime.now(pytz.utc)
+    date_from = date_to - timedelta(days=days)
+    deals     = mt5.history_deals_get(date_from, date_to)
+    if deals is None or len(deals) == 0:
+        return None
+    outs = []
+    for d in deals:
+        pid = getattr(d, "position_id", None)
+        if pid is None:
+            pid = getattr(d, "position", None)
+        if pid is not None and int(pid) == int(position_ticket):
+            if d.entry == mt5.DEAL_ENTRY_OUT:
+                outs.append(d)
+    if not outs:
+        return None
+    return float(outs[-1].price)

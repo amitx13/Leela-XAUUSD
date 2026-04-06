@@ -10,6 +10,7 @@ Scheduled jobs:
   2.  regime_job           — every 15 min
   3.  spread_logger_job    — every 5 min
   4.  tlt_macro_job        — 09:00 IST daily
+  4b. tlt_macro_job_utc    — 09:30 UTC daily (post-US-open macro refresh)
   5.  calendar_job         — 00:01 IST daily (G1 Fix)
   6.  midnight_reset_job   — 00:00 IST daily (KS3 + S7 orders)
   7.  m15_dispatch_job     — every 1 min (M15 candle detection)
@@ -273,46 +274,47 @@ def midnight_reset_job() -> None:
     """
     log_event("JOB_START", job="midnight_reset")
 
-    # KS3 auto-reset
-    if not STATE.get("trading_enabled") and STATE.get("shutdown_reason", "").startswith("KS3"):
-        STATE["trading_enabled"] = True
-        STATE["shutdown_reason"] = None
-        log_event("KS3_AUTO_RESET_MIDNIGHT")
+    with STATE_LOCK:
+        # KS3 auto-reset
+        if not STATE.get("trading_enabled") and STATE.get("shutdown_reason", "").startswith("KS3"):
+            STATE["trading_enabled"] = True
+            STATE["shutdown_reason"] = None
+            log_event("KS3_AUTO_RESET_MIDNIGHT")
 
-    reset_daily_state(STATE)
+        reset_daily_state(STATE)
 
-    try:
-        d1_atr = get_daily_atr14()
-        if d1_atr is not None:
-            STATE["d1_atr_14"] = d1_atr
-            log_event("D1_ATR14_COMPUTED", value=round(d1_atr, 2))
-        else:
-            log_warning("D1_ATR14_UNAVAILABLE", note="S5 will skip compression today")
-    except Exception as _e:
-        log_warning("D1_ATR14_COMPUTE_ERROR", error=str(_e))
-
-    # ── S7: Daily Structure pending orders (v1.1: Sunday skip) ──────────────
-    if datetime.now(pytz.utc).weekday() == 6:   # 6 = Sunday, MT5 not open
-        log_event("S7_SKIPPED_SUNDAY_PREMARKET")
-    else:
-        s7_result = evaluate_s7_signal(STATE)
-        if s7_result:
-            if not PAPER_MODE:
-                _safe_execute("s7_place_orders", place_s7_pending_orders, STATE, s7_result)
+        try:
+            d1_atr = get_daily_atr14()
+            if d1_atr is not None:
+                STATE["d1_atr_14"] = d1_atr
+                log_event("D1_ATR14_COMPUTED", value=round(d1_atr, 2))
             else:
-                log_event("PAPER_MODE_S7_SKIPPED",
-                          buy_entry=s7_result["buy_candidate"]["entry_level"],
-                          sell_entry=s7_result["sell_candidate"]["entry_level"])
+                log_warning("D1_ATR14_UNAVAILABLE", note="S5 will skip compression today")
+        except Exception as _e:
+            log_warning("D1_ATR14_COMPUTE_ERROR", error=str(_e))
 
-    # ── Phase 1A: Starvation daily summary + reset ──────────────────────────
-    _safe_execute("starvation_daily", STARVATION_TRACKER.daily_summary)
-    STARVATION_TRACKER.reset()
+        # ── S7: Daily Structure pending orders (v1.1: Sunday skip) ────────────
+        if datetime.now(pytz.utc).weekday() == 6:   # 6 = Sunday, MT5 not open
+            log_event("S7_SKIPPED_SUNDAY_PREMARKET")
+        else:
+            s7_result = evaluate_s7_signal(STATE)
+            if s7_result:
+                if not PAPER_MODE:
+                    _safe_execute("s7_place_orders", place_s7_pending_orders, STATE, s7_result)
+                else:
+                    log_event("PAPER_MODE_S7_SKIPPED",
+                              buy_entry=s7_result["buy_candidate"]["entry_level"],
+                              sell_entry=s7_result["sell_candidate"]["entry_level"])
 
-    # ── Phase 1A: Edge decay daily check ─────────────────────────────────────
-    _safe_execute("edge_decay_daily", daily_edge_check)
+        # ── Phase 1A: Starvation daily summary + reset ────────────────────────
+        _safe_execute("starvation_daily", STARVATION_TRACKER.daily_summary)
+        STARVATION_TRACKER.reset()
 
-    log_event("MIDNIGHT_RESET_COMPLETE",
-              date=datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat())
+        # ── Phase 1A: Edge decay daily check ──────────────────────────────────
+        _safe_execute("edge_decay_daily", daily_edge_check)
+
+        log_event("MIDNIGHT_RESET_COMPLETE",
+                  date=datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,9 +373,6 @@ def m15_dispatch_job() -> None:
     """
     global _last_m15_time, _prev_session
 
-    if not STATE.get("trading_enabled"):
-        return
-
     # Create shared context for this cycle
     ctx = MarketContext(STATE)
     ctx.refresh(tfs=["M15", "M5", "H1", "H4"])
@@ -401,13 +400,7 @@ def m15_dispatch_job() -> None:
     check_and_fire_london_time_kill(STATE)
     check_and_fire_ny_time_kill(STATE)
 
-    if not STATE.get("trading_enabled"):
-        return
-
-    regime = get_safe_regime(STATE)
-
-    # ── ★ S4/S5 Hard exits (checked every M15 close, before new signals) ─────
-    # These must run regardless of trading_enabled for trend kills
+    # ── ★ S4/S5 Hard exits — must run even when trading is halted (KS3/KS5) ───
     if check_s4_hard_exit(STATE):
         _safe_execute("s4_hard_exit", _execute_generic_market_close,
                       STATE.get("open_position"), "S4_HARD_EXIT_16UTC")
@@ -415,6 +408,11 @@ def m15_dispatch_job() -> None:
     if check_s5_hard_exit(STATE):
         _safe_execute("s5_hard_exit", _execute_generic_market_close,
                       STATE.get("open_position"), "S5_HARD_EXIT_22UTC")
+
+    if not STATE.get("trading_enabled"):
+        return
+
+    regime = get_safe_regime(STATE)
 
     # ── 2. Stop hunt detection ────────────────────────────────────────────────
     if regime not in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
@@ -557,13 +555,12 @@ def m5_mgmt_job() -> None:
     """
     global _last_m5_time
 
-    if not STATE.get("trading_enabled"):
-        return
+    _trading = STATE.get("trading_enabled", True)
 
     # Create shared context for this cycle
     ctx = MarketContext(STATE)
     ctx.refresh(tfs=["M5", "H1"])  # S1d/S1e/S1f/R3/S8 all M5-based
-    
+
     bar_m5 = ctx.get_last_closed_bar("M5")
     if bar_m5 is None:
         return
@@ -573,18 +570,16 @@ def m5_mgmt_job() -> None:
         return
     _last_m5_time = bar_time
 
-    # ── 1-4. Existing fill detection (unchanged) ─────────────────────────────
+    # ── 1–4. Broker sync + pending fills (always — even when trading halted) ─
     _check_for_closed_positions()
     _check_for_s1_pending_fill()
     _check_for_s6_pending_fill()
     _check_for_s7_pending_fill()
 
-    # ── 4.5 S8: Independent position lane (Change 6.2) ───────────────────────
-    # Management takes priority over evaluation (elif ensures mutual exclusion).
-    # Gate is now s8_open_ticket (not trend_family_occupied — S8 is independent).
+    # ── 4.5 S8: manage open always; new S8 only when trading enabled ──────────
     if STATE.get("s8_open_ticket"):
         _safe_execute("s8_mgmt", manage_s8_position, STATE)
-    elif not STATE.get("s8_fired_today"):
+    elif _trading and not STATE.get("s8_fired_today"):
         s8_candidate = evaluate_s8_signal(STATE, context=ctx)
         if s8_candidate:
             ks_permitted, ks_reason = run_pre_trade_kill_switches(STATE)
@@ -604,21 +599,20 @@ def m5_mgmt_job() -> None:
                 )
                 log_event("S8_BLOCKED_BY_KS", reason=ks_reason)
 
-    # ── ★ 5. R3: Attempt to arm on this M5 close ─────────────────────────────
-    if not STATE.get("r3_fired_today"):
+    # ── ★ 5. R3: arm only when new entries allowed ─────────────────────────────
+    if _trading and not STATE.get("r3_fired_today"):
         _safe_execute("r3_arm", arm_r3_if_ready, STATE, context=ctx)
 
-    # ── ★ 6. R3: Check if broker closed the R3 position (SL or TP hit) ────────
+    # ── ★ 6–7. R3: broker close + hard exit (always) ──────────────────────────
     if STATE.get("r3_open_ticket"):
         _safe_execute("r3_close_check", check_r3_closed_by_broker, STATE)
 
-    # ── ★ 7. R3: Hard exit check (30-min hold limit) ──────────────────────────
     if STATE.get("r3_open_ticket"):
         if check_r3_hard_exit(STATE):
             _safe_execute("r3_hard_exit", execute_r3_hard_exit, STATE)
 
-    # ── ★ 8. R3: Signal evaluation (fires market order if all gates pass) ──────
-    if STATE.get("r3_armed") and not STATE.get("r3_open_ticket"):
+    # ── ★ 8. R3: new entry only when trading enabled ─────────────────────────
+    if _trading and STATE.get("r3_armed") and not STATE.get("r3_open_ticket"):
         candidate = evaluate_r3_signal(STATE, context=ctx)
         if candidate:
             if not PAPER_MODE:
@@ -628,9 +622,9 @@ def m5_mgmt_job() -> None:
                           direction=candidate.get("direction"),
                           entry=candidate.get("entry_level"))
 
-    # ── 9. Main trend family position management (unchanged) ─────────────────
+    # ── 9–10. Trend position management + addons (addons only if trading on) ─
     if not STATE.get("open_position"):
-        if STATE.get("trend_family_occupied"):
+        if _trading and STATE.get("trend_family_occupied"):
             _evaluate_addon_signals(context=ctx)
         return
 
@@ -730,12 +724,8 @@ def _check_for_closed_positions() -> None:
                     if p.magic == config.MAGIC}
 
     if ticket not in open_tickets:
-        deals = mt5.history_deals_get(position=ticket)
-        exit_price = None
-        if deals:
-            close_deals = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
-            if close_deals:
-                exit_price = close_deals[-1].price
+        from utils.mt5_client import get_exit_price_from_deal_history
+        exit_price = get_exit_price_from_deal_history(mt5, ticket)
         if exit_price is None:
             log_warning("CLOSED_DEAL_PRICE_UNKNOWN", ticket=ticket)
             exit_price = mt5.symbol_info_tick(config.SYMBOL).bid
@@ -1081,7 +1071,9 @@ def _update_atr_trail() -> None:
     if not pos:
         return
 
-    new_trail    = calculate_atr_trail(pos.price_current, direction)
+    strat = STATE.get("trend_family_strategy")
+    atr_mult = config.ATR_TRAIL_MULTIPLIER_S2 if strat == "S2_MEAN_REV" else None
+    new_trail    = calculate_atr_trail(pos.price_current, direction, atr_multiplier=atr_mult)
     current_stop = STATE.get("stop_price_current", 0.0)
     if new_trail is None:
         return
@@ -1320,6 +1312,14 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=CronTrigger(hour=9, minute=0, timezone=tz_ist),
         id="tlt_macro",
         name="TLT Macro Bias Daily",
+        coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    scheduler.add_job(
+        func=lambda: _safe_execute("tlt_utc", tlt_macro_job),
+        trigger=CronTrigger(hour=9, minute=30, timezone=tz_utc),
+        id="tlt_macro_utc",
+        name="TLT Macro Bias 09:30 UTC",
         coalesce=True, max_instances=1, replace_existing=True,
     )
 
@@ -1562,7 +1562,9 @@ def main():
             # INFRA-1 FIX: Write heartbeat file for external watchdog.
             # Watchdog checks file age — if > 10 min, system is dead.
             try:
-                _hb_path = os.path.join(os.path.dirname(__file__), "logs", "heartbeat")
+                _hb_dir = os.path.join(os.path.dirname(__file__), "logs")
+                os.makedirs(_hb_dir, exist_ok=True)
+                _hb_path = os.path.join(_hb_dir, "heartbeat")
                 with open(_hb_path, "w") as _hb:
                     _hb.write(datetime.now(pytz.utc).isoformat())
             except Exception:

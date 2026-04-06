@@ -59,7 +59,7 @@ KS3_DAILY_LOSS_LIMIT_PCT   = -0.070  # full daily halt at -7% vs start-of-day eq
 # KS3 graduated response — throttle tier before full shutdown
 KS3_THROTTLE_THRESHOLD_PCT = -0.040  # -4% daily → reduce size (continue trading)
 KS3_THROTTLE_SIZE_MULT     = 0.60    # retain 60% of sized lots = 40% reduction
-KS4_LOSS_STREAK_COUNT      = 6       # KS-3 FIX: was 4 — 4 consecutive losses is normal for breakout systems
+KS4_LOSS_STREAK_COUNT      = 4
 KS4_REDUCED_TRADES         = 3       # KS-3 FIX: was 5 — shorter penalty duration
 KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.150  # weekly net vs start-of-week equity (IST week); Fri uses 0.8× this
 KS6_DRAWDOWN_LIMIT_PCT     = 0.20    # equity vs rolling peak (see persistence.update_peak_equity)
@@ -163,7 +163,7 @@ MAX_SESSION_LOTS_BASE        = 0.15  # OPT-4.5: baseline total open lots
 PARTIAL_FILL_THRESHOLD       = 0.80  # >= 80% fill = treat as full fill (v1.1)
 
 # ── Signal Engine ─────────────────────────────────────────────────────────────
-MAX_S1_FAMILY_ATTEMPTS = 4   # EXP-8 FIX: was 3 — 3rd attempt often IS the real breakout
+MAX_S1_FAMILY_ATTEMPTS = 3
 MAX_S1F_ATTEMPTS       = 1   # S1f independent daily limit (G4 Fix)
 
 BREAKOUT_DIST_PCT   = 0.12   # 12% of range_size for S1 confirmation
@@ -187,9 +187,14 @@ M5_LOSS_PAUSE_COUNT   = 5   # EXP-7 FIX: was 3 — too conservative for high-fre
 M5_LIMIT_EXPIRY_MIN   = 5   # B4 Fix: M5 limit orders expire after 1 candle
 
 # ── Position Management ───────────────────────────────────────────────────────
-PARTIAL_EXIT_R         = 2.0   # EXP-3 FIX: was 1.0 — let winners run further before partial
+PARTIAL_EXIT_R         = 2.0   # trend / breakout family — let winners run before partial
+PARTIAL_EXIT_R_S2      = 0.8   # mean reversion — earlier partial before MR completes
 BE_ACTIVATION_R        = 1.5   # EXP-4 FIX: was 0.75 — too aggressive, normal retracements stop out at entry
-ATR_TRAIL_MULTIPLIER   = 2.5   # EXP-5 FIX: was 1.5 — too tight for gold, normal M15 pullbacks clip trail
+ATR_TRAIL_MULTIPLIER   = 2.5   # S1 / S4 / S5 / S6 / S7 — gold trend trail on M15
+ATR_TRAIL_MULTIPLIER_S2 = 1.5  # S2 mean reversion — tighter trail than trend systems
+
+# Minimum stop buffer (points × point) when ATR fallback uses range % — avoids sub-spread stops
+S1_STOP_BUFFER_MIN_POINTS = 12.0
 
 S1D_STOP_POINTS_MIN    = 15    # LOOP-3 FIX: was 10 — too tight for XAUUSD M5
 S1D_STOP_POINTS_MAX    = 20    # LOOP-3 FIX: was 12

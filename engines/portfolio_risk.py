@@ -31,7 +31,7 @@ def check_portfolio_risk(candidate: dict, state: dict) -> tuple[bool, str]:
     info = mt5.account_info()
     if info is None:
         log_warning("PORTFOLIO_RISK_ACCOUNT_INFO_FAILED")
-        return True, "OK"   # can't check → don't block
+        return False, "BROKER_ACCOUNT_UNAVAILABLE"
 
     equity     = float(info.equity)
     direction  = candidate.get("direction", "LONG")
