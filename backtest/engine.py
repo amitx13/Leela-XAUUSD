@@ -268,6 +268,11 @@ class BacktestEngine:
         if self.state.trading_enabled:
             # BUG-4 FIX: pass state.to_dict() so strategies get 'regime' and 'session' aliases
             new_orders = self._generate_signals(bar, context, upcoming_events)
+            if not self.state.s4_ema_touched:
+                ema20_m15 = context.get('ema20_m15')
+                bar_dict = bar._asdict()
+                if ema20_m15 and bar_dict['low'] <= ema20_m15 <= bar_dict['high']:
+                    self.state.s4_ema_touched = True
 
             
             # Portfolio risk check
@@ -530,6 +535,7 @@ class BacktestEngine:
         self.state.s1f_reentered_today = False
         self.state.s1f_post_tk_active = False
         self.state.s4_fired_today = False
+        self.state.s4_ema_touched = False
         self.state.s1d_ema_touched_today = False
         self.state.s5_fired_today = False
         self.state.range_computed = False  # s5_compression_confirmed alias
@@ -542,8 +548,9 @@ class BacktestEngine:
         self.state.daily_pnl = 0.0
         self.state.daily_trades = 0
         self.state.daily_commission_paid = 0.0
-        # BUG-18 FIX: reset kill-switch baselines to current balance
         self.kill_switch_checker.reset_daily(self.state.balance)
+        if bar_time.weekday() == 0:  # Monday
+            self.kill_switch_checker.reset_weekly(self.state.balance)
         
         # Update event-related state
         if upcoming_events:
@@ -576,6 +583,7 @@ class BacktestEngine:
         
         # Update equity
         self.state.equity += trade.pnl_net_dollars
+        self.state.balance = self.state.equity
         if self.state.equity > self.state.peak_equity:
             self.state.peak_equity = self.state.equity
         
@@ -621,7 +629,7 @@ class BacktestEngine:
             equity=self.state.equity,
             balance=self.state.balance,
             open_positions=len(self.state.open_positions),
-            regime=str(self.state.regime)
+            regime=str(self.state.current_regime)
         )
         self.equity_curve.append(equity_point)
 

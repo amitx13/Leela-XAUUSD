@@ -805,7 +805,9 @@ def evaluate_s4_london_pull(
         'direction': direction,  # Dynamic direction based on ADX/DI trend
         'entry_type': 'LIMIT',
         'entry_price': ema20_m15,
-        'stop_price': ema20_m15 - 15 if direction == "LONG" else ema20_m15 + 15,  # Direction-based stop
+        'stop_price': (ema20_m15 - max(context.get('atr_m15', 15.0) * config.get('stop_atr_mult', 0.5), 10.0)
+               if direction == "LONG" else
+               ema20_m15 + max(context.get('atr_m15', 15.0) * config.get('stop_atr_mult', 0.5), 10.0)),
         'tp_price': None,
         'lot_size': 0.0,
         'expiry': bar['time'] + timedelta(minutes=config['expiry_minutes']),

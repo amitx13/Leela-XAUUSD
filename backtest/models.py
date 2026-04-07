@@ -157,7 +157,7 @@ class EquityPoint:
     equity: float
     balance: float = 0.0
     open_positions: int = 0
-    regime: str = "NO_TRADE"
+    # regime: str = "NO_TRADE"
     drawdown_pct: float = 0.0
 
     def to_dict(self) -> dict:
@@ -217,6 +217,7 @@ class SimulatedState:
     s3_fired_today: bool = False
     s3_sweep_direction: Optional[str] = None
     s4_fired_today: bool = False
+    s4_ema_touched: bool = False
     s5_fired_today: bool = False
     s6_placed_today: bool = False
     s7_placed_today: bool = False
@@ -369,7 +370,7 @@ class SimulatedState:
             "s3_fired_today": self.s3_fired_today,
             "s3_sweep_direction": self.s3_sweep_direction,
             "s4_fired_today": self.s4_fired_today,
-            "s4_ema_touched": self.s1d_ema_touched_today,         # legacy alias
+            "s4_ema_touched": self.s4_ema_touched,
             "s5_fired_today": self.s5_fired_today,
             "s5_compression_confirmed": self.range_computed,      # reused flag
             "s6_placed_today": self.s6_placed_today,
