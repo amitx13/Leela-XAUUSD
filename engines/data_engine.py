@@ -96,14 +96,9 @@ def get_contract_spec(symbol: str = "XAUUSD") -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# MT5 timeframe constants mapped to string labels
-TF_MAP = {
-    "M5":  1,    # mt5.TIMEFRAME_M5
-    "M15": 3,    # mt5.TIMEFRAME_M15
-    "H1":  16385, # mt5.TIMEFRAME_H1
-    "H4":  16388, # mt5.TIMEFRAME_H4
-    "D1":  16408, # mt5.TIMEFRAME_D1
-}
+# MT5 timeframe constants — used only by get_tf_constant() below.
+# DEAD-1 FIX: Old hardcoded TF_MAP dict removed (was never referenced — get_tf_constant
+# fetches live mt5.TIMEFRAME_* constants at runtime which is correct).
 
 
 
@@ -363,11 +358,12 @@ def get_session_avg_spread(session: str | None = None) -> float:
     """
     Returns the rolling average spread for the current (or given) session.
 
-    C1 Fix: If spread_fallback_active or fewer than 6 readings exist,
-    returns hardcoded safe fallback value. Switches to real rolling
-    average after 30 minutes (6 readings).
+    C1 Fix: If fewer than 6 readings exist, returns hardcoded safe fallback value.
+    Switches to real rolling average after 30 minutes (6 readings).
 
-    This is the ONLY value used by KS2 spread guard.
+    Note: The canonical pre-placement gate and KS2 spread guard now use
+    get_avg_spread_last_24h() as the primary baseline (CHANGE 2 / v1.1).
+    This function is retained as fallback when 24h data is insufficient.
     """
     if session is None:
         session = get_current_session()
@@ -698,24 +694,21 @@ def calculate_dxy_ewma_variance(lookback: int = 20) -> float:
     return ewma_variance
 
 
-def is_dxy_stable() -> bool:
+def is_dxy_stable(state: dict) -> bool:
     """
     F4: Returns True if DXY is stable (EWMA variance below threshold).
     Used by regime engine to decide whether to apply macro_boost.
 
+    BUG-3 FIX: Removed circular `from main import STATE` which caused ImportError
+    at startup (main imports data_engine during init). Callers now pass state explicitly.
+
     When DXY is unstable (whipsawing), macro_boost is disabled even if
-    the correlation meets the threshold. This prevents false positive
-    boosts based on noisy correlations during volatile dollar periods.
+    the correlation meets the threshold.
     """
-    # BUG-7 FIX: STATE doesn't exist in regime_engine — it lives in main.py.
-    # Instead, accept state as a parameter or use the shared state dict.
-    # Since this is called from regime_engine which has access to state,
-    # we import the state from main.py's global STATE dict.
-    from main import STATE
-    dxy_variance = STATE.get("dxy_ewma_variance", None)
+    dxy_variance = state.get("dxy_ewma_variance", None)
 
     if dxy_variance is None:
-        # No variance data yet — assume stable (don't block on missing data)
+        # No variance data yet — assume stable (don’t block on missing data)
         return True
 
     threshold = config.DXY_VARIANCE_SPIKE_THRESHOLD

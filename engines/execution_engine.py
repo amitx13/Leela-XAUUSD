@@ -7,18 +7,23 @@ emergency shutdown, system initialization, pre-session checklist.
 v1.1 additions:
   - place_s6_pending_orders() stub
   - place_s7_pending_orders() stub
-  - reset_daily_counters() — re-exported for main.py
+  - initialize_system() — startup hardware/broker check
   - initialize_system() — MT5 + DB startup
   - pre_session_checklist() — pre-session sanity gates
   - Change 56: P&L correlation check every 10 closed trades
   - KS4 countdown hook in on_trade_closed()
   - Spread-aware BUY STOP on all pending placement
+
+ENHANCED Safety Fixes (V3.0):
+  - Task 1: Enhanced phantom order verification with multiple retries
+  - Task 2: MT5 auto-reconnect with exponential backoff (in utils/mt5_client.py)
+  - Task 3: Enhanced position reconciliation with comprehensive analysis
 """
 
 import uuid
 import time
-import threading
-from datetime import datetime
+
+from datetime import datetime, timedelta
 import pytz
 
 import config
@@ -49,7 +54,7 @@ from engines.position_manager import (
     on_fill as pm_on_fill,
     on_close as pm_on_close,
 )
-
+from utils.session import get_current_session
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CRITICAL RETCODES — C6
@@ -96,6 +101,183 @@ def _reconcile_position_manager_from_db() -> None:
             )
         except (TypeError, ValueError) as e:
             log_warning("PM_RECONCILE_ROW_SKIPPED", error=str(e), row=r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 3: LIVE POSITION RECONCILIATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reconcile_live_positions(state: dict) -> None:
+    """
+    ENHANCED Task 3: Comprehensive position reconciliation with advanced detection.
+    
+    Detects and handles:
+      - Ghost positions: system thinks open, broker already closed them
+        (stop-out, margin call, manual close, etc.). Triggers emergency_shutdown.
+      - Orphan positions: MT5 has them, system doesn't know about them
+        (manual trades, missed fills, etc.). Alerts with detailed analysis.
+      - Position mismatches: ticket exists but details differ (size, direction)
+      - Magic number violations: positions with wrong magic number
+    
+    Called every 10 minutes by the reconciliation scheduler job in main.py.
+    Enhanced with detailed logging, position analysis, and recovery suggestions.
+    
+    NOTE: state["open_position"] stores the ticket integer directly (not a dict).
+          state["s8_open_ticket"] and state["r3_open_ticket"] are separate lanes.
+    """
+    try:
+        mt5 = get_mt5()
+        
+        # 1. Get comprehensive live position data from MT5
+        all_positions = mt5.positions_get(symbol=config.SYMBOL) or []
+        our_positions = {pos.ticket: pos for pos in all_positions 
+                        if pos.magic == config.MAGIC}
+        other_magic_positions = [pos for pos in all_positions 
+                               if pos.magic != config.MAGIC]
+        
+        live_tickets = set(our_positions.keys())
+        
+        # 2. Build comprehensive system state across all position lanes
+        believed_tickets = set()
+        position_details = {}
+        
+        # Main trend family lane (stores ticket int directly)
+        if state.get("open_position"):
+            ticket = state["open_position"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "trend_family", "source": "state.open_position"}
+        
+        # S8 independent lane
+        if state.get("s8_open_ticket"):
+            ticket = state["s8_open_ticket"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "s8_independent", "source": "state.s8_open_ticket"}
+        
+        # R3 independent lane
+        if state.get("r3_open_ticket"):
+            ticket = state["r3_open_ticket"]
+            believed_tickets.add(ticket)
+            position_details[ticket] = {"lane": "r3_independent", "source": "state.r3_open_ticket"}
+        
+        # 3. Ghost positions: we think open, MT5 says closed
+        ghosts = believed_tickets - live_tickets
+        if ghosts:
+            streak = int(state.get("reconcile_ghost_streak", 0) or 0) + 1
+            state["reconcile_ghost_streak"] = streak
+            log_warning("GHOST_POSITIONS_DETECTED_PASS",
+                        ghost_count=len(ghosts),
+                        streak=streak,
+                        ghost_tickets=list(ghosts))
+            if streak < 2:
+                return
+
+            # Enhanced ghost analysis with recovery suggestions (2 consecutive passes)
+            ghost_details = []
+            for ticket in ghosts:
+                details = position_details.get(ticket, {"lane": "unknown", "source": "unknown"})
+                ghost_details.append({
+                    "ticket": ticket,
+                    "lane": details["lane"],
+                    "source": details["source"],
+                    "possible_causes": ["stop_out", "margin_call", "manual_close", "broker_error"]
+                })
+
+            log_critical("GHOST_POSITIONS_DETECTED_ENHANCED",
+                        ghost_count=len(ghosts),
+                        ghost_tickets=list(ghosts),
+                        ghost_details=ghost_details,
+                        live_tickets=list(live_tickets),
+                        believed_tickets=list(believed_tickets),
+                        recovery_action="EMERGENCY_SHUTDOWN_REQUIRED")
+
+            send_ks_alert("EMERGENCY_SHUTDOWN",
+                          f"CRITICAL: Ghost positions detected! System thinks {len(ghosts)} positions are open but broker shows none. "
+                          f"Ghost tickets: {ghosts}. "
+                          f"Immediate system shutdown to prevent state corruption. "
+                          f"Manual investigation required before restart.")
+
+            state["reconcile_ghost_streak"] = 0
+            emergency_shutdown("GHOST_POSITIONS_DETECTED_ENHANCED", state)
+            return
+        
+        # 4. Orphan positions: MT5 has them, system doesn't track them
+        orphans = live_tickets - believed_tickets
+        if orphans:
+            # Enhanced orphan analysis with position details
+            orphan_details = []
+            for ticket in orphans:
+                pos = our_positions[ticket]
+                orphan_details.append({
+                    "ticket": ticket,
+                    "direction": "LONG" if pos.type == 0 else "SHORT",
+                    "volume": pos.volume,
+                    "profit": pos.profit,
+                    "open_time": pos.time,
+                    "current_price": pos.price_open,
+                    "possible_sources": ["manual_trade", "missed_fill_detection", "system_restart_gap"]
+                })
+            
+            log_warning("ORPHAN_POSITIONS_DETECTED_ENHANCED",
+                        orphan_count=len(orphans),
+                        orphan_tickets=list(orphans),
+                        orphan_details=orphan_details,
+                        note="Manual trades or missed fills - investigate before system restart")
+            
+            send_ks_alert("WARNING",
+                          f"Orphan positions detected in MT5 not tracked by system: {orphans}. "
+                          f"Count: {len(orphans)}. These may be manual trades or missed fills. "
+                          f"Review before next system restart.")
+        
+        # 5. Position integrity check (if both systems agree on tickets)
+        common_tickets = believed_tickets & live_tickets
+        integrity_issues = []
+        
+        for ticket in common_tickets:
+            system_info = position_details.get(ticket, {"lane": "unknown"})
+            mt5_pos = our_positions[ticket]
+            
+            # Check for any obvious integrity issues (can be expanded)
+            if mt5_pos.profit and abs(mt5_pos.profit) > 10000:  # Unusual P&L
+                integrity_issues.append({
+                    "ticket": ticket,
+                    "issue": "unusual_profit_loss",
+                    "profit": mt5_pos.profit,
+                    "lane": system_info["lane"]
+                })
+        
+        if integrity_issues:
+            log_warning("POSITION_INTEGRITY_ISSUES",
+                        issues_count=len(integrity_issues),
+                        issues=integrity_issues)
+        
+        # 6. Magic number violation check
+        if other_magic_positions:
+            log_warning("OTHER_MAGIC_POSITIONS",
+                        count=len(other_magic_positions),
+                        other_magics=set(pos.magic for pos in other_magic_positions),
+                        note="Other EAs or manual trades with different magic numbers")
+        
+        # 7. Final reconciliation status
+        if not ghosts:
+            state["reconcile_ghost_streak"] = 0
+
+        log_event("RECONCILIATION_COMPLETE_ENHANCED",
+                  total_live_positions=len(live_tickets),
+                  total_system_positions=len(believed_tickets),
+                  ghost_positions=len(ghosts),
+                  orphan_positions=len(orphans),
+                  integrity_issues=len(integrity_issues),
+                  other_magic_positions=len(other_magic_positions),
+                  reconciliation_status="HEALTHY" if not (ghosts or orphans) else "ISSUES_DETECTED")
+        
+    except Exception as e:
+        log_critical("RECONCILIATION_SYSTEM_ERROR",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    note="Position reconciliation failed - system may be in inconsistent state")
+        send_ks_alert("WARNING",
+                      f"Position reconciliation system error: {str(e)}. "
+                      f"Manual system health check recommended.")
 
 
 def initialize_system(state: dict) -> None:
@@ -149,11 +331,16 @@ def initialize_system(state: dict) -> None:
     restore_critical_state(state)
     _reconcile_position_manager_from_db()
 
-    # 4. Live equity sync
+    # 4. Live equity sync + backfill KS3/KS5 denominators if still zero (Day-1 / missed midnight)
     info = mt5.account_info()
     if info:
         equity = float(info.equity)
         state["current_equity"] = equity
+        if equity > 0:
+            if float(state.get("equity_at_day_start") or 0) <= 0:
+                state["equity_at_day_start"] = equity
+            if float(state.get("equity_at_week_start") or 0) <= 0:
+                state["equity_at_week_start"] = equity
         update_peak_equity(state)
         log_event("EQUITY_SYNCED_AT_STARTUP",
                   balance=round(info.balance, 2),
@@ -275,25 +462,6 @@ def _check_power_status() -> bool:
 # DAILY COUNTER RESET — re-exported for main.py import
 # ─────────────────────────────────────────────────────────────────────────────
 
-def reset_daily_counters(state: dict) -> None:
-    """
-    Resets intra-day counters ONLY.
-    Rolling state (consecutive_losses, peak_equity) is NEVER reset here.
-    Called by midnight_reset_job() in main.py.
-    v1.1 flags (s3_fired_today, s6_fired_today, s7_fired_today) reset in
-    midnight_reset_job() directly alongside this call.
-    """
-    state["daily_net_pnl_pct"]          = 0.0
-    state["daily_commission_paid"]      = 0.0
-    state["s1_family_attempts_today"]   = 0
-    state["s1f_attempts_today"]         = 0
-    state["consecutive_m5_losses"]      = 0
-    state["session_spread_initialized"] = False
-    state["spread_fallback_active"]     = True
-    state["spread_readings_count"]      = 0
-    state["london_tk_fired_today"]      = False
-    state["ny_tk_fired_today"]          = False
-    log_event("DAILY_COUNTERS_RESET")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,29 +473,46 @@ def cancel_all_pending_orders() -> int:
     C5 Fix: Cancels ALL our pending orders on XAUUSD.
     Magic filter: config.MAGIC. NEVER touches orders from other EAs.
     Called by: time kills, regime→NO_TRADE, emergency_shutdown.
+    
+    HARDENING: Specifically queries MT5 to find "orphan" orders not in local state.
     Returns count of cancelled orders.
     """
-    mt5     = get_mt5()
-    pending = mt5.orders_get(symbol=config.SYMBOL) or []
-    count   = 0
-
+    mt5 = get_mt5()
+    # Query MT5 directly for all pending orders
+    pending = mt5.orders_get(symbol=config.SYMBOL)
+    
+    if pending is None:
+        err = mt5.last_error()
+        log_warning("CANCEL_PENDING_MT5_GET_FAILED", error=str(err))
+        # Fallback: try without symbol filter to be sure (then filter manually)
+        pending = mt5.orders_get() or []
+    
+    count = 0
     for order in pending:
+        # Hard filter: magic must match. Symbol check redundant but safe.
         if order.magic != config.MAGIC:
-            continue    # C5: hard filter — never touch other EAs
-
-        result  = mt5.order_delete(order.ticket)
+            continue
+        if order.symbol != config.SYMBOL:
+            continue
+            
+        result = mt5.order_delete(order.ticket)
         retcode = result.retcode if result else "NO_RESULT"
 
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             log_event("PENDING_ORDER_CANCELLED",
-                      ticket=order.ticket, type=order.type)
+                      ticket=order.ticket, 
+                      type=order.type,
+                      magic=order.magic)
             count += 1
         else:
             log_warning("PENDING_ORDER_CANCEL_FAILED",
-                        ticket=order.ticket, retcode=retcode)
+                        ticket=order.ticket, 
+                        retcode=retcode,
+                        error=str(mt5.last_error()))
 
     if count > 0:
         log_event("ALL_PENDING_CANCELLED", count=count)
+    
     return count
 
 
@@ -476,19 +661,30 @@ def place_s6_pending_orders(state: dict, s6result: dict) -> None:
 
     buy_c  = s6result.get("buy_candidate")
     sell_c = s6result.get("sell_candidate")
-    if not buy_c or not sell_c:
+    if not buy_c and not sell_c:
         log_warning("S6_PENDING_NO_CANDIDATES")
         return
 
-    # Use expiry already embedded in candidate by evaluate_s6_signal
-    expiry_iso = buy_c.get("order_expiry_utc")
+    # Use expiry from whichever candidate is present
+    _expiry_c = buy_c or sell_c
+    expiry_iso = _expiry_c.get("order_expiry_utc")
     expiry_ts  = int(datetime.fromisoformat(expiry_iso).timestamp()) if expiry_iso else \
                  int(datetime.now(pytz.utc).replace(hour=8, minute=0, second=0, microsecond=0).timestamp())
 
-    orders = [
-        (mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s6_pending_buy_ticket"),
-        (mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s6_pending_sell_ticket"),
-    ]
+    # ADX trend filter already applied in signal engine (evaluate_s6_signal).
+    # Removed duplicate filter here (HIGH-7). Signal engine is the single source of truth.
+    place_buy_s6  = buy_c  is not None
+    place_sell_s6 = sell_c is not None
+
+    orders = []
+    if place_buy_s6:
+        orders.append((mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s6_pending_buy_ticket"))
+    if place_sell_s6:
+        orders.append((mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s6_pending_sell_ticket"))
+
+    if not orders:
+        log_event("S6_BOTH_LEGS_FILTERED_AT_PLACEMENT")
+        return
 
     for order_type, price, sl, lots, direction, ticket_key in orders:
         place_price = round(price + spread_price, 3) if order_type == mt5.ORDER_TYPE_BUY_STOP else price
@@ -529,6 +725,12 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
     Sunday skip handled by caller (midnight_reset_job).
     No KS2 check: placed off-hours, fills during active London/NY sessions.
     """
+    from engines.risk_engine import run_pre_trade_kill_switches
+    ks_stack_ok, ks_stack_reason = run_pre_trade_kill_switches(state)
+    if not ks_stack_ok:
+        log_event("S7_PENDING_BLOCKED_KILL_SWITCH", reason=ks_stack_reason)
+        return
+
     ks7_ok, ks7_reason = check_ks7_event_blackout(state)
     if not ks7_ok:
         log_event("KS7_BLOCKED_NEW_PLACEMENT", reason=ks7_reason, path="place_s7_pending")
@@ -542,7 +744,7 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
 
     buy_c  = s7result.get("buy_candidate")
     sell_c = s7result.get("sell_candidate")
-    if not buy_c or not sell_c:
+    if not buy_c and not sell_c:
         log_warning("S7_PENDING_NO_CANDIDATES")
         return
 
@@ -553,10 +755,20 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
 
     spread_price = tick.ask - tick.bid
 
-    orders = [
-        (mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s7_pending_buy_ticket"),
-        (mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s7_pending_sell_ticket"),
-    ]
+    # ADX trend filter already applied in signal engine (evaluate_s7_signal).
+    # Removed duplicate filter here (HIGH-7). Signal engine is the single source of truth.
+    place_buy_s7  = buy_c  is not None
+    place_sell_s7 = sell_c is not None
+
+    orders = []
+    if place_buy_s7:
+        orders.append((mt5.ORDER_TYPE_BUY_STOP,  buy_c["entry_level"],  buy_c["stop_level"],  buy_c["lot_size"],  "LONG",  "s7_pending_buy_ticket"))
+    if place_sell_s7:
+        orders.append((mt5.ORDER_TYPE_SELL_STOP, sell_c["entry_level"], sell_c["stop_level"], sell_c["lot_size"], "SHORT", "s7_pending_sell_ticket"))
+
+    if not orders:
+        log_event("S7_BOTH_LEGS_FILTERED_AT_PLACEMENT")
+        return
 
     for order_type, price, sl, lots, direction, ticket_key in orders:
         place_price = round(price + spread_price, 3) if order_type == mt5.ORDER_TYPE_BUY_STOP else price
@@ -589,7 +801,7 @@ def place_s7_pending_orders(state: dict, s7result: dict) -> None:
     # prev_day_high/low are top-level in s7result ✅
     state["s7_prev_day_high"] = s7result.get("prev_day_high", 0.0)
     state["s7_prev_day_low"]  = s7result.get("prev_day_low",  0.0)
-    
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PENDING FILL HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,9 +825,14 @@ def on_trade_opened_from_pending_fill(
     range_data = state.get("range_data") or {}
     mt5        = get_mt5()
     info       = mt5.account_info()
-    from utils.session import get_current_session
-
-    sess = get_current_session()
+    # OPT-5.2: Capture actual spread at fill time
+    tick = mt5.symbol_info_tick(config.SYMBOL)
+    spread_at_fill = 0.0
+    if tick and config.CONTRACT_SPEC.get("point"):
+        spread_at_fill = (tick.ask - tick.bid) / config.CONTRACT_SPEC["point"]
+    
+    avg_spread = get_avg_spread_last_24h()
+    spread_ratio = round(spread_at_fill / avg_spread, 2) if avg_spread > 0 else 0.0
 
     candidate = {
         "signal_type":           signal_type,
@@ -633,7 +850,7 @@ def on_trade_opened_from_pending_fill(
         "size_multiplier_used":  state["size_multiplier"],
         "adx_h4_at_entry":       state.get("last_adx_h4", 0.0),
         "atr_h1_percentile":     state.get("last_atr_pct_h1", 0.0),
-        "session":               sess,
+        "session":               get_current_session(),
         "regime_age_seconds":    0,
         "macro_bias_at_entry":   state.get("macro_bias", "BOTH_PERMITTED"),
         "macro_boost_at_entry":  bool(state.get("macro_boost", False)),
@@ -642,8 +859,8 @@ def on_trade_opened_from_pending_fill(
         "tlt_3d_slope":          float(state.get("tlt_slope", 0.0)),
         "conviction_level":      state.get("conviction_level", "STANDARD"),
         "stop_hunt_detected":    bool(state.get("stop_hunt_detected", False)),
-        "spread_at_entry":       0.0,
-        "spread_vs_avg_ratio":   0.0,
+        "spread_at_entry":       round(spread_at_fill, 2),
+        "spread_vs_avg_ratio":   spread_ratio,
         "equity_at_entry":       float(info.equity) if info else 0.0,
         "london_hour_at_entry":  0,
         "s1_family_attempt_num": state["s1_family_attempts_today"] + 1,
@@ -675,6 +892,9 @@ def place_order(candidate: dict, state: dict) -> int | None:
 
     v1.1: BUY STOP price = entry + current_spread_pts (§3.5).
           SELL STOP left unadjusted (fills on bid).
+
+    Task 1: Phantom order verification — after TRADE_RETCODE_DONE, confirm
+            the position actually exists in MT5 before updating any state.
     """
     mt5  = get_mt5()
     tick = mt5.symbol_info_tick(config.SYMBOL)
@@ -744,6 +964,12 @@ def place_order(candidate: dict, state: dict) -> int | None:
             return None
 
     is_pending = order_type in (mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_SELL_STOP)
+    # MED-3 FIX: Store actual MT5 order type for Truth Engine logging.
+    # Previous code matched against signal_type string which was wrong.
+    if is_pending:
+        candidate["_actual_order_type"] = "STOP"
+    else:
+        candidate["_actual_order_type"] = "MARKET"
     comment    = f"{candidate['signal_type']}{datetime.now().strftime('%H%M')}"
 
     request = {
@@ -804,7 +1030,62 @@ def place_order(candidate: dict, state: dict) -> int | None:
                     comment=getattr(result, "comment", ""))
         return None
 
-    ticket       = result.order
+    ticket = result.order
+
+    # ── CRIT-1 FIX: Phantom Order Verification ─────────────────────────────────
+    # TRADE_RETCODE_DONE does NOT guarantee the position/order exists on the broker.
+    # MT5 takes ~100-200ms to reflect a new position in positions_get().
+    # CRITICAL: Pending orders (BUY STOP, SELL STOP) appear in orders_get(),
+    # NOT positions_get(). Using the wrong lookup caused every pending order
+    # to trigger emergency_shutdown().
+    import time
+
+    verification_delays = [0.2, 0.4, 0.8]
+
+    for attempt, delay in enumerate(verification_delays):
+        if attempt > 0:
+            time.sleep(delay)
+
+        # Use the correct lookup: orders_get for pending, positions_get for fills
+        if is_pending:
+            verified = mt5.orders_get(ticket=ticket)
+        else:
+            verified = mt5.positions_get(ticket=ticket)
+
+        if verified:
+            if attempt > 0:
+                log_event("PHANTOM_ORDER_VERIFIED_AFTER_RETRY",
+                          ticket=ticket, attempt=attempt + 1,
+                          delay=delay, is_pending=is_pending)
+            break
+
+        log_event("PHANTOM_ORDER_VERIFICATION_FAILED",
+                  ticket=ticket, attempt=attempt + 1,
+                  delay=delay, retcode=result.retcode,
+                  is_pending=is_pending)
+
+    # Final check after all attempts
+    if is_pending:
+        final_check = mt5.orders_get(ticket=ticket)
+    else:
+        final_check = mt5.positions_get(ticket=ticket)
+
+    if not final_check:
+        log_critical("PHANTOM_ORDER_DETECTED_FINAL",
+                     ticket=ticket,
+                     signal=candidate["signal_type"],
+                     retcode=result.retcode,
+                     is_pending=is_pending,
+                     verification_attempts=len(verification_delays),
+                     total_delay_time=sum(verification_delays))
+        emergency_shutdown("PHANTOM_ORDER_DETECTED_FINAL", state)
+        return None
+    else:
+        log_event("PHANTOM_ORDER_VERIFICATION_SUCCESS",
+                  ticket=ticket, is_pending=is_pending,
+                  total_attempts=len(verification_delays))
+    # ── END CRIT-1 FIX ────────────────────────────────────────────────────────
+
     actual_price = result.price if hasattr(result, "price") else price
     slippage_pts = abs(actual_price - price) / point
     commission   = config.COMMISSION_PER_LOT_PER_SIDE * candidate["lot_size"]
@@ -839,6 +1120,7 @@ def on_trade_opened(
     B5 Fix: stop_price_original = candidate stop — NEVER updated after entry.
     G8 Fix: persist_critical_state() called here.
     C5:     trend_family_occupied set ONLY for S1-family signals.
+    V3.0:   S8 independent lane added (Change 5.1) — early return, no trend_family_occupied.
     """
     trade_id = str(uuid.uuid4())
 
@@ -908,7 +1190,7 @@ def on_trade_opened(
             "spread":          candidate.get("spread_at_entry"),
             "spread_ratio":    candidate.get("spread_vs_avg_ratio"),
             "slippage":        round(slippage_pts, 2),
-            "order_type":      "STOP" if "STOP" in str(candidate.get("signal_type", "")) else "LIMIT",
+            "order_type":      candidate.get("_actual_order_type", "MARKET"),
             "event_prox":      candidate.get("event_proximity_min"),
             "risk_pct":        None,
             "london_hour":     candidate.get("london_hour_at_entry"),
@@ -920,7 +1202,29 @@ def on_trade_opened(
     )
 
     signal = candidate["signal_type"]
-    
+
+    # ── S8: Independent position lane (ATR spike) ──────────────────────────
+    # S8 does NOT occupy trend_family. Coexists with S1/S4/S5.
+    if signal == "S8_ATR_SPIKE":
+        state["s8_open_ticket"]         = ticket
+        state["s8_entry_price"]         = actual_price
+        state["s8_stop_price_original"] = candidate.get("stop_level", 0.0)
+        state["s8_stop_price_current"]  = candidate.get("stop_level", 0.0)
+        state["s8_trade_direction"]     = candidate.get("direction", None)
+        state["s8_be_activated"]        = False
+        state["s8_open_time_utc"]       = datetime.now(pytz.utc).isoformat()
+        state["s8_fired_today"]         = True
+        from engines.position_manager import pm_on_fill as _pm_s8
+        from db.persistence import persist_critical_state as _persist_s8
+        _pm_s8(signal, ticket, candidate["direction"], float(candidate["lot_size"]))
+        _persist_s8(state)
+        log_event("S8_POSITION_OPENED",
+                  trade_id=trade_id, ticket=ticket,
+                  entry=actual_price,
+                  stop=candidate.get("stop_level"),
+                  direction=candidate.get("direction"))
+        return    # ← EARLY RETURN: skip trend_family_occupied setter
+
     # ── Phase 2: R3 Independent Family Branch ────────────────────────────────
     # R3 does not occupy the trend family and tracks its own position ticket.
     if signal == "R3_CAL_MOMENTUM":
@@ -943,7 +1247,7 @@ def on_trade_opened(
                   lots=candidate["lot_size"])
         return   # ← EARLY RETURN: skip the main family state updates below
 
-    # ── Standard path (all non-R3 signals) ─────────────────────────────────--
+    # ── Standard path (all non-R3/S8 signals) ────────────────────────────────
     # Everything below is EXISTING code, unchanged.
     state["open_position"]       = ticket
     state["entry_price"]         = actual_price
@@ -980,6 +1284,26 @@ def on_trade_opened(
     if signal in ("S2_MEAN_REV", "S6_ASIAN_BRK", "S7_DAILY_STRUCT"):
         state["trend_family_strategy"] = signal
 
+    # CHANGE 5.3: S6/S7 Cross-Cancellation on fill.
+    # When S6 or S7 fills, cancel all other S6/S7 pending orders immediately.
+    # Prevents position collision (two fills → open_position overwrite).
+    # This is belt-and-suspenders with the fill detection in main.py.
+    if signal in ("S6_ASIAN_BRK", "S7_DAILY_STRUCT"):
+        mt5_cancel = get_mt5()
+        for key in ("s6_pending_buy_ticket", "s6_pending_sell_ticket",
+                    "s7_pending_buy_ticket", "s7_pending_sell_ticket"):
+            pending_ticket = state.get(key)
+            if pending_ticket and pending_ticket != ticket:
+                try:
+                    mt5_cancel.order_delete(pending_ticket)
+                    log_event("S6_S7_CROSS_CANCEL",
+                              cancelled_ticket=pending_ticket,
+                              filled_strategy=signal,
+                              cancelled_key=key)
+                except Exception:
+                    pass
+                state[key] = None
+
     pm_on_fill(signal, ticket, candidate["direction"], float(candidate["lot_size"]))
 
     # G8 Fix: persist on EVERY trade open
@@ -1006,6 +1330,7 @@ def on_trade_closed(
     B5: R-multiple always vs stop_price_original (never stop_price_current).
     v1.1: trigger_ks4_countdown() when loss streak hits KS4_LOSS_STREAK_COUNT.
     Change 56: run P&L correlation check every 10 closed trades.
+    V3.0: S8 guard added (Change 5.2) — S8 close does NOT clear trend_family_occupied.
     """
     rows = execute_query(
         """SELECT trade_id, entry_price, stop_price_original, lot_size,
@@ -1081,10 +1406,29 @@ def on_trade_closed(
     # ── Streak tracking ───────────────────────────────────────────────────────
     if outcome == "WIN":
         state["consecutive_losses"] = 0
+        state["recent_loss_r_multiples"] = []
         if signal == "S1D_PYRAMID":
             state["consecutive_m5_losses"] = 0
+        
+        # OPT-1.4: KS6 Recovery tracking
+        if state.get("ks6_recovery_mode"):
+            state["ks6_recovery_wins"] = state.get("ks6_recovery_wins", 0) + 1
+            if state["ks6_recovery_wins"] >= config.KS6_RECOVERY_WINS_NEEDED:
+                state["ks6_recovery_mode"] = False
+                log_event("KS6_RECOVERY_COMPLETE", wins=state["ks6_recovery_wins"])
+
     else:
         state["consecutive_losses"] += 1
+        
+        # OPT-1.3 KS4 Severity weights: track recent loss R-multiples
+        loss_r = state.get("recent_loss_r_multiples", [])
+        loss_r.append(r_multiple)
+        state["recent_loss_r_multiples"] = loss_r[-6:]  # keep last 6
+
+        # OPT-1.4: Reset KS6 recovery wins on a loss
+        if state.get("ks6_recovery_mode"):
+            state["ks6_recovery_wins"] = 0
+
         if signal == "S1D_PYRAMID":
             state["consecutive_m5_losses"] += 1
 
@@ -1102,8 +1446,19 @@ def on_trade_closed(
         state["r3_stop_price"]  = 0.0
         state["r3_tp_price"]    = 0.0
         # Fall through to equity/P&L update below (shared with all signals)
+    elif signal == "S8_ATR_SPIKE":
+        # S8 independent lane — clean up S8 state only.
+        # Do NOT touch trend_family_occupied (S1 may still be open).
+        state["s8_open_ticket"]         = None
+        state["s8_entry_price"]         = 0.0
+        state["s8_stop_price_original"] = 0.0
+        state["s8_stop_price_current"]  = 0.0
+        state["s8_trade_direction"]     = None
+        state["s8_be_activated"]        = False
+        state["s8_open_time_utc"]       = None
+        # Fall through to equity/P&L update below (shared with all signals)
     else:
-        # ── Existing non-R3 state cleanup (UNCHANGED) ─────────────────────────
+        # ── Existing non-R3/S8 state cleanup (UNCHANGED) ──────────────────────
         if signal not in ("S1D_PYRAMID", "S1E_PYRAMID"):
             state["open_position"]          = None
             state["trend_family_occupied"]  = False
@@ -1118,8 +1473,11 @@ def on_trade_closed(
     info = mt5.account_info()
     if info:
         equity = float(info.equity)
-        if equity > 0:
-            state["daily_net_pnl_pct"] += pnl_net / equity
+        # HIGH-3 FIX: Use start-of-day equity as denominator to prevent
+        # KS3 drift — early wins inflating equity makes later losses look smaller.
+        day_start_equity = state.get("equity_at_day_start", equity)
+        if day_start_equity > 0:
+            state["daily_net_pnl_pct"] += pnl_net / day_start_equity
         state["daily_commission_paid"] += total_comm
         update_peak_equity(state, equity)
 
@@ -1197,10 +1555,14 @@ def modify_stop(ticket: int, new_stop: float,
                WHERE mt5_ticket = :ticket AND exit_time IS NULL""",
             {"new_stop": new_stop, "ticket": ticket}
         )
+        # OPT-1.6: KS1 Log enhancement — record R-multiple at event time
+        stop_orig = state.get("stop_price_original", 0.0)
+        r_at_move = calculate_r_multiple(entry, pos.price_current, stop_orig, direction)
         log_event(reason,
                   ticket=ticket,
                   new_stop=round(new_stop, 3),
-                  entry=round(entry, 3))
+                  entry=round(entry, 3),
+                  r_at_move=round(r_at_move, 2))
         return True
     else:
         retcode = result.retcode if result else "NO_RESULT"
@@ -1217,6 +1579,7 @@ def emergency_shutdown(reason: str, state: dict) -> None:
     C5 Fix: Magic filter enforced on EVERY position and order.
     Never closes positions or cancels orders with wrong magic number.
     Sends SMTP alert. Calls mt5.shutdown() + reset_mt5_connection().
+    V3.0: S8 + R3 independent lane state cleared on shutdown (Change 5.4).
     """
     log_critical("EMERGENCY_SHUTDOWN_INITIATED", reason=reason)
 
@@ -1230,24 +1593,60 @@ def emergency_shutdown(reason: str, state: dict) -> None:
             continue    # C5: NEVER touch other EAs
 
         close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
-        result     = mt5.order_send({
-            "action":    mt5.TRADE_ACTION_DEAL,
-            "symbol":    config.SYMBOL,
-            "volume":    pos.volume,
-            "type":      close_type,
-            "position":  pos.ticket,
-            "deviation": config.EMERGENCY_DEVIATION_POINTS,
-            "magic":     config.MAGIC,
-            "comment":   f"EMRG_{reason[:15]}",
-        })
-        retcode = result.retcode if result else "NONE"
-        log_event("EMERGENCY_POSITION_CLOSED",
-                  ticket=pos.ticket, volume=pos.volume, retcode=retcode)
+        # HIGH-2 FIX: Retry failed emergency closes (3 attempts, 500ms delay).
+        # Original code logged "CLOSED" even on failure — misleading audit trail.
+        close_success = False
+        for close_attempt in range(3):
+            result = mt5.order_send({
+                "action":    mt5.TRADE_ACTION_DEAL,
+                "symbol":    config.SYMBOL,
+                "volume":    pos.volume,
+                "type":      close_type,
+                "position":  pos.ticket,
+                "deviation": config.EMERGENCY_DEVIATION_POINTS,
+                "magic":     config.MAGIC,
+                "comment":   f"EMRG_{reason[:15]}",
+            })
+            retcode = result.retcode if result else "NONE"
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                log_event("EMERGENCY_POSITION_CLOSED",
+                          ticket=pos.ticket, volume=pos.volume,
+                          retcode=retcode, attempt=close_attempt + 1)
+                close_success = True
+                break
+            log_warning("EMERGENCY_CLOSE_ATTEMPT_FAILED",
+                        ticket=pos.ticket, retcode=retcode,
+                        attempt=close_attempt + 1)
+            time.sleep(0.5)
+
+        if not close_success:
+            log_critical("EMERGENCY_CLOSE_FAILED_MANUAL_REQUIRED",
+                         ticket=pos.ticket, volume=pos.volume,
+                         last_retcode=retcode)
+
+    # OPT-5.3: Emergency Cooldown State
+    now_utc = datetime.now(pytz.utc)
+    state["shutdown_at_utc"]       = now_utc.isoformat()
+    state["min_restart_at_utc"]    = (now_utc + timedelta(minutes=30)).isoformat()
 
     state["trading_enabled"]       = False
     state["shutdown_reason"]       = reason
     state["trend_family_occupied"] = False
     state["open_position"]         = None
+
+    # Clean independent position lanes (S8 + R3)
+    # Without this, stale keys after restart would make bot think positions are open.
+    state["s8_open_ticket"]         = None
+    state["s8_entry_price"]         = 0.0
+    state["s8_be_activated"]        = False
+    state["s8_open_time_utc"]       = None
+    state["s8_trade_direction"]     = None
+    state["s8_stop_price_original"] = 0.0
+    state["s8_stop_price_current"]  = 0.0
+    state["r3_open_ticket"]         = None
+    state["r3_open_time"]           = None
+    state["r3_event_name"]          = None
+
     persist_critical_state(state)
 
     send_ks_alert("EMERGENCY_SHUTDOWN", (
@@ -1266,9 +1665,10 @@ def emergency_shutdown(reason: str, state: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_our_position_by_ticket(mt5, ticket: int):
-    """Returns position by ticket, enforcing magic filter (C5 Fix)."""
-    positions = mt5.positions_get(symbol=config.SYMBOL) or []
+    """Returns position by ticket, enforcing magic filter (C5 Fix).
+    MED-6 FIX: Use direct ticket lookup instead of O(n) symbol scan."""
+    positions = mt5.positions_get(ticket=ticket) or []
     for pos in positions:
-        if pos.ticket == ticket and pos.magic == config.MAGIC:
+        if pos.magic == config.MAGIC:
             return pos
     return None

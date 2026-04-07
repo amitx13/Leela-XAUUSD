@@ -4,8 +4,10 @@ state.py — System runtime state.
 Phase 2 update:
   - Added R3, S4, S5 state keys
   - Added ks7_pre_event_price for R3 direction determination
-  - Bug 2 fix: all S3 sweep resets consolidated in reset_daily_counters()
+  - Bug 2 fix: all S3 sweep resets consolidated in reset_daily_state()
   - F1-F7 state keys merged (S8, spread_multiplier, dxy_ewma_variance, etc.)
+  - V3.0 fix: S8 independent position lane keys added
+  - V3.0 fix: DI+/DI- H4 cache keys added (for S6/S7 ADX filter)
 """
 from datetime import datetime
 import pytz
@@ -22,6 +24,7 @@ def build_initial_state() -> dict:
         "regime_calculated_at":         datetime.now(pytz.utc),
         "size_multiplier":              0.0,
         "_last_persisted_regime":       None,
+        "regime_cold_start_until":      None,   # MED-2: blocks entries during warm-up
 
         # ── Macro ─────────────────────────────────────────────────────────────
         "macro_bias":                   "BOTH_PERMITTED",
@@ -39,6 +42,8 @@ def build_initial_state() -> dict:
         "weekly_net_pnl_pct":           0.0,
         "peak_equity":                  0.0,
         "current_drawdown_pct":         0.0,
+        "equity_at_day_start":          0.0,   # HIGH-3: denominator for daily P&L %
+        "equity_at_week_start":         0.0,   # HIGH-4: denominator for weekly P&L %
 
         # ── Main trend-family position ─────────────────────────────────────────
         "open_position":                None,
@@ -58,6 +63,8 @@ def build_initial_state() -> dict:
         # ── Loss tracking ─────────────────────────────────────────────────────
         "consecutive_losses":           0,
         "consecutive_m5_losses":        0,
+        "recent_loss_r_multiples":      [],     # OPT-1.3: Track last 6 loss severities
+        "momentum_exit_count":          0,      # OPT-3.4: consecutive M5 closes against EMA20
 
         # ── Daily counters ────────────────────────────────────────────────────
         "s1_family_attempts_today":     0,
@@ -88,6 +95,11 @@ def build_initial_state() -> dict:
         "shutdown_reason":              None,
         "network_fail_count":           0,
 
+        # ── KS6 Auto-Reset Tracking (Backtest Only) ───────────────────────
+        "ks6_events":                  [],       # List of all KS6 events
+        "ks6_cooldown_until_bar":      -1,       # Bar index when cooldown ends
+        "ks6_fired":                   False,     # Current KS6 trigger status
+
         # ── Spread tracking ───────────────────────────────────────────────────
         "session_spread_initialized":   False,
         "spread_fallback_active":       True,
@@ -110,6 +122,10 @@ def build_initial_state() -> dict:
         "tlt_slope":                    0.0,
         "last_atr_h1_raw":              0.0,   # F1-F7 Bug 1 fix: cached H1 ATR value
 
+        # ── Cached DI+/DI- values (V3.0: for S6/S7 ADX trend filter) ──────────
+        "last_di_plus_h4":              None,
+        "last_di_minus_h4":             None,
+
         # ── S1 pending STOP orders ────────────────────────────────────────────
         "s1_pending_buy_ticket":        None,
         "s1_pending_sell_ticket":       None,
@@ -124,6 +140,9 @@ def build_initial_state() -> dict:
 
         # ── KS4 countdown ─────────────────────────────────────────────────────
         "ks4_reduced_trades_remaining": 0,
+        "ks3_throttled":                False,  # True when daily P&L below KS3_THROTTLE_THRESHOLD_PCT
+        "ks6_recovery_mode":            False,  # OPT-1.4: KS6 drawdown recovery mode
+        "ks6_recovery_wins":            0,      # OPT-1.4: KS6 consecutive wins during recovery
 
         # ── S3 Stop Hunt Reversal ─────────────────────────────────────────────
         "s3_sweep_candle_time":         None,
@@ -146,8 +165,9 @@ def build_initial_state() -> dict:
         "s7_fired_today":               False,
         "s7_daily_atr":                 0.0,
         "high_corr_pairs":              [],
+        "reconcile_ghost_streak":       0,   # consecutive reconcile passes seeing ghost tickets
 
-        # ── S8 ATR Spike Trade (F7) ────────────────────────────────────────────
+        # ── S8 ATR Spike Trade (F7) — signal/arm state ─────────────────────────
         "s8_armed":                     False,
         "s8_arm_time":                  None,
         "s8_arm_candle_time":           None,
@@ -157,6 +177,17 @@ def build_initial_state() -> dict:
         "s8_spike_atr":                 0.0,
         "s8_spike_candle_idx":          None,
         "s8_fired_today":               False,
+
+        # ── S8 ATR Spike Trade — independent position lane (V3.0) ──────────────
+        # S8 does NOT occupy trend_family. It has its own open-position keys
+        # so it can coexist with S1/S4/S5 trend trades.
+        "s8_open_ticket":               None,
+        "s8_entry_price":               0.0,
+        "s8_stop_price_original":       0.0,
+        "s8_stop_price_current":        0.0,
+        "s8_trade_direction":           None,
+        "s8_be_activated":              False,
+        "s8_open_time_utc":             None,
 
         # ══════════════════════════════════════════════════════════════════════
         # PHASE 2 — NEW STATE KEYS
@@ -188,6 +219,7 @@ def build_initial_state() -> dict:
         "london_session_tracking_active": False,
         "s5_compression_confirmed":     False,
         "s5_fired_today":               False,
+        "s5_noon_checked_today":        False,  # ISSUE-6 FIX: one-shot noon check guard
         "d1_atr_14":                    0.0,    # D1 ATR(14,RMA) — computed at midnight
     }
 
@@ -205,6 +237,7 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "regime_calculated_at":         datetime,
     "size_multiplier":              float,
     "_last_persisted_regime":       (str, type(None)),
+    "regime_cold_start_until":      (datetime, type(None)),
 
     # Macro
     "macro_bias":                   str,
@@ -222,6 +255,8 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "weekly_net_pnl_pct":           float,
     "peak_equity":                  float,
     "current_drawdown_pct":         float,
+    "equity_at_day_start":          float,
+    "equity_at_week_start":         float,
 
     # Main position
     "open_position":                (int, type(None)),
@@ -287,6 +322,10 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "tlt_slope":                    float,
     "last_atr_h1_raw":              float,
 
+    # Cached DI+/DI- (V3.0)
+    "last_di_plus_h4":              (float, type(None)),
+    "last_di_minus_h4":             (float, type(None)),
+
     # S1 pending
     "s1_pending_buy_ticket":        (int, type(None)),
     "s1_pending_sell_ticket":       (int, type(None)),
@@ -323,8 +362,9 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "s7_fired_today":               bool,
     "s7_daily_atr":                 float,
     "high_corr_pairs":              list,
+    "reconcile_ghost_streak":       int,
 
-    # S8 (F7)
+    # S8 signal/arm state (F7)
     "s8_armed":                     bool,
     "s8_arm_time":                  (datetime, type(None)),
     "s8_arm_candle_time":           (datetime, type(None)),
@@ -334,6 +374,15 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "s8_fired_today":               bool,
     "s8_spike_atr":                 float,
     "s8_spike_candle_idx":          (int, type(None)),
+
+    # S8 independent position lane (V3.0)
+    "s8_open_ticket":               (int, type(None)),
+    "s8_entry_price":               float,
+    "s8_stop_price_original":       float,
+    "s8_stop_price_current":        float,
+    "s8_trade_direction":           (str, type(None)),
+    "s8_be_activated":              bool,
+    "s8_open_time_utc":             (str, type(None)),
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
 
@@ -361,20 +410,23 @@ REQUIRED_STATE_KEYS: dict[str, type | tuple] = {
     "london_session_tracking_active": bool,
     "s5_compression_confirmed":     bool,
     "s5_fired_today":               bool,
+    "s5_noon_checked_today":        bool,   # ISSUE-6 FIX
     "d1_atr_14":                    float,
 }
 
 
 def validate_state_keys(state: dict) -> None:
     for key, expected_type in REQUIRED_STATE_KEYS.items():
-        assert key in state, (
-            f"STATE_KEY_MISSING: '{key}' not found in state. "
-            f"Add it to both build_initial_state() and REQUIRED_STATE_KEYS."
-        )
-        assert isinstance(state[key], expected_type), (
-            f"STATE_TYPE_ERROR: '{key}' expected {expected_type}, "
-            f"got {type(state[key]).__name__} = {state[key]!r}"
-        )
+        if key not in state:
+            raise KeyError(
+                f"STATE_KEY_MISSING: '{key}' not found in state. "
+                f"Add it to both build_initial_state() and REQUIRED_STATE_KEYS."
+            )
+        if not isinstance(state[key], expected_type):
+            raise TypeError(
+                f"STATE_TYPE_ERROR: '{key}' expected {expected_type}, "
+                f"got {type(state[key]).__name__} = {state[key]!r}"
+            )
     extra_keys = set(state.keys()) - set(REQUIRED_STATE_KEYS.keys())
     if extra_keys:
         log_event("STATE_EXTRA_KEYS_WARNING",
@@ -382,24 +434,47 @@ def validate_state_keys(state: dict) -> None:
                   note="Add these to REQUIRED_STATE_KEYS")
 
 
-def reset_daily_counters(state: dict) -> None:
+def reset_daily_state(state: dict) -> None:
     """
-    Bug 2 fix: ALL daily state resets are in ONE place.
-    This is the single source of truth — midnight_reset_job calls this
-    and does NOT scatter additional resets across other files.
+    Unified authoritative daily state reset.
+    Resets ALL intra-day counters and signal flags for S1-S8, R3, S4, S5.
+    Called by midnight_reset_job() in main.py once daily.
 
-    RULE: consecutive_losses and peak_equity are NEVER reset here.
-    A losing streak that spans midnight is still a streak.
+    HARDENING: Includes assertions to verify state reset success.
+
+    RULES:
+      1. Rolling state (consecutive_losses, peak_equity) is NEVER reset here.
+      2. Pending tickets (s1b_pending, s6_pending, s7_pending) are NOT cleared
+         here (legacy pending support).
+      3. Open independent tickets (s8_open_ticket, r3_open_ticket) are NOT cleared.
     """
-    # ── P&L ───────────────────────────────────────────────────────────────────
+    # ── P&L & Exposure ────────────────────────────────────────────────────────
     state["daily_net_pnl_pct"]          = 0.0
     state["daily_commission_paid"]      = 0.0
+    state["ks3_throttled"]              = False
+    state["momentum_exit_count"]        = 0
+
+    # HIGH-3 FIX: Capture start-of-day equity for accurate KS3 denominator.
+    # On Monday resets, also capture start-of-week equity for KS5 (HIGH-4).
+    try:
+        from utils.mt5_client import get_mt5
+        _mt5 = get_mt5()
+        _info = _mt5.account_info()
+        if _info and _info.equity > 0:
+            state["equity_at_day_start"] = float(_info.equity)
+            import pytz as _pytz
+            from datetime import datetime as _dt
+            if _dt.now(_pytz.utc).weekday() == 0:  # Monday
+                state["equity_at_week_start"] = float(_info.equity)
+    except Exception:
+        pass  # MT5 not yet connected on first boot — equity stays at 0.0
 
     # ── Signal attempt counters ────────────────────────────────────────────────
     state["s1_family_attempts_today"]   = 0
     state["s1f_attempts_today"]         = 0
+    state["consecutive_m5_losses"]      = 0
 
-    # ── Spread warmup ─────────────────────────────────────────────────────────
+    # ── Spread tracking reset ─────────────────────────────────────────────────
     state["session_spread_initialized"] = False
     state["spread_fallback_active"]     = True
     state["spread_readings_count"]      = 0
@@ -407,63 +482,60 @@ def reset_daily_counters(state: dict) -> None:
     state["spread_elevated_last_ratio"] = 0.0
     state["spread_multiplier"]          = 1.0
 
-    # ── Session time-kills ────────────────────────────────────────────────────
+    # ── Session boundaries ────────────────────────────────────────────────────
     state["london_tk_fired_today"]      = False
     state["ny_tk_fired_today"]          = False
 
-    # ── M5 cycling ────────────────────────────────────────────────────────────
-    state["consecutive_m5_losses"]      = 0
-
-    # ── S1 family daily guards ────────────────────────────────────────────────
+    # ── Signal-specific daily guards ──────────────────────────────────────────
+    # S1 family items
     state["s1d_ema_touched_today"]      = False
     state["s1d_fired_today"]            = False
 
-    # ── S3 Stop Hunt — Bug 2 fix: ALL S3 resets here, not split across files ──
+    # S3 Reversal items
     state["s3_fired_today"]             = False
     state["s3_sweep_candle_time"]       = None
     state["s3_sweep_low"]               = 0.0
     state["s3_sweep_high"]              = 0.0
 
-    # ── Reversal family reset ─────────────────────────────────────────────────
-    # Only reset occupied flag — don't clear s1b_pending_ticket
-    # (it may still be a valid resting order from yesterday's session)
-    state["reversal_family_occupied"]   = False
-
-    # ── S6 daily guard ────────────────────────────────────────────────────────
+    # S6, S7, S8 daily signal flags (Signals, not positions)
     state["s6_fired_today"]             = False
-
-    # ── S7 daily guard ────────────────────────────────────────────────────────
     state["s7_fired_today"]             = False
-
-    # ── S8 daily guard ────────────────────────────────────────────────────────
     state["s8_fired_today"]             = False
     state["s8_armed"]                   = False
     state["s8_arm_time"]                = None
+    state["s8_arm_candle_time"]         = None
     state["s8_spike_high"]              = 0.0
     state["s8_spike_low"]               = 0.0
     state["s8_direction"]               = None
+    state["s8_spike_candle_idx"]        = None
 
-    # ── Phase 2: R3 daily reset ───────────────────────────────────────────────
+    # Family occupation flags
+    state["reversal_family_occupied"]   = False
+
+    # ── Phase 2 resets ────────────────────────────────────────────────────────
+    # R3
     state["r3_armed"]                   = False
     state["r3_arm_time"]                = None
     state["r3_direction"]               = None
     state["r3_fired_today"]             = False
-    # NOTE: r3_open_ticket is NOT reset here.
-    # If a trade is open at midnight (unlikely but possible), it stays tracked.
 
-    # ── Phase 2: S4 daily reset ───────────────────────────────────────────────
+    # S4
     state["s4_ema_touched"]             = False
     state["s4_fired_today"]             = False
     state["s4_touch_bar_low"]           = 0.0
     state["s4_touch_bar_high"]          = 0.0
 
-    # ── Phase 2: S5 + London session tracking reset ───────────────────────────
+    # S5
     state["s5_fired_today"]             = False
     state["s5_compression_confirmed"]   = False
+    state["s5_noon_checked_today"]      = False   # ISSUE-6 FIX: reset each midnight
     state["london_session_high"]        = 0.0
     state["london_session_low"]         = 0.0
     state["london_session_tracking_active"] = False
-    # NOTE: d1_atr_14 is NOT reset here.
-    # midnight_reset_job recomputes it fresh from MT5 D1 bars and stores it.
 
-    log_event("DAILY_COUNTERS_RESET")
+    # ── Hardening assertions ──────────────────────────────────────────────────
+    assert state["daily_net_pnl_pct"] == 0.0, "daily_pnl_reset_failure"
+    assert state["s1_family_attempts_today"] == 0, "s1_family_attempts_reset_failure"
+    assert state["s8_fired_today"] is False, "s8_fired_reset_failure"
+
+    log_event("DAILY_STATE_RESET_COMPLETE")

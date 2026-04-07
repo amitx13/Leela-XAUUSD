@@ -403,6 +403,19 @@ def weekly_review_report() -> None:
 
     print("")
     print(_LINE)
+    print("  BY SESSION")
+    print(_LINE)
+    if not stats.get("by_session"):
+        print("  No session data available.")
+    else:
+        print(f"  {'Session':<18} {'Trades':>6} {'WR%':>7} {'AvgR':>8} {'Expect':>8}")
+        print(f"  {'-'*18} {'-'*6} {'-'*7} {'-'*8} {'-'*8}")
+        for sess, d in sorted(stats["by_session"].items()):
+            print(f"  {sess:<18} {d['trades']:>6} {d['win_rate']*100:>6.1f}% "
+                  f"{d['avg_r']:>+8.4f} {d['expectancy']:>+8.4f}")
+
+    print("")
+    print(_LINE)
     print("  CONVICTION DELTA  (A+ vs STANDARD expectancy)")
     print(_LINE)
     if conv_delta is None:
@@ -476,7 +489,10 @@ def _ewma_win_rate(trades_ordered_oldest_first: list[dict], alpha: float = 0.05)
     weights = [(1 - alpha) ** (n - 1 - i) for i in range(n)]
     total_weight = sum(weights)
     weighted_wins = sum(
-        w * (1.0 if t["outcome"] == "WIN" else 0.0)
+        # ISSUE-2 FIX: trades table stores r_multiple (float), not an 'outcome' enum.
+        # Accessing t["outcome"] caused KeyError or always 0.0 — conviction delta was
+        # permanently 0. Derive win from r_multiple > 0 instead.
+        w * (1.0 if float(t.get("r_multiple") or 0) > 0 else 0.0)
         for w, t in zip(weights, trades_ordered_oldest_first)
     )
     return weighted_wins / total_weight
@@ -580,7 +596,24 @@ class EdgeDecayMonitor:
             self.alerts.append(
                 f"Insufficient trades for edge detection: {len(trades)}/{config.EDGE_MIN_TRADES}"
             )
-            return self._result(trades_100={}, trades_30={})
+            return self._result(metrics_100={}, metrics_30={})
+
+        # ── OPT-7.2: Per-Strategy Edge Check ────────────
+        from collections import defaultdict
+        by_strategy = defaultdict(list)
+        for t in trades:
+            by_strategy[t.get("signal_type", "UNKNOWN")].append(t)
+            
+        for strat, strat_trades in by_strategy.items():
+            if len(strat_trades) >= 10:
+                s_metrics = self._compute_metrics(strat_trades)
+                if s_metrics["expectancy"] < 0:
+                    self.alerts.append(
+                        f"STRATEGY_EDGE_NEGATIVE [{strat}]: {s_metrics['expectancy']:+.4f}R "
+                        f"over {s_metrics['trade_count']} trades"
+                    )
+                    if self.status != "CRITICAL":
+                        self.status = "WARNING"
 
         # ── Compute metrics for full window (up to 100 trades) ────────────
         metrics_100 = self._compute_metrics(trades)

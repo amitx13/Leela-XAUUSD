@@ -1,60 +1,39 @@
-# XAUUSD Trading System - Complete Documentation
-### Version 3.1 | Date: 2026-04-01 | Author: Amit Prasad
-### Classification: System Architecture & Operations Manual
-### Post-Critical Review + Phase 1A/1B (Backtesting, Monitoring, Edge Decay)
+# Leela XAUUSD Algorithmic Trading System
+
+## Overview
+
+Leela is a sophisticated algorithmic trading system designed specifically for XAUUSD (Gold) trading on MetaTrader 5. The system implements multiple trading strategies across different market sessions with advanced risk management, real-time analytics, and comprehensive monitoring capabilities.
+
+**Key Features:**
+- **10 Trading Strategies** across different market conditions and sessions
+- **6-State Regime Engine** for dynamic market classification
+- **Advanced Risk Management** with 7 kill switches and portfolio-level controls
+- **Multi-Session Coverage** (Asian, London, New York, and overlaps)
+- **Economic Calendar Integration** for event-driven trading
+- **Real-time Analytics** and performance monitoring
+- **Complete Audit Trail** for every trade decision
+- **Phase-based Progression** from conservative to aggressive sizing
+
+## Table of Contents
+
+1. [System Architecture](#system-architecture)
+2. [Quick Start Guide](#quick-start-guide)
+3. [Trading Strategies](#trading-strategies)
+4. [Risk Management](#risk-management)
+5. [Market Regimes](#market-regimes)
+6. [Installation & Setup](#installation--setup)
+7. [Configuration](#configuration)
+8. [Daily Operations](#daily-operations)
+9. [Monitoring & Analytics](#monitoring--analytics)
+10. [Troubleshooting](#troubleshooting)
+11. [System Components](#system-components)
 
 ---
 
-## TABLE OF CONTENTS
-1. [System Overview](#section-1--system-overview)
-2. [Architecture](#section-2--architecture)
-3. [Trading Strategies](#section-3--trading-strategies)
-4. [Risk Management](#section-4--risk-management)
-5. [Market Data & Indicators](#section-5--market-data--indicators)
-6. [Database Schema](#section-6--database-schema)
-7. [Operational Procedures](#section-7--operational-procedures)
-8. [Monitoring & Analytics](#section-8--monitoring--analytics)
-9. [Configuration](#section-9--configuration)
-10. [Troubleshooting](#section-10--troubleshooting)
-11. [Recommendations for Future Improvements](#section-11--recommendations)
+## System Architecture
 
----
+The system follows a layered architecture where each layer has specific responsibilities and safety checks:
 
-## SECTION 1 - SYSTEM OVERVIEW
-
-### 1.1 System Identity
-- **Name**: Leela XAUUSD Algorithmic Trading System
-- **Instrument**: XAUUSD (Spot Gold)
-- **Platform**: MetaTrader 5 (MT5) via mt5linux rpyc bridge
-- **Magic Number**: 20260320
-- **Database**: PostgreSQL (Docker container, TCP on 127.0.0.1:5432)
-- **Language**: Python 3.x with APScheduler
-- **Trading Style**: Multi-strategy volatility harvesting across all market sessions
-
-### 1.2 Core Philosophy
-The system operates on the principle that XAUUSD exhibits predictable volatility patterns across different market sessions and economic events. Rather than predicting direction, the system harvests volatility transitions through multiple complementary strategies with strict risk controls.
-
-### 1.3 Key Features
-- **10 Trading Strategies**: S1 family (5), S2, S3, S4, S5, S6, S7, S8, R3
-- **Multi-Session Coverage**: Asian, London, New York, and overlap sessions
-- **Economic Calendar Integration**: Automated high-impact event handling (HorizonFX + hardcoded fallback)
-- **6-State Regime Engine**: Dynamic market state classification with hysteresis
-- **Risk-First Approach**: 7 kill switches + portfolio-level risk controls
-- **ATR-Based Stops**: All strategies use ATR-scaled stops (v3.0 — replaced fixed-point stops)
-- **Volume Filtering**: S1 breakouts require minimum volume confirmation (v3.0)
-- **ADX Trend Filtering**: S6/S7 dual orders biased by trend direction (v3.0)
-- **Active Conviction Sizing**: EWMA-weighted A+ conditions boost size after 50+ trades (v3.1)
-- **Starvation Tracking** (v3.1): Automated detection of signal pipeline blockages
-- **Edge Decay Detection** (v3.1): Rolling expectancy/WR monitor with auto-revert to Phase 1
-- **Backtesting Framework** (v3.1): Full M5 replay engine with walk-forward validation
-- **Monte Carlo Risk Analysis** (v3.1): 10K-simulation drawdown probability estimation
-- **Complete Audit Trail**: Every trade decision logged with full context
-
----
-
-## SECTION 2 - ARCHITECTURE
-
-### 2.1 System Layers
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    MARKET DATA LAYER                         │
@@ -100,16 +79,229 @@ The system operates on the principle that XAUUSD exhibits predictable volatility
 │                 TRUTH ENGINE                                │
 │  Performance analytics, EWMA conviction, edge decay monitor │
 │  Starvation tracking, weekly reviews                        │
-└─────────────────┬───────────────────────────────────────────┘
-                  ↓
-┌─────────────────────────────────────────────────────────────┐
-│              BACKTESTING FRAMEWORK (v3.1)                    │
-│  M5 replay engine, execution simulator, walk-forward        │
-│  Monte Carlo risk-of-ruin analysis (10K simulations)        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Regime States (v3.0 — updated multipliers)
+### Core Components
+
+- **Data Engine**: Handles all market data feeds from MT5 and external APIs
+- **Regime Engine**: Classifies market conditions into 6 states with hysteresis
+- **Signal Engine**: Generates trade signals from 10 different strategies
+- **Risk Engine**: Manages position sizing and implements safety mechanisms
+- **Execution Engine**: Handles order placement and position management
+- **Truth Engine**: Monitors performance and system health
+
+---
+
+## Quick Start Guide
+
+### For Beginners
+
+If you're new to algorithmic trading or this system, follow these steps:
+
+1. **Prerequisites Check**
+   - Ensure you have MetaTrader 5 installed
+   - Have a funded trading account (demo or live)
+   - Python 3.11+ installed on your system
+
+2. **System Setup**
+   ```bash
+   # Clone repository
+   git clone <repository-url>
+   cd xauusd_algo
+   
+   # Create virtual environment
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   
+   # Install dependencies
+   pip install -r requirements.txt
+   ```
+
+3. **Configuration**
+   ```bash
+   # Copy environment template
+   cp .env.example .env
+   
+   # Edit .env with your MT5 and database details
+   nano .env
+   ```
+
+4. **Database Setup**
+   ```bash
+   # Start PostgreSQL (using Docker)
+   docker-compose up -d
+   
+   # Initialize database schema
+   python -c "from db.init_db import init_database; init_database()"
+   ```
+
+5. **First Run (Paper Trading)**
+   ```bash
+   # Run pre-session checklist
+   python main.py --checklist
+   
+   # Start in paper trading mode
+   python main.py --paper
+   ```
+
+### Daily Startup Routine
+
+1. **Pre-Market (12:00 IST)**
+   ```bash
+   python main.py --checklist
+   ```
+   - Verifies MT5 connection
+   - Checks database connectivity
+   - Validates contract specifications
+   - Reviews recent performance
+
+2. **System Start (Before 12:25 IST)**
+   ```bash
+   python main.py --live  # For live trading
+   # or
+   python main.py --paper  # For paper trading
+   ```
+
+3. **Monitor**
+   - Watch for WARM_START completion
+   - Check S6/S7 order placement
+   - Monitor S1 pending order setup
+
+---
+
+## Trading Strategies
+
+The system implements 10 distinct strategies across different market conditions:
+
+### Phase 1 Strategies (Core)
+
+#### S1 Family - London Momentum Strategies
+
+**S1_LONDON_BRK** - Primary London Breakout
+- **Session**: London (08:00-16:30 London time)
+- **Setup**: Pre-London range (00:00-07:55 UTC)
+- **Entry**: BUY/SELL STOP at range boundaries + 12% breakout distance
+- **Volume Filter**: Rejects breakouts with low volume confirmation
+- **Stop Loss**: ATR-based (max(0.3×H1 ATR, 5.0 points))
+- **Take Profit**: 2.5R from entry
+- **Max per Day**: 4 attempts
+
+**S1B_FAILED_BRK** - Failed Breakout Reversal
+- **Trigger**: S1 fills and hits stop loss
+- **Entry**: STOP order beyond false breakout extreme
+- **Auto-Reset**: Clears after 6 M15 candles if no reversal
+
+**S1D_PYRAMID** - M5 Pullback Re-entry
+- **Trigger**: S1 position open + M5 body close above/below EMA20
+- **Entry**: LIMIT at EMA20 with 5-minute expiry
+- **Size**: 0.5× base lot
+- **Max Re-entries**: SUPER=8, NORMAL=5
+
+**S1E_PYRAMID** - Trend Continuation Add
+- **Trigger**: Partial exit done + BE activated
+- **Entry**: Market order
+- **Size**: 0.5× original S1 lots
+
+**S1F_POST_TK** - Post Time-Kill Re-entry
+- **Session**: NY (after London 16:30 time kill)
+- **Entry**: LIMIT at M5 EMA20 with direction validation
+
+#### S2_MEAN_REV - Range Reversion
+- **Regime Gate**: RANGING_CLEAR only
+- **Signal**: H1 close > 1.5×ATR from 20 EMA + RSI confirmation
+- **Entry**: LIMIT at EMA20
+- **Stop**: 1.5×ATR beyond extreme
+
+#### S3_STOP_HUNT_REV - Liquidity Sweep Reversal
+- **Sessions**: London + early NY (08:00-16:30 UTC)
+- **Range Source**: Rolling 3-hour M15 range
+- **Trigger**: Price sweeps range by >0.3×ATR then reclaims within 3 bars
+- **Entry**: BUY STOP 2pts above reclaim candle high
+
+#### S6_ASIAN_BRK - Asian Session Breakout
+- **Session**: Asian (00:00-05:30 UTC setup)
+- **Range**: Asian high/low (00:00-05:30 UTC)
+- **ADX Trend Filter**: Only trending direction in strong trends
+- **Expiry**: 08:00 UTC
+
+#### S7_DAILY_STRUCT - Daily Structure Breakout
+- **Setup**: Previous day OHLC (midnight reset)
+- **Filter**: Previous day range >0.75×daily ATR
+- **ADX Trend Filter**: Same as S6
+- **Size**: 0.5× base lot
+
+### Phase 2 Strategies (Advanced)
+
+#### R3_CAL_MOMENTUM - Economic Calendar Momentum
+- **Trigger**: High-impact economic event release
+- **Wait**: 5 minutes post-release
+- **Volatility Filter**: Post-event move must exceed 0.3×H1 ATR
+- **Entry**: Market order in direction of first M5 close
+- **Hold Limit**: 30 minutes
+- **Family**: Independent (coexists with trend positions)
+
+#### S4_LONDON_PULL - London Pullback Continuation
+- **Session**: London (07:00-12:00 UTC)
+- **Regime Gate**: Trending (ADX > 20 AND increasing)
+- **Entry**: LIMIT at M15 EMA20 with 15-minute expiry
+- **Hard Exit**: 16:00 UTC
+
+#### S5_NY_COMPRESS - NY Compression Breakout
+- **Session**: NY (12:00-15:00 UTC)
+- **Trigger**: London range < 0.70×D1 ATR14 (compressed)
+- **Entry**: BUY/SELL STOP 2pts beyond London boundary
+- **Hard Exit**: 22:00 UTC
+
+#### S8_ATR_SPIKE - Flash Spike Continuation
+- **Trigger**: M15 candle range > 1.5×ATR(14,H1)
+- **Confirmation**: Next M15 close past spike midpoint
+- **Entry**: Market order at current bid/ask
+- **Size**: 0.5× base lot
+
+---
+
+## Risk Management
+
+### Kill Switches (KS1-KS7)
+
+| Switch | Trigger | Action | Recovery |
+|--------|---------|--------|-----------|
+| KS1 | Stop modification against trade | Reject modification | Manual review |
+| KS2 | Spread >2.5× 24h median | Reject order | Wait for spread normalization |
+| KS3 | Daily loss > -7% | Block new entries | Next day reset |
+| KS4 | 4 consecutive losses | Reduce size 50% for 3 trades | Auto-recovery |
+| KS5 | Weekly loss > -15% | Block entries this week | Next week reset |
+| KS6 | Drawdown > 20% from peak | Emergency shutdown | Manual review |
+| KS7 | High-impact event proximity | Block entries 45min pre/20min post | Auto-resume |
+
+### Position Sizing Algorithm
+
+```
+1. Base risk = 1.0% (Phase 1) or 2.0% (Phase 2)
+2. Conviction boost: A+ = ×1.25, OBSERVATION = ×0.75
+3. KS4 countdown: ×0.5 for 3 trades after 4-loss streak
+4. Severity multiplier: from economic event risk score
+5. Spread multiplier: from current vs median spread ratio
+6. Vol scalar: from EWMA ATR percentile
+7. Reduction floor: severity × spread × vol_scalar clamped to minimum 0.50
+8. Compound gate: if severity × spread × vol_scalar < 0.35 → block trade
+9. Final: max(volume_min, min(calculated_lots, V1_LOT_HARD_CAP))
+```
+
+### Portfolio Risk Controls
+
+- **Max Daily VAR**: 2.0% of account equity
+- **Max Session Lots**: 0.15 lots total
+- **Correlation Kill**: Same TREND_FAMILY + same direction → 0.65×
+- **TREND_FAMILY**: {S1_LONDON_BRK, S1F_POST_TK, S4_LONDON_PULL, S5_NY_COMPRESS}
+
+---
+
+## Market Regimes
+
+The system classifies market conditions into 6 states with hysteresis:
+
 | State | ADX H4 | ATR Percentile H1 | DXY Macro | Size Multiplier | Strategies Allowed |
 |-------|--------|-------------------|-----------|-----------------|-------------------|
 | NO_TRADE | Any | >95% | Any | 0.0× | S7 only (pending) |
@@ -119,9 +311,8 @@ The system operates on the principle that XAUUSD exhibits predictable volatility
 | NORMAL_TRENDING | 26-35 | Any | No boost | 1.0× | All strategies |
 | SUPER_TRENDING | >35 | >55% | DXY < -0.70 | **1.5×** | All strategies |
 
-**Session Multiplier** (v3.0): London, London-NY Overlap, and NY = 1.0×. Asian/Off-hours = 0.7×.
+### Session Definitions (UTC)
 
-### 2.3 Session Definitions (UTC)
 | Session | Start | End | Characteristics |
 |---------|-------|-----|----------------|
 | ASIAN | 22:00 | 07:00 | Lower volatility, tight ranges |
@@ -131,235 +322,128 @@ The system operates on the principle that XAUUSD exhibits predictable volatility
 
 ---
 
-## SECTION 3 - TRADING STRATEGIES
+## Installation & Setup
 
-### 3.1 S1 Family - London Momentum Strategies
+### Prerequisites
 
-#### S1_LONDON_BRK - Primary London Breakout
-- **Session**: London (08:00-16:30 London local)
-- **Setup**: Pre-London range (00:00-07:55 UTC)
-- **Entry**: BUY/SELL STOP at range boundaries + breakout distance (12% of range)
-- **Volume Filter** (v3.0): Rejects breakouts with tick_volume < 70% of 5-bar average
-- **Minimum Range**: 10 points
-- **Stop Loss**: ATR-based — `max(0.3 × H1 ATR, 5.0)` beyond opposite range boundary (v3.0 — was fixed 10% of range)
-- **Take Profit**: 2.5R from entry (v3.0 — previously no TP)
-- **Expiry**: 16:30 London local time
-- **Family**: Trend family (blocks other trend strategies)
-- **Max per Day**: 4 (v3.0 — was 3)
+- **Python 3.11+**
+- **MetaTrader 5** with rpyc bridge (mt5linux)
+- **PostgreSQL** (Docker recommended)
+- **Linux environment** (Ubuntu 20.04+ recommended)
 
-#### S1B_FAILED_BRK - Failed Breakout Reversal
-- **Trigger**: S1 fills and hits stop loss with specific conditions
-- **Entry**: STOP order beyond false breakout extreme
-- **Auto-Reset**: Flag clears after 6 M15 candles if no reversal
-- **Max per Day**: 1 per S1 campaign
+### Step-by-Step Installation
 
-#### S1D_PYRAMID - M5 Pullback Re-entry
-- **Trigger**: S1 position open + M5 body close above/below EMA20
-- **Entry**: LIMIT at EMA20 with 5-minute expiry
-- **Size**: 0.5× base lot
-- **Stop**: ATR-based — `max(0.75 × M15 ATR, 15pts)` (v3.0 — was fixed 10-12pts)
-- **Max Re-entries**: SUPER=8, NORMAL=5
-- **Loss Pause**: After 5 consecutive M5 losses (v3.0 — was 3)
+1. **System Dependencies**
+   ```bash
+   sudo apt update
+   sudo apt install python3-pip python3-venv postgresql-client docker.io
+   ```
 
-#### S1E_PYRAMID - Trend Continuation Add
-- **Trigger**: Partial exit done + BE activated + SUPER/NORMAL regime
-- **Entry**: Market order
-- **Size**: 0.5× original S1 lots
-- **Max per Day**: 1 per campaign
+2. **Python Environment**
+   ```bash
+   cd /path/to/xauusd_algo
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
 
-#### S1F_POST_TK - Post Time-Kill Re-entry
-- **Session**: NY (after London 16:30 TK)
-- **Direction Validation** (v3.0): Checks `last_s1_direction` against H1 EMA20 — rejects if market reversed
-- **Entry**: LIMIT at M5 EMA20 with 5-minute expiry
-- **Stop**: 15 points
-- **Max per Day**: 1
+3. **Database Setup**
+   ```bash
+   # Using Docker (recommended)
+   docker-compose up -d
+   
+   # Manual PostgreSQL setup
+   # Create database and user as specified in .env
+   ```
 
-### 3.2 S2_MEAN_REV - Range Reversion (v3.0 — updated)
-- **Regime Gate**: RANGING_CLEAR only
-- **Signal**: H1 close > **1.5× ATR** from 20 EMA + **RSI confirmation** (v3.0 — was 2.5× ATR, no RSI)
-  - SHORT: close > EMA20 + 1.5×ATR AND RSI > 70
-  - LONG: close < EMA20 - 1.5×ATR AND RSI < 30
-- **ATR Percentile**: 30th-85th (not too quiet, not chaotic)
-- **Entry**: LIMIT at EMA20
-- **Stop**: 1.5× ATR beyond extreme
-- **Regime Exit**: Immediate close if regime transitions to any trending state
+4. **MT5 Configuration**
+   - Install MT5 and configure rpyc bridge
+   - Add XAUUSD to Market Watch
+   - Ensure trading is enabled
+   - Note your MT5 terminal path for rpyc connection
 
-### 3.3 S3_STOP_HUNT_REV - Liquidity Sweep Reversal (v3.0 — dynamic range)
-- **Sessions**: London + early NY (08:00-16:30 UTC)
-- **Range Source**: Rolling 3-hour M15 range (v3.0 — was stale pre-London range)
-- **Trigger**: Price sweeps range by >0.3×ATR then M15 close reclaims within 3 bars
-- **Entry**: BUY STOP 2pts above reclaim candle high
-- **Stop**: sweep_low - 0.5×ATR
-- **Max per Session**: 1
+5. **Environment Configuration**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your specific settings:
+   # - MT5 connection details
+   # - Database credentials
+   # - SMTP settings for alerts
+   # - API keys for economic calendar
+   ```
 
-### 3.4 S6_ASIAN_BRK - Asian Session Breakout (v3.0 — trend filtered)
-- **Session**: Asian (00:00-05:30 UTC setup)
-- **Range**: Asian high/low (00:00-05:30 UTC)
-- **Minimum Range**: 8 points
-- **Entry**: Dual BUY/SELL STOP at range boundaries + 5% of range
-- **ADX Trend Filter** (v3.0): In strong trends (ADX>25, DI ratio>1.3×), only trending direction placed
-- **Expiry**: 08:00 UTC
-- **Stop**: 0.5×ATR from entry
-- **Max per Day**: 1
+6. **Database Initialization**
+   ```bash
+   python -c "from db.init_db import init_database; init_database()"
+   ```
 
-### 3.5 S7_DAILY_STRUCT - Daily Structure Breakout (v3.0 — ATR stop + trend filtered)
-- **Setup**: Previous day OHLC (midnight reset)
-- **Filter**: Previous day range >0.75×daily ATR
-- **Entry**: BUY/SELL STOP at prev day extremes + 5pts
-- **Stop**: **0.5 × daily ATR** from entry (v3.0 — was prev_day opposite extreme ± 10pts, 50-90pts wide)
-- **ADX Trend Filter** (v3.0): Same as S6 — only trending direction in strong trends
-- **Size**: 0.5× base lot
-- **Max per Day**: 1
-
-### 3.6 S8_ATR_SPIKE - Flash Spike Continuation (v3.0 — market entry)
-- **Trigger**: M15 candle range > 1.5× ATR(14,H1)
-- **Confirmation**: Next M15 close past spike midpoint (within 3 bars)
-- **Entry**: **Market order at current bid/ask** (v3.0 — was limit at spike midpoint, frequently unfillable)
-- **Stop**: 0.5× ATR from entry
-- **Size**: 0.5× base lot
-- **Max per Day**: 1
-
-### 3.7 Phase 2 Strategies
-
-#### R3_CAL_MOMENTUM - Economic Calendar Momentum (v3.0 — volatility filter)
-- **Trigger**: High-impact economic event release
-- **Wait**: 5 minutes post-release
-- **Volatility Filter** (v3.0): Post-event move must exceed 0.3× H1 ATR — rejects minor releases
-- **Entry**: Market order in direction of first M5 close
-- **Stop**: 0.5 × H1 ATR
-- **TP**: 0.75 × H1 ATR (1.5:1 RR)
-- **Hold Limit**: 30 minutes
-- **Family**: Independent (coexists with trend positions)
-
-#### S4_LONDON_PULL - London Pullback Continuation
-- **Session**: London (07:00-12:00 UTC)
-- **Regime Gate**: Trending (ADX > 20 AND increasing)
-- **Entry**: LIMIT at M15 EMA20 with 15-minute expiry
-- **Stop**: touch_bar extreme - 0.3 × H1 ATR
-- **TP**: 1.5 × stop distance
-- **Hard Exit**: 16:00 UTC
-- **Position Management** (v3.0): Momentum cycling in SUPER/NORMAL, BE activation, partial exit
-
-#### S5_NY_COMPRESS - NY Compression Breakout (v3.0 — STOP order entry)
-- **Session**: NY (12:00-15:00 UTC)
-- **Trigger**: London range < 0.70 × D1 ATR14 (compressed)
-- **Entry**: **BUY/SELL STOP 2pts beyond London boundary** (v3.0 — was M15 close, guaranteed adverse slippage)
-- **Stop**: Opposite London extreme + 0.3 × H1 ATR
-- **TP**: 1.0 × London range from entry
-- **Hard Exit**: 22:00 UTC
-- **Position Management** (v3.0): Momentum cycling, BE activation, partial exit
+7. **System Verification**
+   ```bash
+   python main.py --checklist
+   ```
 
 ---
 
-## SECTION 4 - RISK MANAGEMENT
+## Configuration
 
-### 4.1 Kill Switches (KS1-KS7) — v3.0 updated thresholds
+### Core Parameters (config.py)
 
-| Switch | Trigger | Action | Recovery |
-|--------|---------|--------|-----------|
-| KS1 | Stop modification against trade | Reject modification | Manual review |
-| KS2 | Spread >2.5× 24h median at placement | Reject order | Wait for spread normalization |
-| KS3 | Daily loss > **-4.0%** (v3.0 — was -3%) | Block new entries today | Next day reset |
-| KS4 | **6** consecutive losses (v3.0 — was 4) | Reduce size 50% for **3** trades (v3.0 — was 5) | Auto-recovery |
-| KS5 | Weekly loss > **-10.0%** (v3.0 — was -8%) | Block entries this week | Next week reset |
-| KS6 | Drawdown > **12%** from peak (v3.0 — was 8%) | Emergency shutdown | Manual review |
-| KS7 | High-impact event proximity | Block entries 45min pre/20min post | Auto-resume after ATR check |
-
-### 4.2 Position Sizing Algorithm (v3.0 — with reduction floor + conviction)
-```
-1. Base risk = 1.0% (Phase 1) or 2.0% (Phase 2: 50+ trades, WR>45%, exp>+0.15R)
-2. Conviction boost (v3.0): A+ = ×1.25, OBSERVATION = ×0.75 (after 50+ trades with >8pp delta)
-3. KS4 countdown: ×0.5 for 3 trades after 6-loss streak
-4. Severity multiplier: from economic event risk score
-5. Spread multiplier: from current vs median spread ratio
-6. Vol scalar: from EWMA ATR percentile
-7. REDUCTION FLOOR (v3.0): severity × spread × vol_scalar clamped to minimum 0.50
-8. Compound gate: if severity × spread × vol_scalar < 0.35 → block trade entirely
-9. Final: max(volume_min, min(calculated_lots, V1_LOT_HARD_CAP))
+#### Risk Parameters
+```python
+BASE_RISK_PHASE_1      = 0.010   # 1.0% per trade
+BASE_RISK_PHASE_2      = 0.020   # 2.0% (after 50 proven trades)
+V1_LOT_HARD_CAP        = 0.50    # Maximum lot size
+MIN_CONDITION_MULTIPLIER = 0.35    # Compound gate threshold
 ```
 
-### 4.3 Portfolio Risk Controls (v3.0 — updated)
-- **Max Daily VAR**: 2.0% of account equity
-- **Max Session Lots**: 0.15 lots total
-- **Correlation Kill** (v3.0): Only same TREND_FAMILY + same direction → 0.65× (was: any same direction → 0.5×)
-  - TREND_FAMILY = {S1_LONDON_BRK, S1F_POST_TK, S4_LONDON_PULL, S5_NY_COMPRESS}
-- **SUPER_TRENDING Scaling** (v3.0): Removed double-halving — regime multiplier (1.5×) handles sizing
-- **Correlation Monitoring**: Every 10 closed trades, Pearson correlation of daily P&L
+#### Kill Switch Thresholds
+```python
+KS3_DAILY_LOSS_LIMIT_PCT   = -0.070  # -7%
+KS4_LOSS_STREAK_COUNT      = 4       # 4 consecutive losses
+KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.150  # -15%
+KS6_DRAWDOWN_LIMIT_PCT     = 0.20    # 20% drawdown
+```
 
-### 4.4 Position Management (v3.0 — all strategies managed)
-| Regime | S1 Family | S4/S5 | S6/S7 |
-|--------|-----------|-------|-------|
-| SUPER/NORMAL | Momentum cycle exit → S1d re-entry | Momentum cycle exit + BE activation | BE activation + partial exit |
-| WEAK | Partial exit at **2.0R** (v3.0 — was 1.0R) + BE at **1.5R** (v3.0 — was 0.75R) | Same | Same |
-| ATR Trail | **2.5×** M15 ATR (v3.0 — was 1.5×) | Same | Same |
+#### Strategy Parameters
+```python
+MIN_RANGE_SIZE_PTS      = 10     # Minimum viable pre-London range
+S6_MIN_RANGE_PTS       = 8.0    # Minimum Asian range
+S7_MIN_RANGE_ATR_RATIO = 0.75   # Minimum daily range ratio
+PARTIAL_EXIT_R         = 2.0    # Take 50% at 2R
+BE_ACTIVATION_R        = 1.5    # BE after 1.5R
+```
 
----
+### Environment Variables (.env)
 
-## SECTION 5 - MARKET DATA & INDICATORS
+```bash
+# Environment
+ENV=prod
 
-### 5.1 Data Sources
-- **Primary**: MT5 real-time tick data via rpyc bridge
-- **Economic Calendar**: HorizonFX API with hardcoded fallback (NFP, FOMC, CPI, PPI, Retail Sales)
-- **Macro Proxy**: TLT/TIP ETF via yfinance (daily 09:00 IST)
-- **DXY Correlation**: USDX via MT5 or UUP ETF fallback
+# MT5 Connection
+MT5_HOST=localhost
+MT5_PORT=18812
 
-### 5.2 Core Indicators
+# Database
+DATABASE_URL=postgresql://xauusd_user:password@127.0.0.1:5432/xauusd
 
-#### ADX (Average Directional Index)
-- **Period**: 14, **Timeframe**: H4, **Smoothing**: Wilder's RMA
-- **Usage**: Trend strength + direction (DI+/DI- for S6/S7 trend filter)
-- **Slope Detection**: Required for S4 (increasing ADX)
+# SMTP Alerts
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+ALERT_RECIPIENT=your-email@gmail.com
 
-#### ATR (Average True Range)
-- **Period**: 14, **Smoothing**: Wilder's RMA (pinned to TradingView)
-- **H1**: Regime percentile, stop calculations, R3/S8 sizing
-- **M15**: Position management trailing, S1d stop calculation
-- **D1**: S7 filter, S5 compression check
-
-#### RSI (Relative Strength Index) — v3.0
-- **Period**: 14, **Timeframe**: H1
-- **Usage**: S2 mean reversion confirmation (>70 SHORT, <30 LONG)
-
-### 5.3 Spread Management
-- **Tracking**: Real-time spread logging every 5 minutes
-- **Baseline**: 24-hour rolling **median** (v3.0 — SQL syntax fixed)
-- **Gate**: KS2 blocks orders at >2.5× median spread
-- **Adjustment**: All BUY STOP orders include current spread
+# Economic Calendar
+HORIZONFX_BASE_URL=https://economic-calendar.horizonfx.id/events
+```
 
 ---
 
-## SECTION 6 - DATABASE SCHEMA
+## Daily Operations
 
-### 6.1 Core Tables
+### Session Schedule (IST)
 
-#### system_state.system_state_persistent
-Stores daily state for warm-start recovery. Includes all Phase 2 fields (r3/s4/s5 flags), DXY variance, spread multiplier.
-
-#### system_state.trades
-Complete trade audit trail with:
-- Entry/exit prices, times, lot sizes
-- P&L calculation: `(price_diff / tick_size) × tick_value × lot_size` (v3.0 — BUG-9 fix)
-- R-multiple always vs `stop_price_original`
-- Phase 2 audit columns (r3_pre_event_price, s4_adx, s5_london_range, severity/spread/compound multipliers)
-
-#### market_data.economic_events
-Event tracking with HorizonFX source flag and fallback indicator.
-
-### 6.2 Logging Tables
-- **system_state.spread_log**: Spread tracking every 5 minutes
-- **system_state.regime_log**: Regime changes with context
-- **market_data.macro_signals**: Daily bias calculations
-
----
-
-## SECTION 7 - OPERATIONAL PROCEDURES
-
-### 7.1 Daily Startup Sequence
-1. **Pre-Market Check** (12:00 IST): `python main.py --checklist`
-2. **System Start** (Before 12:25 IST): `python main.py --live`
-3. **Monitor For**: WARM_START, S6/S7 orders, S1 pending placement
-
-### 7.2 Session Schedule (IST)
 | Time | Event | Strategy |
 |------|-------|----------|
 | 00:00 | Midnight reset + S7 orders | Daily |
@@ -373,72 +457,95 @@ Event tracking with HorizonFX source flag and fallback indicator.
 | 22:00 | London time kill | London |
 | 03:30 | S5 hard exit (22:00 UTC) | S5 |
 
-### 7.3 Shutdown Procedure
-- Ctrl+C for graceful shutdown
-- Cancels all pending orders, persists critical state
+### Daily Startup Sequence
+
+1. **Pre-Market Check (12:00 IST)**
+   ```bash
+   python main.py --checklist
+   ```
+   - Verify MT5 connection
+   - Check database connectivity
+   - Validate contract specifications
+   - Review recent performance metrics
+
+2. **System Start (Before 12:25 IST)**
+   ```bash
+   # For live trading
+   python main.py --live
+   
+   # For paper trading (recommended for testing)
+   python main.py --paper
+   ```
+
+3. **Monitor Key Events**
+   - WARM_START completion (regime engine initialization)
+   - S6/S7 pending order placement
+   - S1 pre-London range calculation
+   - Economic calendar updates
+
+### Shutdown Procedure
+
+- **Graceful Shutdown**: Press Ctrl+C
+- **Automatic Actions**:
+  - Cancels all pending orders
+  - Persists critical state
+  - Closes database connections
+  - Logs shutdown reason
 
 ---
 
-## SECTION 8 - MONITORING & ANALYTICS
+## Monitoring & Analytics
 
-### 8.1 Truth Engine Analytics
-- **Daily**: Trades per strategy, win/loss ratios, P&L%, commission, spread analysis
-- **Weekly**: `python main.py --weekly` — full performance review with action items
+### Truth Engine Analytics
 
-### 8.2 Conviction Levels (v3.0 — ACTIVE sizing)
+The Truth Engine provides comprehensive performance monitoring:
+
+#### Daily Analytics
+- Trades per strategy
+- Win/loss ratios
+- P&L percentages
+- Commission tracking
+- Spread analysis
+
+#### Weekly Reviews
+```bash
+python main.py --weekly
+```
+- Full performance review
+- Strategy effectiveness analysis
+- Risk metric evaluation
+- Action items for optimization
+
+### Conviction Levels
+
 | Level | Criteria | Size Effect |
 |-------|----------|-------------|
 | STANDARD | Default conditions | 1.0× |
-| A_PLUS | Clear horizon (90 min no events) + regime alignment | **1.25×** (v3.0 — was observation only) |
-| OBSERVATION | Macro misalignment or elevated risk | **0.75×** (v3.0 — was observation only) |
+| A_PLUS | Clear horizon + regime alignment | **1.25×** |
+| OBSERVATION | Macro misalignment or elevated risk | **0.75×** |
 
 **Activation Gate**: Requires 50+ trades AND >8pp win-rate delta between A+ and OBSERVATION.
 
-### 8.3 Performance Benchmarks
+### Performance Benchmarks
+
 - **Minimum Win Rate**: 45%
 - **Minimum Expectancy**: 0.15R
 - **Maximum Drawdown**: 15% (Phase 2 gate)
 - **Sharpe Ratio Target**: >1.0 (Phase 3 gate)
 
----
+### Edge Decay Detection
 
-## SECTION 9 - CONFIGURATION
+The system monitors for strategy degradation:
 
-### 9.1 Core Parameters (config.py) — v3.0 values
-
-#### Risk Parameters
-```python
-BASE_RISK_PHASE_1      = 0.010   # 1.0% per trade
-BASE_RISK_PHASE_2      = 0.020   # 2.0% (after 50 proven trades)
-V1_LOT_HARD_CAP        = 0.50    # Maximum lot size
-MIN_CONDITION_MULTIPLIER = 0.35  # Compound gate threshold
-```
-
-#### Kill Switch Thresholds (v3.0)
-```python
-KS3_DAILY_LOSS_LIMIT_PCT   = -0.040  # -4% (was -3%)
-KS4_LOSS_STREAK_COUNT      = 6       # (was 4)
-KS4_REDUCED_TRADES         = 3       # (was 5)
-KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.100  # -10% (was -8%)
-KS6_DRAWDOWN_LIMIT_PCT     = 0.12    # 12% (was 8%)
-```
-
-#### Position Management (v3.0)
-```python
-PARTIAL_EXIT_R         = 2.0   # Take 50% at 2R (was 1R)
-BE_ACTIVATION_R        = 1.5   # BE after 1.5R + swing (was 0.75R)
-ATR_TRAIL_MULTIPLIER   = 2.5   # 2.5× M15 ATR trail (was 1.5×)
-S1D_STOP_POINTS_MIN    = 15    # M5 re-entry min stop (was 10)
-S1D_STOP_POINTS_MAX    = 20    # M5 re-entry max stop (was 12)
-M5_LOSS_PAUSE_COUNT    = 5     # Pause after 5 M5 losses (was 3)
-MAX_S1_FAMILY_ATTEMPTS = 4     # S1+S1b daily limit (was 3)
-```
+- **Warning Level**: Expectancy < 0.10R or Win Rate < 40%
+- **Critical Level**: Expectancy < 0.05R or Win Rate < 35%
+- **Action**: Auto-revert to Phase 1 if critical levels detected
 
 ---
 
-## SECTION 10 - TROUBLESHOOTING
+## Troubleshooting
 
-### 10.1 Common Issues
+### Common Issues
 
 #### No Signals Generated
 ```
@@ -447,55 +554,242 @@ Checklist:
 2. Check KS7 active status (economic events)
 3. Confirm spread is not elevated (KS2)
 4. Validate session times
-5. Check volume filter (S1 — may reject low-volume breakouts)
-6. Check ADX trend filter (S6/S7 — may filter counter-trend leg)
+5. Check volume filter (S1 may reject low-volume breakouts)
+6. Check ADX trend filter (S6/S7 may filter counter-trend)
 7. Check R3 volatility filter (may reject minor event moves)
 ```
 
 #### Lot Size Too Small
 ```
-v3.0 Fix: SIZE-1 reduction floor ensures severity × spread × vol_scalar
-never reduces below 50%. If still seeing min lots:
 1. Check if KS4 countdown is active (halves base risk)
 2. Verify regime multiplier (SUPER=1.5×, not 0.5×)
 3. Confirm NY session gets 1.0× (not 0.8× penalty)
+4. Check conviction level (OBSERVATION reduces size)
 ```
 
-### 10.2 Diagnostic Commands
+#### MT5 Connection Issues
+```
+1. Verify rpyc bridge is running (mt5linux)
+2. Check firewall settings for port 18812
+3. Ensure MT5 terminal is open and logged in
+4. Validate magic number configuration
+```
+
+### Diagnostic Commands
+
 ```bash
-python main.py --checklist     # Pre-session validation
-python main.py --weekly        # Weekly performance review
-python tools/calibrate_atr.py  # ATR calibration
+# Pre-session validation
+python main.py --checklist
+
+# Weekly performance review
+python main.py --weekly
+
+# ATR calibration
+python tools/calibrate_atr.py
+
+# Collect historical data
+python tools/collect_historical_data.py
+
+# Fetch events history
+python tools/fetch_events_history.py
+```
+
+### Log Analysis
+
+All logs are structured with KEY=VALUE format for easy parsing:
+
+```bash
+# View recent logs
+tail -f logs/xauusd.log
+
+# Filter for specific events
+grep "KS3_FIRED" logs/xauusd.log
+
+# Analyze trade decisions
+grep "S1_ORDER_PLACED" logs/xauusd.log
 ```
 
 ---
 
-## APPENDICES
+## System Components
 
-### Appendix A - Change Log
-- **v3.0** (2026-04-01): Critical Review fixes applied
-  - BUG-7/8/9: Fixed is_dxy_stable import, SQL syntax, P&L formula
-  - LOOP-1-9: ATR-based stops, dynamic ranges, market entries, direction validation
-  - SIZE-1-5: Reduction floor, SUPER 1.5×, NY penalty removed, correlation kill fixed
-  - KS-1-4: Widened all kill switch thresholds
-  - EXP-1-10: TP targets, volume filter, partial at 2R, BE at 1.5R, trail at 2.5×, trend filters, conviction sizing
-- **v2.0** (2026-03-31): Phase 2 deployment
-  - Added R3, S4, S5, S8 strategies
-  - Implemented portfolio risk brain
-  - Added correlation monitoring
-- **v1.0** (2026-03-20): Initial deployment
-  - S1 family, S2, S3, S6, S7
+### Database Schema
 
-### Appendix B - Glossary
-- **ATR**: Average True Range — volatility measure
-- **ADX**: Average Directional Index — trend strength
-- **DI+/DI-**: Directional Indicators — trend direction
-- **RSI**: Relative Strength Index — momentum oscillator
-- **VAR**: Value at Risk — portfolio risk measure
-- **KS**: Kill Switch — risk control mechanism
-- **R-Multiple**: Risk-adjusted return measure (profit / initial risk)
-- **Kelly Criterion**: Optimal bet sizing formula
+#### Core Tables
+
+**system_state.system_state_persistent**
+- Stores daily state for warm-start recovery
+- Includes all Phase 2 fields (R3/S4/S5 flags)
+- DXY variance, spread multiplier
+
+**system_state.trades**
+- Complete trade audit trail
+- Entry/exit prices, times, lot sizes
+- P&L calculation with R-multiple tracking
+- Phase 2 audit columns
+
+**market_data.economic_events**
+- Event tracking with HorizonFX source flag
+- Fallback indicator for hardcoded events
+
+#### Logging Tables
+- **system_state.spread_log**: Spread tracking every 5 minutes
+- **system_state.regime_log**: Regime changes with context
+- **market_data.macro_signals**: Daily bias calculations
+
+### Engine Modules
+
+#### Data Engine
+- MT5 OHLCV data fetching
+- Economic calendar integration (HorizonFX + fallback)
+- Spread tracking and baseline calculation
+- DXY correlation analysis
+- TLT/TIP macro proxy data
+
+#### Regime Engine
+- 6-state market classification
+- Hysteresis implementation (3 consecutive readings)
+- ATR percentile calculation with EWMA weighting
+- ADX trend strength analysis
+- Session-aware volatility normalization
+
+#### Signal Engine
+- 10 strategy implementations
+- Volume and trend filters
+- Time-based restrictions and expirations
+- Pending order management
+- Add-on signal generation
+
+#### Risk Engine
+- Position sizing with phase-based progression
+- 7 kill switch implementations
+- Conviction level calculations
+- Portfolio-level risk controls
+- Correlation monitoring
+
+#### Execution Engine
+- Order placement with spread adjustment
+- Fill detection and reconciliation
+- Position management (partial exits, BE activation)
+- Emergency shutdown procedures
+- Ghost position detection
+
+#### Truth Engine
+- Performance analytics and reporting
+- Edge decay detection
+- Conviction level optimization
+- Weekly review generation
+- Starvation tracking
+
+### Utility Modules
+
+#### Session Management
+- DST-safe session detection
+- Time zone handling (London, NY, IST)
+- Session boundary notifications
+
+#### Logging System
+- Structured KEY=VALUE logging
+- Rotating file handlers
+- Multiple severity levels
+- Parseable format for analysis
+
+#### MT5 Client
+- Connection management with auto-reconnect
+- Error handling and retry logic
+- Contract specification fetching
+- Position reconciliation
 
 ---
 
-*"The biggest edge in this system isn't any single strategy — it's fixing the bugs that prevent existing edge from being realized."*
+## Best Practices
+
+### For New Users
+
+1. **Start with Paper Trading**
+   - Use `--paper` flag for at least 2 weeks
+   - Monitor all strategy behaviors
+   - Understand risk management actions
+
+2. **Monitor Daily**
+   - Run `--checklist` before market open
+   - Review logs for any warnings or errors
+   - Check economic calendar for high-impact events
+
+3. **Understand Your Risk**
+   - Start with minimum position sizing
+   - Monitor drawdown levels carefully
+   - Respect kill switch activations
+
+### For Advanced Users
+
+1. **Customization**
+   - Modify strategy parameters in config.py
+   - Adjust risk thresholds based on account size
+   - Fine-tune regime thresholds for your broker
+
+2. **Optimization**
+   - Use weekly reviews to identify weak strategies
+   - Monitor conviction level effectiveness
+   - Adjust correlation thresholds as needed
+
+3. **Automation**
+   - Set up automated alerts for kill switches
+   - Implement log monitoring for early issue detection
+   - Schedule regular database maintenance
+
+---
+
+## Support and Maintenance
+
+### Regular Maintenance Tasks
+
+1. **Weekly**
+   - Run `python main.py --weekly`
+   - Review performance metrics
+   - Check for edge decay warnings
+
+2. **Monthly**
+   - Archive old log files
+   - Update economic calendar patterns
+   - Review and update risk parameters
+
+3. **Quarterly**
+   - Full system health check
+   - Strategy performance review
+   - Parameter re-calibration if needed
+
+### Getting Help
+
+1. **Check Logs First**
+   - All issues are logged with structured format
+   - Search logs for error codes and warnings
+   - Review recent trade decisions
+
+2. **Diagnostic Tools**
+   - Use `--checklist` for system validation
+   - Run individual tool scripts for specific issues
+   - Monitor database connection status
+
+3. **Performance Issues**
+   - Check MT5 connection stability
+   - Verify database performance
+   - Review system resource usage
+
+---
+
+## Disclaimer
+
+This is an advanced algorithmic trading system that involves significant risk. Past performance is not indicative of future results. Always:
+
+- Start with paper trading
+- Understand all strategies before risking real capital
+- Monitor positions actively
+- Respect risk management rules
+- Never risk more than you can afford to lose
+
+The system is provided as-is for educational and research purposes. Users are responsible for their own trading decisions and associated risks.
+
+---
+
+*"The biggest edge in this system isn't any single strategy — it's fixing bugs that prevent existing edge from being realized."*

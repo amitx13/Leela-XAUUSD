@@ -11,11 +11,23 @@ load_dotenv()
 # ── Environment ──────────────────────────────────────────────────────────────
 ENV = os.getenv("ENV", "dev")   # 'dev' or 'prod'
 
+# ── Backtest Mode Configuration ───────────────────────────────────────────
+# CRITICAL: Set BACKTEST_MODE = False in live production
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False").lower() == "true"
+
+# KS6 Auto-Reset Configuration (Backtest Only)
+# CRITICAL: Set BACKTEST_KS6_AUTO_RESET = False in live production
+BACKTEST_KS6_AUTO_RESET = os.getenv("BACKTEST_KS6_AUTO_RESET", "False").lower() == "true"
+BACKTEST_KS6_COOLDOWN_BARS = int(os.getenv("BACKTEST_KS6_COOLDOWN_BARS", "96"))  # 96 x M15 bars = 24 hours
+
 # ── MT5 rpyc bridge (mt5linux) ───────────────────────────────────────────────
 MT5_HOST   = os.getenv("MT5_HOST", "localhost")
 MT5_PORT   = int(os.getenv("MT5_PORT", "18812"))
 SYMBOL     = "XAUUSD"
-MAGIC      = 20260320  # date-based magic — consistent across ALL MT5 operations
+# MED-1 FIX: Mode-dependent MAGIC prevents paper/live instances managing each
+# other's positions when running simultaneously on the same MT5 terminal.
+_MAGIC_BASE = 20260320
+MAGIC       = _MAGIC_BASE if ENV == "prod" else _MAGIC_BASE + 1
 
 # ── Database ─────────────────────────────────────────────────────────────────
 # explicit 127.0.0.1 — forces TCP, never Unix socket (arch decision)
@@ -52,11 +64,17 @@ PREPLACEMENT_SPREAD_MULTIPLIER = 1.2  # block S1 pending if spread > 1.2× sessi
 S1_PREPLACEMENT_SPREAD_WINDOW_START_MIN_UTC = 7 * 60 + 45   # 07:45
 S1_PREPLACEMENT_SPREAD_WINDOW_END_MIN_UTC = 8 * 60 + 5      # 08:05
 S1_PREPLACEMENT_SPREAD_LOOKBACK_TRADING_DAYS = 5
-KS3_DAILY_LOSS_LIMIT_PCT   = -0.040  # KS-1 FIX: was -0.030 — too tight, fires after 2-3 trades
-KS4_LOSS_STREAK_COUNT      = 6       # KS-3 FIX: was 4 — 4 consecutive losses is normal for breakout systems
+KS3_DAILY_LOSS_LIMIT_PCT   = -0.070  # full daily halt at -7% vs start-of-day equity
+# KS3 graduated response — throttle tier before full shutdown
+KS3_THROTTLE_THRESHOLD_PCT = -0.040  # -4% daily → reduce size (continue trading)
+KS3_THROTTLE_SIZE_MULT     = 0.60    # retain 60% of sized lots = 40% reduction
+KS4_LOSS_STREAK_COUNT      = 4
 KS4_REDUCED_TRADES         = 3       # KS-3 FIX: was 5 — shorter penalty duration
-KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.100  # KS-4 FIX: was -0.080 — too tight relative to daily limit
-KS6_DRAWDOWN_LIMIT_PCT     = 0.12    # KS-2 FIX: was 0.08 — 5-8% DD is normal for gold trend-following
+KS5_WEEKLY_LOSS_LIMIT_PCT  = -0.150  # weekly net vs start-of-week equity (IST week); Fri uses 0.8× this
+KS6_DRAWDOWN_LIMIT_PCT     = 0.20    # equity vs rolling peak (see persistence.update_peak_equity)
+KS6_RECOVERY_SIZE_MULT     = 0.50    # OPT-1.4: lot size multiplier during recovery
+KS6_RECOVERY_WINS_NEEDED   = 3       # OPT-1.4: consecutive wins to exit recovery
+KS7_SPREAD_RESUME_MULTIPLIER = 1.5   # OPT-1.5: spread must be < 1.5x session avg to resume
 KS7_PRE_EVENT_MINUTES      = 45      # blackout window before HIGH impact event
 KS7_POST_EVENT_MINUTES     = 20      # minimum wait after event release
 KS7_ATR_RESUME_MULTIPLIER  = 1.30    # resume only if ATR < 130% pre-event ATR
@@ -103,7 +121,8 @@ HARDCODED_EVENT_PATTERNS = [
 ]
 
 # ── Regime Engine ─────────────────────────────────────────────────────────────
-REGIME_STALENESS_SEC         = 1200   # 20 minutes → NO_TRADE if exceeded
+REGIME_STALENESS_SEC_DEFAULT = 1200   # OPT-2.3: 20 minutes default
+REGIME_STALENESS_SEC_SUPER   = 900    # OPT-2.3: 15 minutes for volatile states
 REGIME_HYSTERESIS_COUNT      = 3      # same state for 3 consecutive readings to flip
 REGIME_JOB_INTERVAL_MIN      = 15     # APScheduler interval
 REGIME_JOB_COALESCE          = True   # skip missed runs
@@ -128,12 +147,14 @@ S3_RECLAIM_OFFSET_PTS   = 2.0   # BUY STOP 2pts above reclaim candle high
 S3_WINDOW_CANDLES       = 3     # reclaim must happen within 3 M15 bars (45 min)
 
 # ── S6 Asian Breakout ───────────────────────────────────────────────────────
-S6_MIN_RANGE_PTS        = 8.0   # skip if Asian range < 8pts
+S6_MIN_RANGE_PTS           = 8.0     # skip if Asian range is too tight
+S6_MAX_RANGE_PTS           = 30.0    # OPT-3.5: skip Asian ranges wider than 30pts (poor risk-reward)
 S6_STOP_ATR_MULT        = 0.5   # stop = 0.5×ATR14 from entry
 S6_BREAKOUT_DIST_PTS    = 2.0   # pts beyond range boundary before entry
 
 # ── S7 Daily Structure ──────────────────────────────────────────────────────
 S7_MIN_RANGE_ATR_RATIO  = 0.75  # skip if prev_day_range < 0.75×daily_ATR14
+S7_MAX_RANGE_ATR_RATIO  = 1.50  # OPT-3.5: skip if prev_day_range > 1.5× daily ATR
 S7_ENTRY_OFFSET_PTS     = 5.0   # BUY STOP at prev_day_high + 5pts + spread
 S7_STOP_OFFSET_PTS      = 10.0  # stop at prev_day_low - 10pts (LONG)
 S7_SIZE_MULTIPLIER      = 0.5   # 0.5x base lot — wider stops, smaller size
@@ -147,11 +168,11 @@ KS4_REDUCED_TRADE_COUNT      = KS4_REDUCED_TRADES  # CONSOLIDATED: was duplicate
 
 # ── Portfolio Risk Brain ──────────────────────────────────────────────────────
 MAX_DAILY_VAR_PCT            = 0.02  # 2% of account all strategies combined
-MAX_SESSION_LOTS             = 0.15  # total open lots per session
+MAX_SESSION_LOTS_BASE        = 0.15  # OPT-4.5: baseline total open lots
 PARTIAL_FILL_THRESHOLD       = 0.80  # >= 80% fill = treat as full fill (v1.1)
 
 # ── Signal Engine ─────────────────────────────────────────────────────────────
-MAX_S1_FAMILY_ATTEMPTS = 4   # EXP-8 FIX: was 3 — 3rd attempt often IS the real breakout
+MAX_S1_FAMILY_ATTEMPTS = 3
 MAX_S1F_ATTEMPTS       = 1   # S1f independent daily limit (G4 Fix)
 
 BREAKOUT_DIST_PCT   = 0.12   # 12% of range_size for S1 confirmation
@@ -175,9 +196,14 @@ M5_LOSS_PAUSE_COUNT   = 5   # EXP-7 FIX: was 3 — too conservative for high-fre
 M5_LIMIT_EXPIRY_MIN   = 5   # B4 Fix: M5 limit orders expire after 1 candle
 
 # ── Position Management ───────────────────────────────────────────────────────
-PARTIAL_EXIT_R         = 2.0   # EXP-3 FIX: was 1.0 — let winners run further before partial
+PARTIAL_EXIT_R         = 2.0   # trend / breakout family — let winners run before partial
+PARTIAL_EXIT_R_S2      = 0.8   # mean reversion — earlier partial before MR completes
 BE_ACTIVATION_R        = 1.5   # EXP-4 FIX: was 0.75 — too aggressive, normal retracements stop out at entry
-ATR_TRAIL_MULTIPLIER   = 2.5   # EXP-5 FIX: was 1.5 — too tight for gold, normal M15 pullbacks clip trail
+ATR_TRAIL_MULTIPLIER   = 2.5   # S1 / S4 / S5 / S6 / S7 — gold trend trail on M15
+ATR_TRAIL_MULTIPLIER_S2 = 1.5  # S2 mean reversion — tighter trail than trend systems
+
+# Minimum stop buffer (points × point) when ATR fallback uses range % — avoids sub-spread stops
+S1_STOP_BUFFER_MIN_POINTS = 12.0
 
 S1D_STOP_POINTS_MIN    = 15    # LOOP-3 FIX: was 10 — too tight for XAUUSD M5
 S1D_STOP_POINTS_MAX    = 20    # LOOP-3 FIX: was 12
@@ -239,7 +265,9 @@ MIN_CONDITION_MULTIPLIER    = 0.35   # Tune after 50+ live trades
 # ── R3 — Calendar Momentum ────────────────────────────────────────────────────
 R3_MIN_DELAY_MIN            = 5      # Min minutes post-event before R3 arms
 R3_ARMED_WINDOW_MIN         = 35     # R3 expires 35 min post-event
-R3_MAX_HOLD_MIN             = 30     # Force-close after 30 min from entry
+R3_MAX_HOLD_MIN_NFP         = 30     # OPT-3.9: NFP hold
+R3_MAX_HOLD_MIN_CPI         = 20     # OPT-3.9: CPI hold
+R3_MAX_HOLD_MIN_DEFAULT     = 25     # OPT-3.9: Default event hold
 R3_STOP_ATR_MULT            = 0.50   # Stop = 0.5 × H1 ATR from entry
 R3_TP_ATR_MULT              = 0.75   # TP   = 0.75 × H1 ATR → 1.5:1 RR
 R3_SEVERITY_THRESHOLD       = 35     # Severity >= 35 → R3 takes it; < 35 → S8
@@ -248,7 +276,7 @@ R3_DIRECTION_MIN_MOVE_RATIO = 0.05   # Min move = 0.05 × H1 ATR to confirm dire
 # ── S4 — London Pullback ──────────────────────────────────────────────────────
 S4_SESSION_START_HOUR_UTC   = 7      # London session start (UTC)
 S4_SESSION_END_HOUR_UTC     = 12     # London session end / S4 entry window end
-S4_TOUCH_ATR_FACTOR         = 0.10   # EMA20 touch zone = 0.1 × H1 ATR proximity
+S4_TOUCH_ATR_FACTOR         = 0.15   # OPT-3.8: Widened touch zone (was 0.10)
 S4_STOP_ATR_BUFFER          = 0.30   # Stop beyond touch bar low/high = 0.3 × H1 ATR
 S4_TP_RR_RATIO              = 1.50   # TP = 1.5 × stop distance
 S4_ADX_MIN_THRESHOLD        = 20     # ADX H4 must be > 20 for S4 to fire

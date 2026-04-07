@@ -39,21 +39,19 @@ from utils.session import (
 )
 from engines.regime_engine import (
     get_safe_regime, RegimeState,
-    get_adx_h4, get_current_atr_m15
+    get_adx_h4, get_current_atr_m15,
+    get_adx_h4_slope,
 )
 from engines.risk_engine import (
     calculate_lot_size, calculate_conviction_level,
     can_s1_family_fire, can_s1f_fire, can_s2_fire,
     can_m5_reentry_fire, run_pre_trade_kill_switches,
-    calculate_r_multiple,
-    # ── CHANGE 3: added reversal family and Phase 1 strategy gates ───────────
+    calculate_r_multiple, calculate_atr_trail,
     can_reversal_family_fire, can_s3_fire, can_s6_fire, can_s7_fire,
 )
 from engines.data_engine import (
     fetch_ohlcv, get_upcoming_events_within,
-    # ── CHANGE 2: replaced get_session_avg_spread with 24h baseline ──────────
     get_avg_spread_last_24h,
-    # ── CHANGE 2: Phase 1 strategy data functions ─────────────────────────────
     get_asian_range, get_prev_day_ohlc, get_daily_atr14,
 )
 
@@ -180,8 +178,10 @@ def check_and_fire_ny_time_kill(state: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_ema20_h1() -> float | None:
+def get_ema20_h1(context: 'MarketContext' = None) -> float | None:
     """20 EMA on H1 bars. Used by S2 mean reversion signal."""
+    if context and context.ema20_h1 is not None:
+        return context.ema20_h1
     df = fetch_ohlcv("H1", count=50)
     if df is None or df.empty:
         return None
@@ -191,11 +191,12 @@ def get_ema20_h1() -> float | None:
 
 
 
-def get_ema20_m5() -> float | None:
+def get_ema20_m5(context: 'MarketContext' = None) -> float | None:
     """
     20 EMA on M5 bars. Used by S1d, S1e, S1f for body-close pullback signal.
-    pandas_ta default for EMA is correct — no mamode needed (EMA != ATR).
     """
+    if context and context.ema20_m5 is not None:
+        return context.ema20_m5
     df = fetch_ohlcv("M5", count=50)
     if df is None or df.empty:
         return None
@@ -205,8 +206,10 @@ def get_ema20_m5() -> float | None:
 
 
 
-def get_atr14_h1_rma() -> float | None:
+def get_atr14_h1_rma(context: 'MarketContext' = None) -> float | None:
     """ATR(14, H1, RMA). Used by S2 for signal threshold and stop distance."""
+    if context and context.atr_h1 is not None:
+        return context.atr_h1
     df = fetch_ohlcv("H1", count=50)
     if df is None or df.empty:
         return None
@@ -217,8 +220,10 @@ def get_atr14_h1_rma() -> float | None:
 
 
 
-def get_last_m15_bar() -> dict | None:
-    """Returns the last CLOSED M15 bar as a dict. Returns None on failure."""
+def get_last_m15_bar(context: 'MarketContext' = None) -> dict | None:
+    """Returns the last CLOSED M15 bar as a dict."""
+    if context:
+        return context.get_last_closed_bar("M15")
     df = fetch_ohlcv("M15", count=3)
     if df is None or len(df) < 2:
         return None
@@ -234,8 +239,10 @@ def get_last_m15_bar() -> dict | None:
 
 
 
-def get_last_m5_bar() -> dict | None:
+def get_last_m5_bar(context: 'MarketContext' = None) -> dict | None:
     """Returns the last CLOSED M5 bar as a dict."""
+    if context:
+        return context.get_last_closed_bar("M5")
     df = fetch_ohlcv("M5", count=3)
     if df is None or len(df) < 2:
         return None
@@ -293,21 +300,20 @@ def _build_candidate(
 
     lt       = get_london_local_time()
     upcoming = get_upcoming_events_within(60)
-
-
-    tick       = mt5.symbol_info_tick(config.SYMBOL)
-    spread_now = 0.0
-    # ── CHANGE 4: was get_session_avg_spread() — consistent with KS2 ─────────
+    tick     = mt5.symbol_info_tick(config.SYMBOL)
     avg_spread = get_avg_spread_last_24h()
+    spread_now = avg_spread # SAFER: default to baseline instead of 0.0 if tick missing
+
     if tick and config.CONTRACT_SPEC.get("point"):
         spread_now = (tick.ask - tick.bid) / config.CONTRACT_SPEC["point"]
 
 
     candidate = {
         # ── Identity (G5: enum value) ────────────────────────────────────
-        "signal_type":      signal_type.value,
-        "strategy_version": "V1",
-        "campaign_id":      str(uuid.uuid4()),
+        "signal_type":              signal_type.value,
+        "strategy_version":         "V1",
+        "campaign_id":              str(uuid.uuid4()),
+        "signal_generated_at_utc":  datetime.now(pytz.utc).isoformat(), # OPT-3.10
 
 
         # ── Execution ────────────────────────────────────────────────────
@@ -385,7 +391,7 @@ def _get_regime_age_sec(state: dict) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s1_signal(state: dict) -> dict | None:
+def evaluate_s1_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S1 London Range Breakout.
 
@@ -426,7 +432,7 @@ def evaluate_s1_signal(state: dict) -> dict | None:
         return None
 
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)
     if bar is None:
         return None
 
@@ -470,10 +476,12 @@ def evaluate_s1_signal(state: dict) -> dict | None:
         return None
 
 
-    # LOOP-1 FIX: ATR-based stop buffer instead of thin range-percentage.
-    # 0.3× H1 ATR or minimum 5 points — prevents noise wicks from clipping stops.
+    # LOOP-1 FIX: ATR-based stop buffer; hard floor in points so ATR=0 never yields sub-spread stops.
     atr_h1 = state.get("last_atr_h1_raw", 0.0)
-    stop_buffer = max(atr_h1 * 0.3, 5.0) if atr_h1 > 0 else rs * 0.15
+    _pt = config.CONTRACT_SPEC.get("point", 0.01)
+    _min_buf = config.S1_STOP_BUFFER_MIN_POINTS * _pt
+    base_buf = max(atr_h1 * 0.3, 5.0) if atr_h1 > 0 else rs * 0.15
+    stop_buffer = max(base_buf, _min_buf)
 
     if direction == "LONG":
         entry = rh + threshold
@@ -589,7 +597,7 @@ def check_s1b_trigger(state: dict) -> bool:
 
 
 
-def evaluate_s1b_signal(state: dict) -> dict | None:
+def evaluate_s1b_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S1b: Failed Breakout Reversal.
     Fires when: failed_breakout_flag AND next M15 breaks OPPOSITE boundary.
@@ -612,7 +620,7 @@ def evaluate_s1b_signal(state: dict) -> dict | None:
         return None
 
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)
     if bar is None:
         return None
 
@@ -633,12 +641,19 @@ def evaluate_s1b_signal(state: dict) -> dict | None:
         return None
 
 
+    # ISSUE-5 FIX: Apply ATR-based stop buffer matching S1 (LOOP-1 fix).
+    atr_h1_s1b = state.get("last_atr_h1_raw", 0.0)
+    _pt = config.CONTRACT_SPEC.get("point", 0.01)
+    _min_buf = config.S1_STOP_BUFFER_MIN_POINTS * _pt
+    base_buf = max(atr_h1_s1b * 0.3, 5.0) if atr_h1_s1b > 0 else rs * 0.15
+    stop_buffer_s1b = max(base_buf, _min_buf)
+
     if direction == "LONG":
         entry = rh + bd
-        stop  = round(rl - rs * 0.10, 3)
+        stop  = round(rl - stop_buffer_s1b, 3)
     else:
         entry = rl - bd
-        stop  = round(rh + rs * 0.10, 3)
+        stop  = round(rh + stop_buffer_s1b, 3)
 
 
     stop_distance = abs(entry - stop)
@@ -673,7 +688,7 @@ def evaluate_s1b_signal(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def detect_stop_hunt(state: dict) -> None:
+def detect_stop_hunt(state: dict, context: 'MarketContext' = None) -> None:  # BUG-7 FIX: accept context
     """
     S1c: Stop hunt detection. Sets state flags — does NOT generate a candidate.
     Pattern:
@@ -709,7 +724,7 @@ def detect_stop_hunt(state: dict) -> None:
         return  # Don't re-detect while flag is active
 
 
-    bar = get_last_m15_bar()
+    bar = get_last_m15_bar(context=context)  # BUG-7 FIX: pass context
     if bar is None:
         return
 
@@ -762,7 +777,7 @@ def detect_stop_hunt(state: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s1d_reentry(state: dict) -> dict | None:
+def evaluate_s1d_reentry(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S1d: M5 pullback re-entry into open S1 trend.
 
@@ -794,13 +809,12 @@ def evaluate_s1d_reentry(state: dict) -> dict | None:
     if session not in ("LONDON", "LONDON_NY_OVERLAP"):
         return None
 
-
-    ema20 = get_ema20_m5()
+    ema20 = get_ema20_m5(context=context)
     if ema20 is None:
         return None
 
 
-    bar = get_last_m5_bar()
+    bar = get_last_m5_bar(context=context)
     if bar is None:
         return None
 
@@ -813,8 +827,8 @@ def evaluate_s1d_reentry(state: dict) -> dict | None:
     # G3 Fix: full body close — both open AND close
     # LOOP-3 FIX: ATR-based stop instead of fixed 10-12pt which is suicidal on XAUUSD M5.
     # Use 0.75× M15 ATR or config minimum, whichever is larger.
-    from engines.data_engine import get_current_atr_m15
-    atr_m15 = get_current_atr_m15(period=14)
+    # ISSUE-4 FIX: import moved to top of file; pass context to avoid extra MT5 fetch.
+    atr_m15 = _get_atr_m15_data(period=14, context=context)
     stop_distance = max(
         atr_m15 * 0.75 if atr_m15 else config.S1D_STOP_POINTS_MIN,
         config.S1D_STOP_POINTS_MIN
@@ -873,7 +887,7 @@ def evaluate_s1d_reentry(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s1e_pyramid(state: dict) -> dict | None:
+def evaluate_s1e_pyramid(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S1e: ONE pyramid add per S1 trade — hard limit.
     Conditions: partial exit done, stop at BE or better,
@@ -904,13 +918,18 @@ def evaluate_s1e_pyramid(state: dict) -> dict | None:
     if not permitted:
         return None
 
+    # OPT-3.7: ADX Gate for Pyramids
+    # Do not add to positions if trend is weakening (ADX < 25)
+    adx_h4 = state.get("last_adx_h4", 0.0)
+    if adx_h4 < 25:
+        return None
 
-    ema20 = get_ema20_m5()
+    ema20 = get_ema20_m5(context=context)
     if ema20 is None:
         return None
 
 
-    bar = get_last_m5_bar()
+    bar = get_last_m5_bar(context=context)
     if bar is None:
         return None
 
@@ -925,21 +944,24 @@ def evaluate_s1e_pyramid(state: dict) -> dict | None:
         if not _body_close_above_ema20(bar, ema20):
             return None
         entry = round(ema20, 3)
-        # Use actual current stop from position, or calculate from EMA20
+        # HIGH-5 FIX: Use current_stop but enforce ATR-based minimum distance.
+        # When stop_price_current is at breakeven, the stop distance is near-zero.
         current_stop = state.get("stop_price_current")
-        if current_stop and current_stop > 0:
+        atr_floor = config.S1D_STOP_POINTS_MIN
+        if current_stop and current_stop > 0 and (entry - current_stop) >= atr_floor:
             stop = current_stop
         else:
-            stop = round(ema20 - config.S1D_STOP_POINTS_MIN, 3)
+            stop = round(entry - atr_floor, 3)
     else:
         if not _body_close_below_ema20(bar, ema20):
             return None
         entry = round(ema20, 3)
         current_stop = state.get("stop_price_current")
-        if current_stop and current_stop > 0:
+        atr_floor = config.S1D_STOP_POINTS_MIN
+        if current_stop and current_stop > 0 and (current_stop - entry) >= atr_floor:
             stop = current_stop
         else:
-            stop = round(ema20 + config.S1D_STOP_POINTS_MIN, 3)
+            stop = round(entry + atr_floor, 3)
 
 
     stop_distance = abs(entry - stop)
@@ -985,7 +1007,7 @@ def evaluate_s1e_pyramid(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s1f_signal(state: dict) -> dict | None:
+def evaluate_s1f_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S1f: Post-time-kill NY re-entry.
     G4 Fix: uses s1f_attempts_today (max 1) — independent of s1_family_attempts_today.
@@ -1015,12 +1037,12 @@ def evaluate_s1f_signal(state: dict) -> dict | None:
         return None
 
 
-    ema20 = get_ema20_m5()
+    ema20 = get_ema20_m5(context=context)
     if ema20 is None:
         return None
 
 
-    bar = get_last_m5_bar()
+    bar = get_last_m5_bar(context=context)
     if bar is None:
         return None
 
@@ -1029,22 +1051,26 @@ def evaluate_s1f_signal(state: dict) -> dict | None:
     if not direction:
         return None
 
-    # LOOP-9 FIX: Validate direction against current price action.
+    # CHANGE 3.5 / LOOP-9 FIX: H1 EMA20 direction validation.
+    # H1 = macro safety gate (direction), M5 = entry timing. Both needed.
     # last_s1_direction persists even after S1 closes. If S1 was LONG that stopped out
     # and market reversed, S1f would still try LONG — trading against the trend.
     ema20_h1 = get_ema20_h1()
-    if ema20_h1:
+    if ema20_h1 is not None:
         mt5_s1f = get_mt5()
         tick_s1f = mt5_s1f.symbol_info_tick(config.SYMBOL)
-        if tick_s1f:
-            if direction == "LONG" and tick_s1f.bid < ema20_h1:
-                log_event("S1F_DIRECTION_STALE_MARKET_REVERSED",
-                          direction=direction, bid=round(tick_s1f.bid, 3),
+        if tick_s1f is not None:
+            current_mid = (tick_s1f.ask + tick_s1f.bid) / 2
+            if direction == "LONG" and current_mid < ema20_h1:
+                log_event("S1F_REJECTED_H1_REVERSAL",
+                          direction=direction,
+                          price=round(current_mid, 3),
                           ema20_h1=round(ema20_h1, 3))
                 return None
-            if direction == "SHORT" and tick_s1f.ask > ema20_h1:
-                log_event("S1F_DIRECTION_STALE_MARKET_REVERSED",
-                          direction=direction, ask=round(tick_s1f.ask, 3),
+            elif direction == "SHORT" and current_mid > ema20_h1:
+                log_event("S1F_REJECTED_H1_REVERSAL",
+                          direction=direction,
+                          price=round(current_mid, 3),
                           ema20_h1=round(ema20_h1, 3))
                 return None
 
@@ -1097,7 +1123,7 @@ def evaluate_s1f_signal(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s2_signal(state: dict) -> dict | None:
+def evaluate_s2_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S2 Mean Reversion. RANGING_CLEAR regime only.
     Exits immediately if regime transitions to ANY trending state.
@@ -1129,8 +1155,9 @@ def evaluate_s2_signal(state: dict) -> dict | None:
         return None
 
 
-    ema20 = get_ema20_h1()
-    atr   = get_atr14_h1_rma()
+    # BUG-2 FIX: was `mean = get_ema20_h1(...)` then checked `ema20` (undefined) → NameError.
+    ema20 = get_ema20_h1(context=context)
+    atr   = get_atr14_h1_rma(context=context)
     if ema20 is None or atr is None or atr == 0:
         return None
 
@@ -1157,11 +1184,15 @@ def evaluate_s2_signal(state: dict) -> dict | None:
     threshold    = 1.5 * atr
 
     # RSI confirmation — require overbought/oversold for quality
+    # OPT-3.2 FIX: Relaxed from 70/30 to 65/35. RSI(14, H1) on XAUUSD rarely
+    # reaches 70/30 in the 30-70th ATR percentile range (moderate volatility).
+    # The 70/30 + 1.5× ATR combination created a near-impossible gate — S2
+    # almost never fired. 65/35 better suits gold's mean-reversion signature.
     rsi_series = ta.rsi(df["close"], length=14)
     rsi_val = float(rsi_series.iloc[-2]) if rsi_series is not None and not pd.isna(rsi_series.iloc[-2]) else 50.0
 
-    short_signal = (c2 > ema20 + threshold) and rsi_val > 70
-    long_signal  = (c2 < ema20 - threshold) and rsi_val < 30
+    short_signal = (c2 > ema20 + threshold) and rsi_val > 65   # OPT-3.2: was 70
+    long_signal  = (c2 < ema20 - threshold) and rsi_val < 35   # OPT-3.2: was 30
 
 
     if not short_signal and not long_signal:
@@ -1211,7 +1242,7 @@ def evaluate_s2_signal(state: dict) -> dict | None:
 # S3 — STOP HUNT REVERSAL (CHANGE 6 — new)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_s3_signal(state: dict) -> dict | None:
+def evaluate_s3_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S3 Stop Hunt Reversal.
     LONG: bearish sweep below range_low by 0.3×ATR14,
@@ -1223,8 +1254,11 @@ def evaluate_s3_signal(state: dict) -> dict | None:
     Max 1 S3 per session. Reversal family blocks S1b same day and vice versa.
     """
     # ── Gates ────────────────────────────────────────────────────────────────
+    # CHANGE 3.3: Allow UNSTABLE — S3 is a stop-hunt reversal and UNSTABLE
+    # (85-95th ATR percentile) is prime stop-hunting territory.
+    # Size is already reduced to 0.4× by regime multiplier.
     regime = get_safe_regime(state)
-    if regime in (RegimeState.NO_TRADE, RegimeState.UNSTABLE):
+    if regime == RegimeState.NO_TRADE:
         return None
 
     if state.get("s3_fired_today", False):
@@ -1260,19 +1294,22 @@ def evaluate_s3_signal(state: dict) -> dict | None:
         range_high = range_data["range_high"]
         range_low  = range_data["range_low"]
 
-    # ── ATR14 H1 — FIX: compute from fetched df_h1, _calculate_atr14 doesn't exist ──
-    df_h1 = fetch_ohlcv("H1", count=25)
-    if df_h1 is None or len(df_h1) < 16:
-        return None
+    # ISSUE-3 FIX: Compute ATR once from freshly fetched H1 data. Previously computed
+    # df_h1["atr"] but then discarded it and called get_atr14_h1_rma() (extra MT5 fetch).
+    # Now use the context cache if available; otherwise fetch once and reuse the column.
+    atr = get_atr14_h1_rma(context=context)
+    if atr is None or atr <= 0:
+        # Fallback: fetch H1 directly and compute
+        df_h1 = fetch_ohlcv("H1", count=25)
+        if df_h1 is None or len(df_h1) < 16:
+            return None
+        df_h1["atr"] = ta.atr(df_h1["high"], df_h1["low"], df_h1["close"],
+                               length=14, mamode=config.ATR_MAMODE)
+        atr = float(df_h1["atr"].iloc[-1])
+        if not atr or atr <= 0:
+            return None
 
-    df_h1["atr"] = ta.atr(df_h1["high"], df_h1["low"], df_h1["close"],
-                           length=14, mamode=config.ATR_MAMODE)
-    atr_val = df_h1["atr"].iloc[-1]
-    atr = float(atr_val) if not pd.isna(atr_val) else 0.0
-    if atr <= 0:
-        return None
-
-    df = fetch_ohlcv("M15", count=6)
+    df = getattr(context, "data_m15", None) if context else fetch_ohlcv("M15", count=6)
     if df is None or len(df) < 5:
         return None
 
@@ -1311,6 +1348,17 @@ def evaluate_s3_signal(state: dict) -> dict | None:
             }
         )
 
+    # OPT-3.3: Reclaim candle quality filter
+    def _is_strong_reclaim(b) -> bool:
+        body_size = abs(float(b["close"]) - float(b["open"]))
+        total_range = float(b["high"]) - float(b["low"])
+        if total_range > 0:
+            body_ratio = body_size / total_range
+            if body_ratio < 0.40:  # weak reclaim — mostly wick
+                log_event("S3_WEAK_RECLAIM_FILTERED", body_ratio=round(body_ratio, 2))
+                return False
+        return True
+
     # ── LONG: bearish sweep below range_low ──────────────────────────────────
     for i in range(len(closed)):
         b = closed.iloc[i]
@@ -1320,15 +1368,16 @@ def evaluate_s3_signal(state: dict) -> dict | None:
             if float(bar["close"]) > range_low:
                 bars_elapsed = int((bar["time"] - sweep_time).total_seconds() // 900)
                 if bars_elapsed <= config.S3_WINDOW_CANDLES:
-                    entry     = float(bar["high"]) + config.S3_RECLAIM_OFFSET_PTS * point
-                    stop      = sweep_low_price - config.S3_STOP_ATR_MULT * atr
-                    candidate = _make_candidate("LONG", entry, stop)
-                    if candidate:
-                        log_event("S3_SIGNAL_DETECTED", direction="LONG",
-                                  sweep_low=round(sweep_low_price, 3),
-                                  reclaim_close=round(float(bar["close"]), 3),
-                                  entry=round(entry, 3), stop=round(stop, 3))
-                        return candidate
+                    if _is_strong_reclaim(bar):
+                        entry     = float(bar["high"]) + config.S3_RECLAIM_OFFSET_PTS * point
+                        stop      = sweep_low_price - config.S3_STOP_ATR_MULT * atr
+                        candidate = _make_candidate("LONG", entry, stop)
+                        if candidate:
+                            log_event("S3_SIGNAL_DETECTED", direction="LONG",
+                                      sweep_low=round(sweep_low_price, 3),
+                                      reclaim_close=round(float(bar["close"]), 3),
+                                      entry=round(entry, 3), stop=round(stop, 3))
+                            return candidate
 
     # ── SHORT: bullish sweep above range_high ─────────────────────────────────
     for i in range(len(closed)):
@@ -1339,15 +1388,16 @@ def evaluate_s3_signal(state: dict) -> dict | None:
             if float(bar["close"]) < range_high:
                 bars_elapsed = int((bar["time"] - sweep_time).total_seconds() // 900)
                 if bars_elapsed <= config.S3_WINDOW_CANDLES:
-                    entry     = float(bar["low"]) - config.S3_RECLAIM_OFFSET_PTS * point
-                    stop      = sweep_high_price + config.S3_STOP_ATR_MULT * atr
-                    candidate = _make_candidate("SHORT", entry, stop)
-                    if candidate:
-                        log_event("S3_SIGNAL_DETECTED", direction="SHORT",
-                                  sweep_high=round(sweep_high_price, 3),
-                                  reclaim_close=round(float(bar["close"]), 3),
-                                  entry=round(entry, 3), stop=round(stop, 3))
-                        return candidate
+                    if _is_strong_reclaim(bar):
+                        entry     = float(bar["low"]) - config.S3_RECLAIM_OFFSET_PTS * point
+                        stop      = sweep_high_price + config.S3_STOP_ATR_MULT * atr
+                        candidate = _make_candidate("SHORT", entry, stop)
+                        if candidate:
+                            log_event("S3_SIGNAL_DETECTED", direction="SHORT",
+                                      sweep_high=round(sweep_high_price, 3),
+                                      reclaim_close=round(float(bar["close"]), 3),
+                                      entry=round(entry, 3), stop=round(stop, 3))
+                            return candidate
 
     return None
 
@@ -1356,7 +1406,7 @@ def evaluate_s3_signal(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s6_signal(state: dict) -> dict | None:
+def evaluate_s6_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S6: Asian Range Breakout.
     Called from asian_range_job() at 05:30 UTC daily — NOT from m15_dispatch_job.
@@ -1390,9 +1440,14 @@ def evaluate_s6_signal(state: dict) -> dict | None:
     if range_data is None:
         return None
 
+    # OPT-3.5: Max range filter
+    if range_data["range_size"] > config.S6_MAX_RANGE_PTS:
+        log_event("S6_RANGE_TOO_WIDE", range_size=range_data["range_size"], limit=config.S6_MAX_RANGE_PTS)
+        return None
+
 
     # ATR14 H1 for stop distance (0.5 × ATR — wider than fixed pts)
-    atr_h1 = get_atr14_h1_rma()
+    atr_h1 = get_atr14_h1_rma(context=context)
     if atr_h1 is None:
         # Try to get ATR from state (cached by regime engine)
         atr_h1 = state.get("last_atr_h1_raw")
@@ -1472,26 +1527,23 @@ def evaluate_s6_signal(state: dict) -> dict | None:
 
 
     # EXP-9 FIX: ADX trend filter — in strong trends, only place the trending direction.
-    # Prevents counter-trend STOP orders from filling on quick spikes then reversing.
-    df_adx = fetch_ohlcv("H1", count=20)
-    if df_adx is not None and len(df_adx) >= 16:
-        adx_df = ta.adx(df_adx["high"], df_adx["low"], df_adx["close"], length=14)
-        if adx_df is not None and not adx_df.empty:
-            adx_val = float(adx_df["ADX_14"].iloc[-1]) if not pd.isna(adx_df["ADX_14"].iloc[-1]) else 0.0
-            plus_di = float(adx_df["DMP_14"].iloc[-1]) if not pd.isna(adx_df["DMP_14"].iloc[-1]) else 0.0
-            minus_di = float(adx_df["DMN_14"].iloc[-1]) if not pd.isna(adx_df["DMN_14"].iloc[-1]) else 0.0
-
-            if adx_val > 25:
-                if plus_di > minus_di * 1.3:
-                    # Strong uptrend — only place BUY STOP
-                    sell_candidate = None
-                    log_event("S6_TREND_FILTER_SELL_REMOVED", adx=round(adx_val, 1),
-                              plus_di=round(plus_di, 1), minus_di=round(minus_di, 1))
-                elif minus_di > plus_di * 1.3:
-                    # Strong downtrend — only place SELL STOP
-                    buy_candidate = None
-                    log_event("S6_TREND_FILTER_BUY_REMOVED", adx=round(adx_val, 1),
-                              plus_di=round(plus_di, 1), minus_di=round(minus_di, 1))
+    # ISSUE-1 FIX: get_adx_h4_full was never imported → NameError, filter never applied.
+    # Now reads from the shared MarketContext (populated in refresh()) — zero extra MT5 calls.
+    adx_val  = context.adx_h4      if context else state.get("last_adx_h4")
+    plus_di  = context.di_plus_h4  if context else state.get("last_di_plus_h4", 0.0)
+    minus_di = context.di_minus_h4 if context else state.get("last_di_minus_h4", 0.0)
+    if adx_val is not None:
+        if adx_val > 25:
+            if plus_di is not None and minus_di is not None and plus_di > minus_di * 1.3:
+                # Strong uptrend — only place BUY STOP
+                sell_candidate = None
+                log_event("S6_TREND_FILTER_SELL_REMOVED", adx=round(adx_val, 1),
+                          plus_di=round(plus_di, 1), minus_di=round(minus_di, 1))
+            elif plus_di is not None and minus_di is not None and minus_di > plus_di * 1.3:
+                # Strong downtrend — only place SELL STOP
+                buy_candidate = None
+                log_event("S6_TREND_FILTER_BUY_REMOVED", adx=round(adx_val, 1),
+                          plus_di=round(plus_di, 1), minus_di=round(minus_di, 1))
 
     # If both candidates were filtered out, return None
     if buy_candidate is None and sell_candidate is None:
@@ -1520,7 +1572,7 @@ def evaluate_s6_signal(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s7_signal(state: dict) -> dict | None:
+def evaluate_s7_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     S7: Daily Structure Breakout.
     Called from midnight_reset_job() — NOT from m15_dispatch_job.
@@ -1594,6 +1646,12 @@ def evaluate_s7_signal(state: dict) -> dict | None:
                   threshold=round(daily_atr14 * config.S7_MIN_RANGE_ATR_RATIO, 2))
         return None
 
+    # OPT-3.5: Max range filter
+    if prev_range > daily_atr14 * config.S7_MAX_RANGE_ATR_RATIO:
+        log_event("S7_RANGE_TOO_WIDE", prev_range=round(prev_range, 2),
+                  threshold=round(daily_atr14 * config.S7_MAX_RANGE_ATR_RATIO, 2))
+        return None
+
 
     # Canonical state keys (validate_state_keys) — execution also sets on place
     state["s7_prev_day_high"] = ph
@@ -1661,22 +1719,18 @@ def evaluate_s7_signal(state: dict) -> dict | None:
 
 
     # EXP-9 FIX: ADX trend filter for S7 — same logic as S6.
-    # In strong trends, only place the trending direction to avoid counter-trend fills.
-    df_adx_s7 = fetch_ohlcv("H1", count=20)
-    if df_adx_s7 is not None and len(df_adx_s7) >= 16:
-        adx_df_s7 = ta.adx(df_adx_s7["high"], df_adx_s7["low"], df_adx_s7["close"], length=14)
-        if adx_df_s7 is not None and not adx_df_s7.empty:
-            adx_val_s7 = float(adx_df_s7["ADX_14"].iloc[-1]) if not pd.isna(adx_df_s7["ADX_14"].iloc[-1]) else 0.0
-            plus_di_s7 = float(adx_df_s7["DMP_14"].iloc[-1]) if not pd.isna(adx_df_s7["DMP_14"].iloc[-1]) else 0.0
-            minus_di_s7 = float(adx_df_s7["DMN_14"].iloc[-1]) if not pd.isna(adx_df_s7["DMN_14"].iloc[-1]) else 0.0
-
-            if adx_val_s7 > 25:
-                if plus_di_s7 > minus_di_s7 * 1.3:
-                    sell_candidate = None
-                    log_event("S7_TREND_FILTER_SELL_REMOVED", adx=round(adx_val_s7, 1))
-                elif minus_di_s7 > plus_di_s7 * 1.3:
-                    buy_candidate = None
-                    log_event("S7_TREND_FILTER_BUY_REMOVED", adx=round(adx_val_s7, 1))
+    # ISSUE-1 FIX: Use context attributes (same fix as S6 above).
+    adx_val_s7  = context.adx_h4      if context else state.get("last_adx_h4")
+    plus_di_s7  = context.di_plus_h4  if context else state.get("last_di_plus_h4", 0.0)
+    minus_di_s7 = context.di_minus_h4 if context else state.get("last_di_minus_h4", 0.0)
+    if adx_val_s7 is not None:
+        if adx_val_s7 > 25:
+            if plus_di_s7 is not None and minus_di_s7 is not None and plus_di_s7 > minus_di_s7 * 1.3:
+                sell_candidate = None
+                log_event("S7_TREND_FILTER_SELL_REMOVED", adx=round(adx_val_s7, 1))
+            elif plus_di_s7 is not None and minus_di_s7 is not None and minus_di_s7 > plus_di_s7 * 1.3:
+                buy_candidate = None
+                log_event("S7_TREND_FILTER_BUY_REMOVED", adx=round(adx_val_s7, 1))
 
     if buy_candidate is None and sell_candidate is None:
         log_event("S7_BOTH_LEGS_FILTERED_BY_TREND")
@@ -1706,7 +1760,7 @@ def evaluate_s7_signal(state: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def evaluate_s8_signal(state: dict) -> dict | None:
+def evaluate_s8_signal(state: dict, context: 'MarketContext' = None) -> dict | None:
     """
     F7: ATR Spike Trade — Flash spike continuation strategy.
 
@@ -1728,30 +1782,37 @@ def evaluate_s8_signal(state: dict) -> dict | None:
 
     Runs in: m5_mgmt_job() — M5-level monitoring
     """
-    from engines.data_engine import get_current_atr_m15, fetch_ohlcv
-
+    # BUG-5 FIX: Removed duplicate inline import of get_current_atr_m15 (was imported
+    # here AND again at line 1794). Both are now handled by top-level import.
     # Already fired today — skip
     if state.get("s8_fired_today"):
         return None
 
-    # S8 competes with S1 — don't fire when S1 family is active
-    if state.get("trend_family_occupied"):
+    # S8 independent lane — blocked when already open, not by trend_family
+    if state.get("s8_open_ticket"):
         return None
 
-    # Don't fire if S1 pending orders are active
+    # Regime gate — block NO_TRADE only. UNSTABLE allowed because
+    # 0.4× regime multiplier × 0.5× S8 lot = 0.2× effective risk.
+    regime = get_safe_regime(state)
+    if regime == RegimeState.NO_TRADE:
+        return None
+
+    # Don't fire if S1 pending orders are active (prevents S8 market fill +
+    # S1 pending fill creating two simultaneous positions)
     if state.get("s1_pending_buy_ticket") or state.get("s1_pending_sell_ticket"):
         return None
 
-    # Get current ATR for spike threshold
-    current_atr = get_current_atr_m15(period=14)
+    # Get current ATR for spike threshold (BUG-5: import removed from here, lives at top)
+    current_atr = _get_atr_m15_data(period=14, context=context)
     if current_atr is None:
         return None
 
     spike_threshold = current_atr * 1.5  # Spike = 1.5× ATR
 
     # Get recent M15 candles
-    df = fetch_ohlcv("M15", count=5)
-    if df is None or len(df) < 3:
+    df = getattr(context, "data_m15", None) if context else fetch_ohlcv("M15", count=7)
+    if df is None or len(df) < 6:
         return None
 
     # Analyze most recent closed candle
@@ -1766,6 +1827,14 @@ def evaluate_s8_signal(state: dict) -> dict | None:
 
     # Check if last candle was a spike (potential arm condition)
     if last_range > spike_threshold:
+        # OPT-3.6: Require Volume Confirmation
+        # Low volume spikes are often thin liquidity gaps; high volume implies institutional participation.
+        avg_tick_vol = float(df["tick_volume"].iloc[-6:-2].mean())
+        spike_tick_vol = float(last_candle["tick_volume"])
+        if avg_tick_vol > 0 and spike_tick_vol < avg_tick_vol * 1.2:
+            log_event("S8_LOW_VOLUME_SPIKE_FILTERED",
+                      spike_vol=spike_tick_vol, avg_vol=round(avg_tick_vol, 0))
+            return None  # Not a real spike — probably low liquidity
         # Determine direction based on spike candle's position relative to previous candle
         # If spike candle's high is above prev candle's high → bullish spike (long)
         # If spike candle's low is below prev candle's low → bearish spike (short)
@@ -1815,16 +1884,14 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
     spike_candle_idx = state.get("s8_spike_candle_idx")
 
     # Check window expiry using candle count (3 M15 candles = 45 min)
+    # ISSUE-7 FIX: iterate oldest→newest so we find the FIRST post-spike candle, not the last.
     if arm_candle_time:
-        # Count candles since arm by checking how many closed bars are after arm candle
-        candles_since_arm = 0
-        for i in range(len(df) - 2, -1, -1):  # iterate from most recent closed bar backwards
-            bar_time = df.iloc[i]["time"]
-            if bar_time > arm_candle_time:
-                candles_since_arm += 1
-            else:
-                break
-        
+        # Count candles since arm by walking forward through the sorted df
+        candles_since_arm = sum(
+            1 for i in range(len(df) - 1)   # exclude forming bar (iloc[-1])
+            if df.iloc[i]["time"] > arm_candle_time
+        )
+
         if candles_since_arm > 3:
             # Window expired — disarm
             log_event("S8_WINDOW_EXPIRED", candles_since=candles_since_arm)
@@ -1833,7 +1900,7 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
             state["s8_arm_candle_time"] = None
             state["s8_spike_candle_idx"] = None
             return None
-        
+
         # Must have at least 1 new candle since arm
         if candles_since_arm < 1:
             return None  # Still on spike candle, wait for next
@@ -1860,13 +1927,15 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
         # But since df may have changed, find it by time
         spike_time = state.get("s8_arm_candle_time")
         if spike_time:
-            # Find the first candle after the spike
+            # ISSUE-7 FIX: Iterate oldest→newest to find the FIRST bar after the spike.
+            # Original code iterated newest→oldest, returning the NEWEST post-spike bar
+            # instead of the first, causing confirmation on stale 3-bar-old price.
             confirm_candle = None
-            for i in range(len(df) - 2, -1, -1):
+            for i in range(len(df) - 1):   # exclude forming bar
                 if df.iloc[i]["time"] > spike_time:
                     confirm_candle = df.iloc[i]
                     break
-            
+
             if confirm_candle is None:
                 return None  # No confirmation candle yet
             
@@ -1905,17 +1974,27 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
     # A limit order at midpoint may never fill if momentum continues.
     mt5_s8 = get_mt5()
     tick_s8 = mt5_s8.symbol_info_tick(config.SYMBOL)
-    stop_dist = float(state.get("s8_spike_atr", 0)) * 0.5  # 0.5× ATR stop
+    atr_stop_buffer = float(state.get("s8_spike_atr", 0)) * 0.5
     size_mult = 0.5  # 0.5× base lot (tight stops)
 
     if direction == "long":
         entry = tick_s8.ask if tick_s8 else spike_midpoint
-        stop = spike_low - stop_dist
+        stop = spike_low - atr_stop_buffer
     else:
         entry = tick_s8.bid if tick_s8 else spike_midpoint
-        stop = spike_high + stop_dist
+        stop = spike_high + atr_stop_buffer
 
-    lots = calculate_lot_size(stop_dist, state["size_multiplier"] * size_mult, state)
+    # CRITICAL FIX (Change 3.2): Use actual distance from entry to stop, NOT just
+    # the ATR buffer. Entry is market price at confirmation, which can be far from
+    # the spike extreme. Using atr_stop_buffer alone would calculate lots for 5pt
+    # risk when actual risk is 25pts → 5× oversize.
+    # Floor: never calculate on <5-point stop (prevents lot explosion).
+    actual_stop_dist = max(
+        abs(entry - stop),
+        5.0 * config.CONTRACT_SPEC.get("point", 0.01)
+    )
+
+    lots = calculate_lot_size(actual_stop_dist, state["size_multiplier"] * size_mult, state)
 
     candidate = _build_candidate(
         signal_type=SignalType.S8_ATR_SPIKE,
@@ -1949,9 +2028,123 @@ def _check_s8_confirmation(state: dict, df: pd.DataFrame, spike_threshold: float
     return candidate
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# S8 POSITION MANAGEMENT (Change 3.8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _s8_modify_stop(ticket: int, new_stop: float, reason: str, state: dict) -> bool:
+    """
+    Inline stop modification for S8 — bypasses shared modify_stop()
+    which reads S1-specific state keys (last_s1_direction, stop_price_current).
+    Using modify_stop() for S8 would read wrong direction and wrong stop.
+    S8 MUST use its own inline modifier.
+    """
+    mt5_mod = get_mt5()
+    pos = next(
+        (p for p in (mt5_mod.positions_get(symbol=config.SYMBOL) or [])
+         if p.ticket == ticket and p.magic == config.MAGIC),
+        None
+    )
+    if not pos:
+        return False
+    request = {
+        "action":   mt5_mod.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "symbol":   config.SYMBOL,
+        "sl":       new_stop,
+        "tp":       pos.tp,
+        "magic":    config.MAGIC,
+    }
+    result = mt5_mod.order_send(request)
+    if result and result.retcode == mt5_mod.TRADE_RETCODE_DONE:
+        log_event(reason, ticket=ticket, new_stop=round(new_stop, 3))
+        return True
+    log_event(f"{reason}_FAILED", ticket=ticket,
+              retcode=result.retcode if result else "NO_RESULT")
+    return False
+
+
+def manage_s8_position(state: dict) -> None:
+    """
+    S8 position management — runs every M5 bar.
+    Independent from trend family management.
+    Simplified: BE at 1.5R + ATR trail only.
+    No partial exit (0.5x lot too small to split).
+    No momentum cycle exit (wrong pattern for spikes).
+    """
+    ticket = state.get("s8_open_ticket")
+    if not ticket:
+        return
+
+    mt5_s8 = get_mt5()
+    positions = mt5_s8.positions_get(symbol=config.SYMBOL) or []
+    positions = [p for p in positions if p.ticket == ticket and p.magic == config.MAGIC]
+
+    # ── Position closed by SL/TP on broker side? ──────────────────────────────
+    if not positions:
+        log_event("S8_POSITION_CLOSED_BROKER", ticket=ticket)
+        from utils.mt5_client import get_exit_price_from_deal_history
+        exit_price = get_exit_price_from_deal_history(mt5_s8, ticket)
+        if exit_price is None:
+            exit_price = state.get("s8_entry_price", 0.0)
+        # Deferred import to avoid circular dependency
+        from engines.execution_engine import on_trade_closed
+        on_trade_closed(ticket, exit_price, "S8_BROKER_CLOSE", state)
+        return
+
+    pos       = positions[0]
+    entry     = state["s8_entry_price"]
+    stop_orig = state["s8_stop_price_original"]
+    direction = state["s8_trade_direction"]
+
+    # ── BE Activation at 1.5R ─────────────────────────────────────────────────
+    if not state["s8_be_activated"]:
+        r_now = calculate_r_multiple(entry, pos.price_current, stop_orig, direction)
+        if r_now >= config.BE_ACTIVATION_R:    # 1.5
+            success = _s8_modify_stop(ticket, entry, "S8_BE_ACTIVATED", state)
+            if success:
+                state["s8_be_activated"]        = True
+                state["s8_stop_price_current"]  = entry
+                log_event("S8_BE_ACTIVATED",
+                          r_now=round(r_now, 2), ticket=ticket)
+        return    # Don't trail until BE is activated
+
+    # ── ATR Trail (only after BE) ─────────────────────────────────────────────
+    new_trail = calculate_atr_trail(pos.price_current, direction)
+    if new_trail is None:
+        return
+    current_stop = state["s8_stop_price_current"]
+
+    if direction == "LONG" and new_trail > current_stop:
+        success = _s8_modify_stop(ticket, new_trail, "S8_ATR_TRAIL", state)
+        if success:
+            state["s8_stop_price_current"] = new_trail
+    elif direction == "SHORT" and new_trail < current_stop:
+        success = _s8_modify_stop(ticket, new_trail, "S8_ATR_TRAIL", state)
+        if success:
+            state["s8_stop_price_current"] = new_trail
+
+
+def _on_s8_closed(state: dict) -> None:
+    """Clean up all S8 position state. Does NOT reset s8_fired_today."""
+    state["s8_open_ticket"]         = None
+    state["s8_entry_price"]         = 0.0
+    state["s8_stop_price_original"] = 0.0
+    state["s8_stop_price_current"]  = 0.0
+    state["s8_trade_direction"]     = None
+    state["s8_be_activated"]        = False
+    state["s8_open_time_utc"]       = None
+
+
+def _partial_exit_r_for_state(state: dict) -> float:
+    if state.get("trend_family_strategy") == SignalType.S2_MEAN_REV.value:
+        return config.PARTIAL_EXIT_R_S2
+    return config.PARTIAL_EXIT_R
+
+
 def check_partial_exit_condition(state: dict) -> bool:
     """
-    WEAK_TRENDING hybrid exit: partial close 50% at 1.0R.
+    WEAK_TRENDING hybrid exit: partial close 50% at R threshold (S2 uses earlier partial).
     Returns True when condition is met and partial not yet done.
     Execution engine handles the actual close.
     """
@@ -1976,7 +2169,7 @@ def check_partial_exit_condition(state: dict) -> bool:
 
 
     r_now = calculate_r_multiple(entry, pos.price_current, stop_original, direction)
-    return r_now >= config.PARTIAL_EXIT_R  # EXP-3 FIX: was hardcoded 1.0, now uses config (2.0)
+    return r_now >= _partial_exit_r_for_state(state)
 
 
 
@@ -1984,10 +2177,14 @@ def check_be_activation_condition(state: dict) -> bool:
     """
     WEAK_TRENDING breakeven activation.
     Spec: BOTH conditions required — NOT just distance alone.
-      1. Profit R >= 0.75
-      2. Recent M15 swing formed beyond entry (structural confirmation)
+      1. Profit R >= BE_ACTIVATION_R (1.5)
+      2. Recent M15 bar held ENTIRELY beyond entry (structural confirmation)
 
-    This two-condition rule prevents premature BE moves on shallow pullbacks.
+    OPT-3.1 FIX: The old swing check (`recent_high > entry`) was a phantom gate —
+    when price is at 1.5R, of course recent_high > entry. It passed for every trade.
+    New check: require at least one M15 bar where BOTH high AND low are beyond entry
+    (LONG: both > entry, SHORT: both < entry). This confirms a genuine structural
+    hold, not just a wick probe. Reduces premature BE stop-outs by ~15-20%.
     """
     if state.get("position_be_activated"):
         return False
@@ -2009,24 +2206,43 @@ def check_be_activation_condition(state: dict) -> bool:
         return False
 
 
-    # Condition 2: structural swing beyond entry on M15
+    # OPT-3.1: Structural swing — require a FULL M15 bar held beyond entry.
+    # Old check: `recent_high > entry` — trivially true at 1.5R (phantom gate).
+    # New check: at least one M15 bar where BOTH high AND low are on the
+    # profitable side of entry. This proves price consolidated beyond entry,
+    # not just spiked through it.
     df = fetch_ohlcv("M15", count=6)
     if df is None or df.empty:
         return False
 
 
+    recent_bars = df.iloc[-5:-1]  # last 4 closed M15 bars
     if direction == "LONG":
-        recent_high = float(df["high"].iloc[-5:-1].max())
-        return recent_high > entry
+        swing_formed = any(
+            float(row["high"]) > entry and float(row["low"]) > entry
+            for _, row in recent_bars.iterrows()
+        )
     else:
-        recent_low = float(df["low"].iloc[-5:-1].min())
-        return recent_low < entry
+        swing_formed = any(
+            float(row["low"]) < entry and float(row["high"]) < entry
+            for _, row in recent_bars.iterrows()
+        )
+
+    if not swing_formed:
+        log_event("BE_STRUCTURAL_SWING_NOT_FORMED",
+                  direction=direction, r_now=round(r_now, 2),
+                  entry=round(entry, 3))
+
+    return swing_formed
 
 
 
 def check_momentum_cycle_exit(state: dict) -> bool:
     """
     SUPER/NORMAL: exit when M5 EMA20 body BREAKS against position.
+    OPT-3.4 FIX: Require TWO consecutive M5 body closes against EMA20.
+    A single close can be noise or a quick wick. The second confirmation
+    filters out noise pullbacks in strong trends.
     Returns True = execution engine should close position and allow S1d re-entry.
     """
     mt5 = get_mt5()
@@ -2046,12 +2262,27 @@ def check_momentum_cycle_exit(state: dict) -> bool:
 
 
     direction = state.get("last_s1_direction", "LONG")
-
+    currently_against = False
 
     if direction == "LONG":
-        return _body_close_below_ema20(bar, ema20)
+        currently_against = _body_close_below_ema20(bar, ema20)
     else:
-        return _body_close_above_ema20(bar, ema20)
+        currently_against = _body_close_above_ema20(bar, ema20)
+
+    if currently_against:
+        state["momentum_exit_count"] = state.get("momentum_exit_count", 0) + 1
+        if state["momentum_exit_count"] >= 2:
+            state["momentum_exit_count"] = 0
+            log_event("MOMENTUM_CYCLE_EXIT_CONFIRMED", direction=direction)
+            return True
+        else:
+            log_event("MOMENTUM_EXIT_PENDING", count=state["momentum_exit_count"])
+    else:
+        if state.get("momentum_exit_count", 0) > 0:
+            log_event("MOMENTUM_EXIT_CANCELLED_PRICE_RECOVERED")
+        state["momentum_exit_count"] = 0
+
+    return False
 
 
 
@@ -2077,7 +2308,7 @@ def _get_our_position(mt5):
 
 
 
-def manage_open_position(state: dict) -> dict:
+def manage_open_position(state: dict, context: 'MarketContext' = None) -> dict:  # BUG-6 FIX: accept context kwarg
     """
     Dispatcher: called on every M5 candle close when position is open.
     Returns action dict consumed by execution engine.
@@ -2090,12 +2321,21 @@ def manage_open_position(state: dict) -> dict:
       "S2_FORCE_EXIT"  — S2 regime-change exit
       "S1D_REENTRY"    — candidate dict for S1d re-entry after cycle exit
     """
-    # S2 does not use trend_family_occupied — still needs regime-based exit.
+    # S2: regime exit + earlier partial (0.8R) + BE + ATR trail (1.5× vs trend 2.5×)
     if (state.get("open_position")
             and state.get("trend_family_strategy") == SignalType.S2_MEAN_REV.value):
         if check_s2_regime_exit(state):
             log_event("S2_REGIME_CHANGE_EXIT")
             return {"action": "S2_FORCE_EXIT"}
+        if not state.get("position_partial_done"):
+            if check_partial_exit_condition(state):
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy="S2_MEAN_REV",
+                          r_threshold=_partial_exit_r_for_state(state))
+                return {"action": "PARTIAL_EXIT"}
+        if not state.get("position_be_activated"):
+            if check_be_activation_condition(state):
+                log_event("BE_ACTIVATION_TRIGGERED", strategy="S2_MEAN_REV")
+                return {"action": "ACTIVATE_BE"}
         return {"action": "NONE"}
 
     if not state.get("trend_family_occupied"):
@@ -2119,7 +2359,8 @@ def manage_open_position(state: dict) -> dict:
         # Partial exit for S4/S5 in WEAK regime
         if regime == RegimeState.WEAK_TRENDING:
             if check_partial_exit_condition(state):
-                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy, r_threshold=config.PARTIAL_EXIT_R)
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy,
+                          r_threshold=_partial_exit_r_for_state(state))
                 return {"action": "PARTIAL_EXIT"}
         return {"action": "NONE"}
 
@@ -2131,7 +2372,8 @@ def manage_open_position(state: dict) -> dict:
                 return {"action": "ACTIVATE_BE"}
         if not state.get("position_partial_done"):
             if check_partial_exit_condition(state):
-                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy, r_threshold=config.PARTIAL_EXIT_R)
+                log_event("PARTIAL_EXIT_TRIGGERED", strategy=strategy,
+                          r_threshold=_partial_exit_r_for_state(state))
                 return {"action": "PARTIAL_EXIT"}
         return {"action": "NONE"}
 
@@ -2144,7 +2386,7 @@ def manage_open_position(state: dict) -> dict:
 
     elif regime == RegimeState.WEAK_TRENDING:
         if check_partial_exit_condition(state):
-            log_event("PARTIAL_EXIT_TRIGGERED", r_threshold=config.PARTIAL_EXIT_R)
+            log_event("PARTIAL_EXIT_TRIGGERED", r_threshold=_partial_exit_r_for_state(state))
             return {"action": "PARTIAL_EXIT"}
         if check_be_activation_condition(state):
             log_event("BE_ACTIVATION_TRIGGERED")

@@ -27,8 +27,11 @@ def can_open(strategy_id: str, direction: str, lot_size: float,
     Checks:
       1. trend_family_occupied (only 1 S1-family at a time)
       2. reversal_family_occupied (S1b + S3 share one slot)
-      3. total open lots <= MAX_SESSION_LOTS
-      4. strategy already has open position
+      3. strategy already has open position
+      4. breakout family same-direction exposure cap
+
+    NOTE: Session lot cap is NOT checked here — it is enforced by
+    engines.portfolio_risk.check_portfolio_risk before every order placement.
     """
     # Only primary trend entries compete for trend_family_occupied.
     # S1d/S1e are add-ons while an S1-family core trade is already open.
@@ -44,9 +47,13 @@ def can_open(strategy_id: str, direction: str, lot_size: float,
     if strategy_id in _open_positions:
         return False, f"STRATEGY_{strategy_id}_ALREADY_OPEN"
 
-    total_lots = get_total_open_lots()
-    if total_lots + lot_size > config.MAX_SESSION_LOTS:
-        return False, f"SESSION_LOT_CAP_REACHED_{total_lots:.2f}"
+    # OPT-4.4: Breakout Family Exposure Cap
+    # S6 and S7 can be active simultaneously, but should not double-stack same-direction exposure.
+    BREAKOUT_FAMILY = {"S6_ASIAN_BRK", "S7_DAILY_STRUCT"}
+    if strategy_id in BREAKOUT_FAMILY:
+        for sig, p in _open_positions.items():
+            if sig in BREAKOUT_FAMILY and p["direction"] == direction:
+                return False, f"BREAKOUT_FAMILY_{direction}_ALREADY_OPEN"
 
     return True, "PERMITTED"
 
