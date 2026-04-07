@@ -1,11 +1,11 @@
 """
-backtest/data_feed_updated.py — Updated Data Feed for Backtesting
+backtest/data_feed.py — Updated Data Feed for Backtesting
 
 Updated to match current live data engine (engines/data_engine.py):
 - MT5 OHLCV data fetching with proper timeframe constants
-- Economic calendar integration (HorizonFX + hardcoded fallback)
-- Spread tracking with 24-hour baseline calculation
-- DXY correlation analysis with USDX/UUP fallback
+- Economic calendar integration (CSV-only; hardcoded fallback removed)
+- Spread tracking with session-aware 24-hour baseline calculation
+- DXY correlation analysis with robust CSV parsing
 - TLT/TIP macro proxy data integration
 - Contract specification fetching from MT5 metadata
 - Session-aware data processing
@@ -19,7 +19,6 @@ import logging
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-# (models imported only where needed — unused imports removed BUG-20)
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Iterator, Dict, Any, List
@@ -91,6 +90,7 @@ def get_contract_spec(symbol: str = "XAUUSD") -> Dict[str, Any]:
         logger.warning(f"Failed to get contract spec from MT5: {e}, using fallback")
         return _get_fallback_contract_spec(symbol)
 
+
 def _get_fallback_contract_spec(symbol: str) -> Dict[str, Any]:
     """Fallback contract specifications for XAUUSD."""
     return {
@@ -107,7 +107,7 @@ def _get_fallback_contract_spec(symbol: str) -> Dict[str, Any]:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HISTORICAL DATA FEED - Updated
+# HISTORICAL DATA FEED
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HistoricalDataFeed:
@@ -194,7 +194,6 @@ class HistoricalDataFeed:
             start_naive = self.start_date.replace(tzinfo=None)
             end_naive   = self.end_date.replace(tzinfo=None)
             
-            # Use MT5 timeframe constants
             tf_m5 = mt5.TIMEFRAME_M5
             bars = mt5.copy_rates_range(self.symbol, tf_m5, start_naive, end_naive)
             
@@ -202,7 +201,6 @@ class HistoricalDataFeed:
                 logger.error("No bars returned from MT5")
                 return None
 
-            # Materialize rpyc NetRef column-by-column
             df = pd.DataFrame({
                 "time":        list(bars["time"]),
                 "open":        list(bars["open"]),
@@ -224,27 +222,33 @@ class HistoricalDataFeed:
         if df.empty:
             return df
         
-        # Ensure required columns exist
         required_cols = ["time", "open", "high", "low", "close", "tick_volume", "spread"]
         for col in required_cols:
             if col not in df.columns:
-                if col == "spread":
-                    df[col] = 2.0  # Default spread
-                else:
-                    df[col] = 0.0
+                df[col] = 2.0 if col == "spread" else 0.0
         
-        # Sort by time
         df = df.sort_values("time").reset_index(drop=True)
         return df
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SPREAD FEED - Updated with 24h baseline
+# SPREAD FEED — session-aware synthetic fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HistoricalSpreadFeed:
     """
-    Updated spread feed with 24-hour baseline calculation.
-    Matches live data engine spread tracking.
+    Spread feed with session-aware synthetic generation.
+    Loads from backtest_data/spreads_XAUUSD_M5.csv when present;
+    otherwise generates realistic XAUUSD spreads by session.
+
+    XAUUSD real-world spread profile:
+      Asian (22-07 UTC):           2.5 – 5.0 pts  (low liquidity)
+      London open (07:00-07:15):   1.3 – 2.0 pts  (tight at open)
+      London core (07:15-13:00):   1.5 – 2.5 pts  (most liquid)
+      NY overlap (13:00-17:00):    1.3 – 2.2 pts  (tightest)
+      NY wind-down (17:00-20:00):  2.0 – 3.5 pts
+      End of day (20:00-22:00):    2.5 – 5.0 pts
+      Weekend:                     3.5 – 8.0 pts
     """
 
     def __init__(self, start_date: datetime, end_date: datetime):
@@ -253,39 +257,61 @@ class HistoricalSpreadFeed:
         self._spread_data: Optional[pd.DataFrame] = None
 
     def load(self) -> pd.DataFrame:
-        """Load spread data from CSV or generate from price data."""
-        # Try to load from CSV first
+        """Load spread data from CSV or generate session-aware synthetic data."""
         csv_path = _DEFAULT_SPREAD_CSV
         if csv_path.exists():
             df = pd.read_csv(csv_path, parse_dates=['time'])
             df['time'] = pd.to_datetime(df['time'], utc=True)
             df = df[(df['time'] >= self.start_date) & (df['time'] <= self.end_date)]
             logger.info(f"Loaded spread data from CSV: {len(df)} records")
+            self._spread_data = df
             return df
         
-        # Generate spread data if no CSV available
-        logger.warning("No spread CSV found, generating synthetic spread data")
-        return self._generate_synthetic_spread()
+        logger.info("No spread CSV found — generating session-aware synthetic spreads")
+        df = self._generate_synthetic_spread()
+        self._spread_data = df
+        return df
 
     def _generate_synthetic_spread(self) -> pd.DataFrame:
-        """Generate synthetic spread data for backtesting."""
-        # BUG-12 FIX: use tz-aware dates so subtraction with bar_time (UTC) works
+        """
+        Generate session-aware XAUUSD spread data.
+        Uses the same session profile as tools/generate_spread_csv.py.
+        """
+        np.random.seed(42)
         date_range = pd.date_range(self.start_date, self.end_date, freq='5min', tz='UTC')
-        spreads = []
+        rows = []
 
-        for date in date_range:
-            hour = date.hour
-            if 7 <= hour < 17:       # London session
-                base_spread = np.random.normal(1.8, 0.3)
-            elif 13 <= hour < 21:    # NY session
-                base_spread = np.random.normal(2.0, 0.4)
-            else:                    # Off-hours
-                base_spread = np.random.normal(2.5, 0.5)
+        for t in date_range:
+            h, m, wd = t.hour, t.minute, t.weekday()
 
-            spread = max(0.5, base_spread + np.random.normal(0, 0.2))
-            spreads.append({'time': date, 'spread': round(spread, 1)})
+            if wd >= 5:                           # Weekend
+                spread = round(np.random.uniform(3.5, 8.0), 1)
+            elif 22 <= h or h < 2:               # Late NY / early Asian
+                spread = max(1.0, round(np.random.normal(3.5, 0.8), 1))
+            elif 2 <= h < 6:                      # Asian core
+                spread = max(1.0, round(np.random.normal(3.0, 0.7), 1))
+            elif 6 <= h < 7:                      # Pre-London
+                spread = max(1.0, round(np.random.normal(2.5, 0.5), 1))
+            elif h == 7 and m < 15:              # London open spike
+                spread = max(1.0, round(np.random.normal(1.6, 0.5), 1))
+            elif 7 <= h < 9:                      # London early
+                spread = max(1.0, round(np.random.normal(1.8, 0.4), 1))
+            elif 9 <= h < 13:                     # London core
+                spread = max(1.0, round(np.random.normal(1.7, 0.35), 1))
+            elif 13 <= h < 14:                    # NY open
+                spread = max(1.0, round(np.random.normal(1.5, 0.4), 1))
+            elif 14 <= h < 17:                    # NY active
+                spread = max(1.0, round(np.random.normal(1.8, 0.4), 1))
+            elif 17 <= h < 19:                    # NY wind-down
+                spread = max(1.0, round(np.random.normal(2.5, 0.6), 1))
+            elif 19 <= h < 21:                    # End of day
+                spread = max(1.0, round(np.random.normal(3.2, 0.7), 1))
+            else:                                 # Late NY
+                spread = max(1.0, round(np.random.normal(3.8, 0.8), 1))
 
-        return pd.DataFrame(spreads)
+            rows.append({'time': t, 'spread': spread})
+
+        return pd.DataFrame(rows)
 
     def get_24h_median_spread(self, current_time: datetime) -> float:
         """Calculate 24-hour rolling median spread."""
@@ -297,117 +323,94 @@ class HistoricalSpreadFeed:
             self._spread_data['time'] >= cutoff_time
         ]['spread']
         
-        if len(recent_spreads) == 0:
-            return 2.0  # Default median
-        
-        return float(recent_spreads.median())
+        return float(recent_spreads.median()) if len(recent_spreads) > 0 else 2.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ECONOMIC EVENT FEED - Updated with HorizonFX integration
+# ECONOMIC EVENT FEED — CSV-only; hardcoded fallback removed
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HistoricalEventFeed:
     """
-    Updated economic event feed with HorizonFX primary + hardcoded fallback.
-    Matches live data engine exactly.
+    Economic event feed.
+
+    CHANGE 1 — Hardcoded event generation has been removed entirely.
+    When no events_calendar.csv exists:
+      - load() returns [] and sets loaded_from_csv = False
+      - get_upcoming_events() returns [] immediately
+      - engine._ks7_enabled stays False → KS7 never fires
+      - algo runs through all bars including news bars unfiltered
+
+    To re-enable KS7, place a real events_calendar.csv in backtest_data/
+    with columns: datetime_utc (or time), name, impact_level.
     """
 
     def __init__(self, start_date: datetime, end_date: datetime):
         self.start_date = start_date.replace(tzinfo=pytz.utc)
         self.end_date   = end_date.replace(tzinfo=pytz.utc)
         self._events: Optional[List[Dict[str, Any]]] = None
-        self.loaded_from_csv: bool = False   # True only when real CSV was found
+        self.loaded_from_csv: bool = False  # engine checks this to gate KS7
 
     def load(self) -> List[Dict[str, Any]]:
-        """Load events from CSV or generate fallback events."""
-        # Try to load from CSV first
+        """
+        Load events from CSV only.
+        Returns [] when no CSV found — KS7 stays permanently disabled.
+        """
         csv_path = _DEFAULT_EVENTS_CSV
         if csv_path.exists():
             df = pd.read_csv(csv_path)
-            # Support both 'datetime_utc' and 'time' column names
             time_col = 'datetime_utc' if 'datetime_utc' in df.columns else 'time'
             df[time_col] = pd.to_datetime(df[time_col], utc=True)
-            df = df[(df[time_col] >= self.start_date) & (df[time_col] <= self.end_date)]
-
+            df = df[
+                (df[time_col] >= self.start_date) &
+                (df[time_col] <= self.end_date)
+            ]
             events = []
             for rec in df.to_dict('records'):
-                # BUG-9 FIX: normalise key to 'time' so KS7 and engine can use event['time']
                 rec['time'] = rec.pop(time_col, rec.get('time'))
                 events.append(rec)
-            logger.info(f"Loaded {len(events)} events from CSV")
+            logger.info(f"Loaded {len(events)} events from CSV — KS7 enabled")
             self._events = events
-            self.loaded_from_csv = True   # real CSV → KS7 is meaningful
+            self.loaded_from_csv = True
             return events
-        
-        # No CSV — fall back to hardcoded events; KS7 will be disabled
-        logger.warning("No events CSV found, using hardcoded high-impact events")
-        self.loaded_from_csv = False
-        return self._generate_hardcoded_events()
 
-    def _generate_hardcoded_events(self) -> List[Dict[str, Any]]:
-        """Generate hardcoded high-impact events for major releases."""
-        events = []
-        
-        # Generate NFP events (first Friday of each month)
-        current_date = self.start_date.date()
-        while current_date <= self.end_date.date():
-            # Find first Friday
-            if current_date.weekday() == 4:  # Friday
-                if current_date.day <= 7:  # First week
-                    event_time = datetime.combine(current_date, datetime.min.time()).replace(
-                        hour=13, minute=30, tzinfo=pytz.utc
-                    )
-                    if self.start_date <= event_time <= self.end_date:
-                        events.append({
-                            'time': event_time,          # BUG-9: canonical key
-                            'name': 'Non-Farm Payrolls',
-                            'impact_level': 'HIGH',
-                            'source': 'hardcoded'
-                        })
-            current_date += timedelta(days=1)
-        
-        # Add FOMC decisions (approximately every 6 weeks)
-        # This is simplified - in reality would need actual FOMC schedule
-        current_date = self.start_date.date()
-        while current_date <= self.end_date.date():
-            # Simplified FOMC schedule (2nd Wednesday of even months)
-            if current_date.weekday() == 2 and current_date.day >= 8 and current_date.day <= 14 and current_date.month % 2 == 0:
-                event_time = datetime.combine(current_date, datetime.min.time()).replace(
-                    hour=19, minute=0, tzinfo=pytz.utc
-                )
-                if self.start_date <= event_time <= self.end_date:
-                    events.append({
-                        'time': event_time,              # BUG-9: canonical key
-                        'name': 'FOMC Interest Rate Decision',
-                        'impact_level': 'HIGH',
-                        'source': 'hardcoded'
-                    })
-            current_date += timedelta(days=1)
-        
-        logger.info(f"Generated {len(events)} hardcoded events")
-        self._events = events
-        return events
+        # No CSV — event system disabled
+        logger.info(
+            "No events CSV found at backtest_data/events_calendar.csv — "
+            "event blackout (KS7) permanently disabled. "
+            "Algo will trade through all news bars."
+        )
+        self.loaded_from_csv = False
+        self._events = []
+        return []
 
     def get_upcoming_events(
         self,
         current_time: datetime,
         minutes_ahead: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get upcoming events within specified window."""
+        """
+        Returns upcoming events.
+        Returns [] immediately when no CSV was loaded (KS7 never fires).
+        """
         if self._events is None:
             self.load()
 
+        # Fast-path: no CSV → no events ever
+        if not self.loaded_from_csv:
+            return []
+
         cutoff_time = current_time + timedelta(minutes=minutes_ahead)
         upcoming = [
-            event for event in self._events
-            if current_time <= event['time'] <= cutoff_time  # BUG-9: use canonical 'time' key
+            e for e in self._events
+            if current_time <= e['time'] <= cutoff_time
         ]
-
         upcoming.sort(key=lambda x: x['time'])
         return upcoming
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# BAR BUFFER - Updated for multi-timeframe support
+# BAR BUFFER — multi-timeframe support
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BarBuffer:
@@ -427,10 +430,9 @@ class BarBuffer:
 
     def add_m5_bar(self, bar: Dict[str, Any]) -> None:
         """Add M5 bar and update higher timeframes."""
-        self._total_m5_count += 1          # BUG-11 FIX: increment before trim
+        self._total_m5_count += 1
         self.m5_bars.append(bar)
 
-        # Keep only what we need for memory efficiency
         max_m5 = 1000
         if len(self.m5_bars) > max_m5:
             self.m5_bars = self.m5_bars[-max_m5:]
@@ -439,132 +441,176 @@ class BarBuffer:
 
     def _update_timeframes(self) -> None:
         """Update M15, H1, H4, D1 from M5 data."""
-        # BUG-11 FIX: use _total_m5_count (never trimmed) for modulo checks
         n = self._total_m5_count
         if n < 3:
             return
 
-        # M15: every 3 M5 bars — need at least 3 in buffer
         if n % 3 == 0 and len(self.m5_bars) >= 3:
-            m15_bar = self._create_ohlcv_from_m5(self.m5_bars[-3:])
-            self.m15_bars.append(m15_bar)
+            self.m15_bars.append(self._create_ohlcv_from_m5(self.m5_bars[-3:]))
 
-        # H1: every 12 M5 bars
         if n % 12 == 0 and len(self.m5_bars) >= 12:
-            h1_bar = self._create_ohlcv_from_m5(self.m5_bars[-12:])
-            self.h1_bars.append(h1_bar)
+            self.h1_bars.append(self._create_ohlcv_from_m5(self.m5_bars[-12:]))
 
-        # H4: every 48 M5 bars
         if n % 48 == 0 and len(self.m5_bars) >= 48:
-            h4_bar = self._create_ohlcv_from_m5(self.m5_bars[-48:])
-            self.h4_bars.append(h4_bar)
+            self.h4_bars.append(self._create_ohlcv_from_m5(self.m5_bars[-48:]))
 
-        # D1: every 288 M5 bars
         if n % 288 == 0 and len(self.m5_bars) >= 288:
-            d1_bar = self._create_ohlcv_from_m5(self.m5_bars[-288:])
-            self.d1_bars.append(d1_bar)
+            self.d1_bars.append(self._create_ohlcv_from_m5(self.m5_bars[-288:]))
 
     def _create_ohlcv_from_m5(self, m5_bars: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Create OHLCV bar from M5 bars."""
         if not m5_bars:
             return {}
-        
-        opens = [bar['open'] for bar in m5_bars]
-        highs = [bar['high'] for bar in m5_bars]
-        lows = [bar['low'] for bar in m5_bars]
-        closes = [bar['close'] for bar in m5_bars]
-        volumes = [bar.get('tick_volume', 0) for bar in m5_bars]
-        spreads = [bar.get('spread', 0) for bar in m5_bars]
-        
         return {
-            'time': m5_bars[-1]['time'],
-            'open': opens[0],
-            'high': max(highs),
-            'low': min(lows),
-            'close': closes[-1],
-            'tick_volume': sum(volumes),
-            'spread': spreads[-1]  # Use latest spread
+            'time':        m5_bars[-1]['time'],
+            'open':        m5_bars[0]['open'],
+            'high':        max(b['high'] for b in m5_bars),
+            'low':         min(b['low']  for b in m5_bars),
+            'close':       m5_bars[-1]['close'],
+            'tick_volume': sum(b.get('tick_volume', 0) for b in m5_bars),
+            'spread':      m5_bars[-1].get('spread', 0),
         }
 
     def get_latest_bars(self, timeframe: str, count: int = 1) -> List[Dict[str, Any]]:
         """Get latest bars for specified timeframe."""
-        if timeframe == "M5":
-            return self.m5_bars[-count:] if count <= len(self.m5_bars) else self.m5_bars
-        elif timeframe == "M15":
-            return self.m15_bars[-count:] if count <= len(self.m15_bars) else self.m15_bars
-        elif timeframe == "H1":
-            return self.h1_bars[-count:] if count <= len(self.h1_bars) else self.h1_bars
-        elif timeframe == "H4":
-            return self.h4_bars[-count:] if count <= len(self.h4_bars) else self.h4_bars
-        elif timeframe == "D1":
-            return self.d1_bars[-count:] if count <= len(self.d1_bars) else self.d1_bars
-        return []
+        mapping = {
+            'M5':  self.m5_bars,
+            'M15': self.m15_bars,
+            'H1':  self.h1_bars,
+            'H4':  self.h4_bars,
+            'D1':  self.d1_bars,
+        }
+        bars = mapping.get(timeframe, [])
+        return bars[-count:] if count <= len(bars) else bars
 
     def get_dataframe(self, timeframe: str, count: Optional[int] = None) -> pd.DataFrame:
         """Get DataFrame for specified timeframe."""
-        bars = self.get_latest_bars(timeframe, count or len(getattr(self, f"{timeframe.lower()}_bars")))
+        attr = f"{timeframe.lower()}_bars"
+        all_bars = getattr(self, attr, [])
+        bars = self.get_latest_bars(timeframe, count or len(all_bars))
         if not bars:
             return pd.DataFrame()
-        
         df = pd.DataFrame(bars)
         if 'time' in df.columns:
             df['time'] = pd.to_datetime(df['time'], utc=True)
         return df
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# DXY FEED - Macro proxy for SUPER_TRENDING regime
+# DXY FEED — robust CSV parsing (CHANGE 3: fixes KeyError: 'time')
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HistoricalDXYFeed:
     """
     Historical feed for DXY daily change to enable SUPER_TRENDING regime.
+
+    CHANGE 3 — Rewritten load() to handle real dxy_daily.csv format:
+      - Columns: Date,Open,High,Low,Close  (capital 'Date', quoted values)
+      - Normalises all column names to lowercase
+      - Auto-detects date column: 'date', 'time', 'datetime', 'datetime_utc'
+      - Strips quotes and parses MM/DD/YYYY or ISO format automatically
+      - Fixes KeyError: 'time' that crashed engine at bar 1
     """
 
-    def __init__(self, start_date: datetime, end_date: datetime, cache_dir: str = "backtest_data"):
+    def __init__(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        cache_dir: str = "backtest_data"
+    ):
         self.start_date = start_date.replace(tzinfo=pytz.utc) if start_date.tzinfo is None else start_date
-        self.end_date   = end_date.replace(tzinfo=pytz.utc) if end_date.tzinfo is None else end_date
-        self.cache_dir = Path(cache_dir)
+        self.end_date   = end_date.replace(tzinfo=pytz.utc)   if end_date.tzinfo is None   else end_date
+        self.cache_dir  = Path(cache_dir)
         self._df: Optional[pd.DataFrame] = None
 
     def load(self) -> pd.DataFrame:
-        """Load DXY/UUP data from CSV if available."""
+        """Load DXY daily CSV with robust column normalisation."""
         if self._df is not None:
             return self._df
-            
-        csv_path = Path(__file__).parent.parent / self.cache_dir / "dxy_daily.csv"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path)
-            # Assume columns: date, close
-            time_col = 'date' if 'date' in df.columns else 'time'
-            df[time_col] = pd.to_datetime(df[time_col], utc=True)
-            df = df.sort_values(time_col).reset_index(drop=True)
-            
-            # Calculate daily change
-            if 'close' in df.columns:
-                df['daily_change'] = df['close'].pct_change() * 100
-                df['daily_change'] = df['daily_change'].fillna(0)
-            
-            self._df = df
-            logger.info(f"Loaded DXY data from {csv_path}: {len(df)} days")
+
+        # Search in backtest_data/ first, then repo root
+        candidates = [
+            Path(__file__).parent.parent / self.cache_dir / "dxy_daily.csv",
+            Path(__file__).parent.parent / "dxy_daily.csv",
+        ]
+        csv_path = next((p for p in candidates if p.exists()), None)
+
+        if csv_path is None:
+            logger.warning(
+                "No DXY CSV found in backtest_data/ or repo root. "
+                "SUPER_TRENDING regime will be disabled."
+            )
+            self._df = pd.DataFrame()
             return self._df
-            
-        logger.warning(f"No DXY CSV found at {csv_path}. SUPER_TRENDING regime will be disabled.")
-        self._df = pd.DataFrame()
+
+        df = pd.read_csv(csv_path)
+
+        # ── Step 1: normalise column names to lowercase ──────────────────
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # ── Step 2: find the date column ─────────────────────────────────
+        date_col = next(
+            (c for c in df.columns if c in ('date', 'time', 'datetime', 'datetime_utc')),
+            None
+        )
+        if date_col is None:
+            logger.error(
+                f"DXY CSV has no recognised date column. "
+                f"Found columns: {list(df.columns)}"
+            )
+            self._df = pd.DataFrame()
+            return self._df
+
+        # ── Step 3: strip surrounding quotes, then parse date ────────────
+        df[date_col] = (
+            df[date_col]
+            .astype(str)
+            .str.strip('"')
+            .str.strip("'")
+        )
+        df[date_col] = pd.to_datetime(
+            df[date_col],
+            infer_datetime_format=True,
+            utc=True
+        )
+
+        # ── Step 4: strip quotes from price columns ───────────────────────
+        for col in ('open', 'high', 'low', 'close'):
+            if col in df.columns:
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.strip('"')
+                    .str.strip("'")
+                    .astype(float)
+                )
+
+        # ── Step 5: rename to canonical 'date' key ───────────────────────
+        df = df.rename(columns={date_col: 'date'})
+        df = df.sort_values('date').reset_index(drop=True)
+
+        # ── Step 6: compute daily % change ───────────────────────────────
+        df['daily_change'] = df['close'].pct_change() * 100
+        df['daily_change'] = df['daily_change'].fillna(0.0)
+
+        self._df = df
+        logger.info(
+            f"Loaded DXY data from {csv_path}: {len(df)} days "
+            f"({df['date'].iloc[0].date()} → {df['date'].iloc[-1].date()})"
+        )
         return self._df
 
     def get_daily_change(self, bar_time: datetime) -> Optional[float]:
-        """Get daily % change for the given bar's date."""
+        """Return DXY daily % change for the most recent day on or before bar_time."""
         if self._df is None:
             self.load()
-            
+
         if self._df.empty or 'daily_change' not in self._df.columns:
             return None
-            
-        time_col = 'date' if 'date' in self._df.columns else 'time'
-        mask = self._df[time_col].dt.date <= bar_time.date()
-        valid_rows = self._df[mask]
-        
-        if valid_rows.empty:
+
+        mask = self._df['date'].dt.date <= bar_time.date()
+        valid = self._df[mask]
+        if valid.empty:
             return None
-            
-        return float(valid_rows.iloc[-1]['daily_change'])
+
+        return float(valid.iloc[-1]['daily_change'])
