@@ -157,7 +157,7 @@ class EquityPoint:
     equity: float
     balance: float = 0.0
     open_positions: int = 0
-    # regime: str = "NO_TRADE"
+    regime: str = "NO_TRADE"        # FIX: was commented out; engine passes regime= and to_dict() reads self.regime
     drawdown_pct: float = 0.0
 
     def to_dict(self) -> dict:
@@ -179,12 +179,16 @@ class SimulatedState:
     Tracks all strategy state, risk management, and position data.
     Mirrors the live system's state structure for perfect parity.
 
-    BUG-4 FIX: to_dict() now exposes 'regime' and 'session' aliases so
-        strategies using state.get('regime') and state.get('session')
-        correctly read current_regime and current_session.
+    BUG-4 FIX: to_dict() now exposes 'regime' and 'session' as aliases for
+        current_regime and current_session so all strategy state.get()
+        calls work regardless of which key name they use.
 
     BUG-5 FIX: size_multiplier initialised to 0.5 (RANGING floor) instead of
         0.0 to prevent zero-multiplier lot sizes on bar-0.
+
+    REMAINING-6 FIX: removed stale duplicate `regime` field; only
+        current_regime is canonical.  to_dict() already exposes 'regime'
+        as an alias.
     """
     # Account metrics
     balance: float = 10000.0
@@ -325,6 +329,18 @@ class SimulatedState:
     corr_throttle_active: bool = False
     corr_throttle_pairs: list = field(default_factory=list)
     _corr_check_trade_counter: int = field(default=0, repr=False)
+
+    # Extra structural state (set dynamically by engine)
+    open_positions: dict = field(default_factory=dict)
+    independent_lanes_occupied: dict = field(default_factory=dict)
+    pre_london_range: Optional[dict] = None
+    asian_range: Optional[dict] = None
+    prev_day_ohlc: Optional[dict] = None
+    r3_pre_event_price: float = 0.0
+    r3_pre_event_atr: float = 0.0
+    conviction_level: str = "STANDARD"
+    severity_multiplier: float = 1.0
+    vol_scalar: float = 1.0
 
     def to_dict(self) -> dict:
         """
