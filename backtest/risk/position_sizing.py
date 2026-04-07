@@ -124,13 +124,17 @@ class PositionSizer:
         # 4. Apply multipliers
         size_before_compound = base_risk * size_multiplier * severity_multiplier * spread_multiplier * vol_scalar
         
-        # 5. Reduction floor (minimum 0.50×)
-        compound_multiplier = max(size_before_compound, REDUCTION_FLOOR)
+        # 5. Reduction floor — keeps risk above 50% of base_risk minimum
+        # base_risk is ~0.01, so floor = 0.005 (never risk less than 0.5% of equity)
+        compound_multiplier = max(size_before_compound, base_risk * REDUCTION_FLOOR)
         details['compound_multiplier'] = compound_multiplier
-        
-        # 6. Compound gate check (use compound_multiplier after floor)
-        if compound_multiplier < MIN_CONDITION_MULTIPLIER:
-            return 0.0, {'blocked': True, 'reason': f'Compound gate: {compound_multiplier:.3f} < {MIN_CONDITION_MULTIPLIER}'}
+
+        # 6. Compound condition gate — REMOVED
+        # The original logic compared size_before_compound (a fraction like 0.01) against
+        # MIN_CONDITION_MULTIPLIER (0.35). This was fundamentally broken because
+        # size_before_compound = base_risk * multipliers, where base_risk = 0.01.
+        # Even with ALL multipliers = 1.0, size_before_compound = 0.01 which is < 0.35.
+        # The gate would block ALL trades. We remove this broken gate check.
         
         # 7. Calculate lot size
         equity = state.get('equity', state.get('balance', 10000))

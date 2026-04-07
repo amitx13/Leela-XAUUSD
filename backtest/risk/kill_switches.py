@@ -243,6 +243,8 @@ class KillSwitchChecker:
         self.peak_equity = 0.0
         self.week_start_balance = 0.0
         self.day_start_balance = 0.0
+        self.ks3_triggered_today = False
+        self.ks5_triggered_this_week = False
         
     def check_all_kill_switches(
         self,
@@ -281,12 +283,16 @@ class KillSwitchChecker:
             results['triggered_switches'].append('KS2')
             results['warnings'].append(ks2_reason)
         
-        # KS3: Daily loss limit
+        # KS3: Daily loss limit — only fire once per day, not on every bar
         ks3_triggered, ks3_reason = check_ks3_daily_loss(daily_pnl, self.day_start_balance)
-        if ks3_triggered:
+        if ks3_triggered and not self.ks3_triggered_today:
+            self.ks3_triggered_today = True
             results['triggered_switches'].append('KS3')
             results['state_updates']['trading_enabled'] = False
             results['state_updates']['shutdown_reason'] = ks3_reason
+        elif self.ks3_triggered_today:
+            # Already triggered — keep trading disabled but do not spam log
+            results['state_updates']['trading_enabled'] = False
         
         # KS4: Loss streak with countdown
         ks4_triggered, ks4_reason, new_countdown = check_ks4_loss_streak(
@@ -301,12 +307,16 @@ class KillSwitchChecker:
             if new_countdown > 0:
                 results['size_multiplier'] *= 0.5
         
-        # KS5: Weekly loss limit
+        # KS5: Weekly loss limit — only fire once per week, not on every bar
         ks5_triggered, ks5_reason = check_ks5_weekly_loss(weekly_pnl, self.week_start_balance)
-        if ks5_triggered:
+        if ks5_triggered and not self.ks5_triggered_this_week:
+            self.ks5_triggered_this_week = True
             results['triggered_switches'].append('KS5')
             results['state_updates']['trading_enabled'] = False
             results['state_updates']['shutdown_reason'] = ks5_reason
+        elif self.ks5_triggered_this_week:
+            # Already triggered — keep trading disabled but do not spam log
+            results['state_updates']['trading_enabled'] = False
         
         # KS6: Intentionally NOT checked here.
         # KS6 is a daily circuit breaker handled exclusively at midnight
@@ -334,9 +344,11 @@ class KillSwitchChecker:
             self.consecutive_losses = 0
     
     def reset_daily(self, balance: float) -> None:
-        """Reset daily state."""
+        """Reset daily state including KS3 trigger flag."""
         self.day_start_balance = balance
+        self.ks3_triggered_today = False
     
     def reset_weekly(self, balance: float) -> None:
-        """Reset weekly state."""
+        """Reset weekly state including KS5 trigger flag."""
         self.week_start_balance = balance
+        self.ks5_triggered_this_week = False

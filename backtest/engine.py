@@ -569,6 +569,12 @@ class BacktestEngine:
                     else:
                         orders.append(self._create_order(signal, bar.time))
 
+                    # Mark one-shot strategies as placed for today
+                    if strategy == 'S6_ASIAN_BRK':
+                        self.state.s6_placed_today = True
+                    elif strategy == 'S7_DAILY_STRUCT':
+                        self.state.s7_placed_today = True
+
             except Exception as e:
                 logger.error(f"Error evaluating {strategy}: {e}")
                 continue
