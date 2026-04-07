@@ -47,14 +47,11 @@ from engines.risk_engine import (
     can_s1_family_fire, can_s1f_fire, can_s2_fire,
     can_m5_reentry_fire, run_pre_trade_kill_switches,
     calculate_r_multiple, calculate_atr_trail,
-    # ── CHANGE 3: added reversal family and Phase 1 strategy gates ───────────
     can_reversal_family_fire, can_s3_fire, can_s6_fire, can_s7_fire,
 )
 from engines.data_engine import (
     fetch_ohlcv, get_upcoming_events_within,
-    # ── CHANGE 2: replaced get_session_avg_spread with 24h baseline ──────────
     get_avg_spread_last_24h,
-    # ── CHANGE 2: Phase 1 strategy data functions ─────────────────────────────
     get_asian_range, get_prev_day_ohlc, get_daily_atr14,
 )
 
