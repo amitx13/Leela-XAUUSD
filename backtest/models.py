@@ -478,6 +478,11 @@ class SimulatedState:
             "range_computed": self.range_computed,
             "s7_prev_day_high": self.s7_prev_day_high,
             "s7_prev_day_low": self.s7_prev_day_low,
+            
+            # Pre-London/Asian/Daily ranges (for strategy conditions)
+            "pre_london_range": self.pre_london_range,
+            "asian_range": self.asian_range,
+            "prev_day_ohlc": self.prev_day_ohlc,
 
             # Performance
             "total_closed_trades": self.total_closed_trades,

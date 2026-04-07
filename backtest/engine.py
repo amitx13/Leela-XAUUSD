@@ -362,7 +362,7 @@ class BacktestEngine:
             current_spread / median_spread if median_spread > 0 else 1.0
         )
         
-        self.state.current_regime = regime
+        self.state.current_regime = str(regime.value) if hasattr(regime, 'value') else str(regime)
         self.state.size_multiplier = size_multiplier
         
         # Run kill switches — pass empty events list when KS7 is disabled
@@ -410,6 +410,7 @@ class BacktestEngine:
                     logger.debug(f"Portfolio risk blocked: {order.strategy} - {portfolio_result[1]}")
             
             # Position sizing
+            valid_orders = []
             for order in filtered_orders:
                 lot_size, sizing_details = self.position_sizer.calculate_lot_size(
                     abs(order.stop_price - order.price),
@@ -421,12 +422,18 @@ class BacktestEngine:
                     vol_scalar=getattr(self.state, 'vol_scalar', 1.0)
                 )
                 
-                order.lot_size = lot_size
-                order.metadata.update(sizing_details)
+                # Check if position sizing blocked this order
+                if lot_size > 0:
+                    order.lot_size = lot_size
+                    order.metadata.update(sizing_details)
+                    valid_orders.append(order)
+                else:
+                    logger.debug(f"Position sizing blocked: {order.strategy} - {sizing_details.get('reason', 'unknown')}")
             
-            # Process orders
+            # Process orders - combine new valid orders with any pending orders from previous bars
+            all_orders = self.pending_orders + valid_orders
             filled_positions, remaining_orders = self.execution_sim.process_pending_orders(
-                filtered_orders, bar._asdict(), current_spread, bar_time
+                all_orders, bar._asdict(), current_spread, bar_time
             )
             
             self.pending_orders = remaining_orders
@@ -781,7 +788,8 @@ class BacktestEngine:
             last_bar = self.bar_buffer.get_latest_bars('M5', 1)[0]
             last_price = last_bar['close']
             
-            for ticket, position in self.state.open_positions.items():
+            # Iterate over a copy to avoid "dictionary changed size during iteration"
+            for ticket, position in list(self.state.open_positions.items()):
                 if position.direction == "LONG":
                     pnl_points = last_price - position.entry_price
                 else:

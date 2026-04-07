@@ -239,12 +239,20 @@ def get_regime_multiplier(regime: RegimeState, session: str = "LONDON") -> float
     return regime.multiplier * session_multiplier
 
 def is_regime_allowed_for_strategy(
-    regime: RegimeState, 
+    regime, 
     strategy: str
 ) -> bool:
     """
     Check if regime allows specific strategy.
+    Handles both RegimeState enums and string values.
     """
+    # Convert string to enum if needed
+    if isinstance(regime, str):
+        try:
+            regime = RegimeState(regime)
+        except ValueError:
+            return False
+    
     if regime == RegimeState.NO_TRADE:
         return False  # Only S7 pending orders allowed
     elif strategy == "S2_MEAN_REV":

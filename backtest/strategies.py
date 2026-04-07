@@ -454,7 +454,16 @@ def evaluate_s2_mean_rev(
     """
     config = STRATEGY_CONFIGS["S2_MEAN_REV"]
 
-    regime = state.get('regime', RegimeState.NORMAL_TRENDING)
+    regime_str = state.get('regime', 'NORMAL_TRENDING')
+    # Convert string to RegimeState enum if needed
+    if isinstance(regime_str, str):
+        try:
+            regime = RegimeState(regime_str)
+        except ValueError:
+            regime = RegimeState.NORMAL_TRENDING
+    else:
+        regime = regime_str
+    
     if regime != RegimeState.RANGING_CLEAR:
         return None
     if state.get('s2_fired_today'):

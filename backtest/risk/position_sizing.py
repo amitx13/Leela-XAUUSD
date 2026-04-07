@@ -128,9 +128,9 @@ class PositionSizer:
         compound_multiplier = max(size_before_compound, REDUCTION_FLOOR)
         details['compound_multiplier'] = compound_multiplier
         
-        # 6. Compound gate check
-        if size_before_compound < MIN_CONDITION_MULTIPLIER:
-            return 0.0, {'blocked': True, 'reason': f'Compound gate: {size_before_compound:.3f} < {MIN_CONDITION_MULTIPLIER}'}
+        # 6. Compound gate check (use compound_multiplier after floor)
+        if compound_multiplier < MIN_CONDITION_MULTIPLIER:
+            return 0.0, {'blocked': True, 'reason': f'Compound gate: {compound_multiplier:.3f} < {MIN_CONDITION_MULTIPLIER}'}
         
         # 7. Calculate lot size
         equity = state.get('equity', state.get('balance', 10000))

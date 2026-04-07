@@ -331,10 +331,11 @@ def run_walk_forward(results: dict, args: argparse.Namespace) -> Optional[dict]:
     logger.info("Running walk-forward analysis...")
     
     try:
+        start_date, end_date = validate_dates(args.start, args.end)
         wf_analyzer = WalkForwardAnalyzer()
         wf_results = wf_analyzer.run_analysis(
-            args.start,
-            args.end,
+            start_date,
+            end_date,
             args.train_months,
             args.test_months,
             get_selected_strategies(args),
