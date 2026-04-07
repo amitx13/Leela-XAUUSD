@@ -41,7 +41,7 @@ STRATEGY_CONFIGS = {
     'S6_ASIAN_BRK': {'min_range': 8, 'breakout_pct': 0.1, 'expiry_utc': '08:05'},
     'S7_DAILY_STRUCT': {'min_range_atr_ratio': 0.75, 'breakout_points': 5},
     'R3_CAL_MOMENTUM': {'volatility_atr_mult': 0.3, 'max_hold_minutes': 30},
-    'S4_LONDON_PULL': {'start_utc': '08:00', 'end_utc': '16:00', 'adx_min': 25, 'expiry_minutes': 30},
+    'S4_LONDON_PULL': {'start_utc': '08:00', 'end_utc': '16:00', 'adx_min': 25, 'stop_atr_mult': 0.5, 'expiry_minutes': 30},
     'S5_NY_COMPRESS': {'start_utc': '13:00', 'end_utc': '22:00', 'breakout_points': 5},
     'S8_ATR_SPIKE': {'spike_atr_mult': 1.5}
 }
@@ -413,12 +413,17 @@ def evaluate_s1f_post_tk(
     if last_s1_direction == "SHORT" and bar['close'] > ema20_h1:
         return None
 
+    # BUG-15 context: use ATR-based stop, not hardcoded 15 points
+    atr_m15 = context.get('atr_m15') or 15.0
+    stop_atr_mult = STRATEGY_CONFIGS["S1F_POST_TK"].get('stop_atr_mult', 0.5)
+    stop_distance = max(atr_m15 * stop_atr_mult, 10.0)
+
     return {
         'strategy': 'S1F_POST_TK',
         'direction': last_s1_direction,
         'entry_type': 'LIMIT',
         'entry_price': ema20_m5,
-        'stop_price': ema20_m5 - 15 if last_s1_direction == "LONG" else ema20_m5 + 15,
+        'stop_price': ema20_m5 - stop_distance if last_s1_direction == "LONG" else ema20_m5 + stop_distance,
         'tp_price': None,
         'lot_size': 0.0,
         'expiry': bar['time'] + timedelta(minutes=config['expiry_minutes']),
@@ -748,10 +753,21 @@ def evaluate_s4_london_pull(
 ) -> Optional[Dict[str, Any]]:
     """
     S4_LONDON_PULL - London Pullback Continuation.
+
+    REMAINING-5 FIX: the `state` dict is a *copy* produced by
+    SimulatedState.to_dict() — writing `state['s4_ema_touched'] = True`
+    here had zero effect on the live SimulatedState object, so the touch
+    flag was always False on the next bar and S4 never fired.
+
+    The fix: remove the flag mutation from this function entirely.
+    The engine already detects the EMA20 touch in _process_bar and writes
+    `self.state.s4_ema_touched = True` directly on the SimulatedState
+    object.  This function simply reads the flag from the state dict, which
+    is correct since to_dict() serialises `s4_ema_touched`.
     """
     config = STRATEGY_CONFIGS["S4_LONDON_PULL"]
     
-    # Check session
+    # Check session window
     current_time = bar['time']
     start_utc = current_time.replace(
         hour=int(config['start_utc'].split(':')[0]),
@@ -767,47 +783,44 @@ def evaluate_s4_london_pull(
     if not (start_utc <= current_time <= end_utc):
         return None
     
-    # Check if already fired today
     if state.get('s4_fired_today'):
         return None
     
-    # Check regime (trending with increasing ADX)
+    # Regime filter: trending with increasing ADX
     adx_h4 = context.get('adx_h4', 20)
     adx_increasing = context.get('adx_increasing', False)
-    di_plus_h4 = context.get('di_plus_h4', 0)
+    di_plus_h4  = context.get('di_plus_h4',  0)
     di_minus_h4 = context.get('di_minus_h4', 0)
     
     if adx_h4 < config['adx_min'] or not adx_increasing:
         return None
     
-    # Determine direction based on ADX/DI trend
-    if di_plus_h4 > di_minus_h4:
-        direction = "LONG"
-    else:
-        direction = "SHORT"
+    # Determine direction from DI
+    direction = "LONG" if di_plus_h4 > di_minus_h4 else "SHORT"
     
-    # EMA20 touch check
+    # EMA20-M15 must be available
     ema20_m15 = context.get('ema20_m15')
     if not ema20_m15:
         return None
     
-    # Check for EMA20 touch
+    # REMAINING-5 FIX: only READ the flag — never WRITE it here.
+    # The engine sets self.state.s4_ema_touched in _process_bar.
     if not state.get('s4_ema_touched'):
-        # Check if current bar touches EMA20
-        if bar['low'] <= ema20_m15 <= bar['high']:
-            state['s4_ema_touched'] = True
-        else:
-            return None
+        return None
     
-    # LIMIT order at EMA20
+    # ATR-based stop (REMAINING-3 already fixed in previous commit; kept here)
+    atr_m15 = context.get('atr_m15') or 15.0
+    stop_distance = max(atr_m15 * config.get('stop_atr_mult', 0.5), 10.0)
+
     return {
         'strategy': 'S4_LONDON_PULL',
-        'direction': direction,  # Dynamic direction based on ADX/DI trend
+        'direction': direction,
         'entry_type': 'LIMIT',
         'entry_price': ema20_m15,
-        'stop_price': (ema20_m15 - max(context.get('atr_m15', 15.0) * config.get('stop_atr_mult', 0.5), 10.0)
-               if direction == "LONG" else
-               ema20_m15 + max(context.get('atr_m15', 15.0) * config.get('stop_atr_mult', 0.5), 10.0)),
+        'stop_price': (
+            ema20_m15 - stop_distance if direction == "LONG"
+            else ema20_m15 + stop_distance
+        ),
         'tp_price': None,
         'lot_size': 0.0,
         'expiry': bar['time'] + timedelta(minutes=config['expiry_minutes']),
@@ -827,10 +840,22 @@ def evaluate_s5_ny_compress(
 ) -> Optional[Dict[str, Any]]:
     """
     S5_NY_COMPRESS - NY Compression Breakout.
+
+    REMAINING-5 corollary: the old code wrote `state['s5_compression_confirmed']`
+    and `state['london_range']` into the ephemeral dict copy — those writes
+    were also lost every bar.
+
+    Fix: compression detection now writes into the `context` dict, which IS
+    recomputed by the engine each bar via _calculate_indicators.  The engine
+    passes `context` by reference so writes here survive until end of bar
+    processing (which is all we need — this is a within-bar signal path).
+    We still read `state.get('s5_compression_confirmed')` for the persistent
+    across-bar flag; the engine must set self.state.range_computed = True
+    (aliased as s5_compression_confirmed in to_dict) when compression is
+    first detected.
     """
     config = STRATEGY_CONFIGS["S5_NY_COMPRESS"]
     
-    # Check session
     current_time = bar['time']
     start_utc = current_time.replace(
         hour=int(config['start_utc'].split(':')[0]),
@@ -845,52 +870,48 @@ def evaluate_s5_ny_compress(
     
     if not (start_utc <= current_time <= end_utc):
         return None
-    
-    # Check if compression confirmed - implement detection
+
+    if state.get('s5_fired_today'):
+        return None
+
+    # Check if compression has been confirmed (persistent flag on SimulatedState)
+    # If not yet confirmed, try to detect it now and store result in context.
     if not state.get('s5_compression_confirmed'):
-        # Implement compression detection logic
-        # Check if price has been in a tight range for the last 4 hours (London session)
-        london_bars = context.get('london_bars', [])  # Need to pass this from engine
-        if len(london_bars) >= 48:  # 4 hours * 12 bars per hour (M5 data)
+        london_bars = context.get('london_bars', [])
+        if len(london_bars) >= 48:
             london_highs = [b['high'] for b in london_bars[-48:]]
-            london_lows = [b['low'] for b in london_bars[-48:]]
+            london_lows  = [b['low']  for b in london_bars[-48:]]
             london_range_points = max(london_highs) - min(london_lows)
-            
-            # Check if range is compressed (less than ATR threshold)
             atr_current = context.get('atr_m15', 20)
-            if london_range_points < atr_current * 0.5:  # Compression threshold
-                state['s5_compression_confirmed'] = True
-                state['london_range'] = {
+            if london_range_points < atr_current * 0.5:
+                # Store in context (not state dict) — context is live this bar
+                context['s5_compression_confirmed'] = True
+                context['s5_london_range'] = {
                     'high': max(london_highs),
-                    'low': min(london_lows)
+                    'low':  min(london_lows)
                 }
             else:
                 return None
         else:
             return None
-    
-    # Check if already fired today
-    if state.get('s5_fired_today'):
-        return None
-    
-    # STOP order beyond London boundary
-    london_range = state.get('london_range', {})
+
+    # Retrieve the london_range — prefer context (just computed) then state
+    london_range = context.get('s5_london_range') or state.get('london_range', {})
     if not london_range:
         return None
+
+    buy_level  = london_range['high'] + config['breakout_points']
+    sell_level = london_range['low']  - config['breakout_points']
     
-    buy_level = london_range['high'] + config['breakout_points']
-    sell_level = london_range['low'] - config['breakout_points']
-    
-    # Determine direction based on current price
     current_price = bar['close']
     if current_price > london_range.get('high', 0):
-        direction = "LONG"
+        direction   = "LONG"
         entry_price = buy_level
-        stop_price = london_range['low'] - 20
+        stop_price  = london_range['low'] - 20
     elif current_price < london_range.get('low', 0):
-        direction = "SHORT"
+        direction   = "SHORT"
         entry_price = sell_level
-        stop_price = london_range['high'] + 20
+        stop_price  = london_range['high'] + 20
     else:
         return None
     
