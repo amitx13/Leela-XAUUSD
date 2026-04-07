@@ -95,6 +95,11 @@ def build_initial_state() -> dict:
         "shutdown_reason":              None,
         "network_fail_count":           0,
 
+        # ── KS6 Auto-Reset Tracking (Backtest Only) ───────────────────────
+        "ks6_events":                  [],       # List of all KS6 events
+        "ks6_cooldown_until_bar":      -1,       # Bar index when cooldown ends
+        "ks6_fired":                   False,     # Current KS6 trigger status
+
         # ── Spread tracking ───────────────────────────────────────────────────
         "session_spread_initialized":   False,
         "spread_fallback_active":       True,

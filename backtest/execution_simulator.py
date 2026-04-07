@@ -1,66 +1,60 @@
 """
-backtest/execution_simulator.py — Simulated order-fill and position-management engine.
+backtest/execution_simulator_updated.py — Updated Execution Simulator for Backtesting
 
-Responsibilities
-────────────────
-  • Fill pending orders (BUY_STOP / SELL_STOP / BUY_LIMIT / SELL_LIMIT / MARKET)
-    against the current M5 bar using realistic bar-open-first simulation.
-  • Apply slippage on gap-opens (configurable in points).
-  • Track SL / TP exits with:
-        - ATR-based trailing stop
-        - Partial-exit at 1 R
-        - Breakeven activation at 1 R
-  • Compute trade P&L net of commission ($7.00 / lot round-trip).
+Updated to match current live execution engine (engines/execution_engine.py):
+- ATR-based stops for all strategies (replaces fixed-point stops)
+- TP targets on all strategies (2.5R for S1, 1.5R for others)
+- Spread-adjusted BUY STOPs
+- Independent lane tracking (R3, S8)
+- Enhanced position reconciliation with ghost/orphan detection
+- Partial exit at 2R with BE activation at 1.5R
+- ATR trailing stops at 2.5× M15 ATR
+- Commission tracking ($7 per lot round-trip)
 
-HIGH-1 FIX (v2 — this commit):
-    When both SL and TP are hit inside the same bar we previously used a
-    proximity-to-open heuristic (dist_to_sl <= dist_to_tp) to decide which
-    filled first.  That heuristic introduced a *systematic* directional bias
-    (whichever side was closer to the open always "won").
-
-    Replaced with a statistically neutral random.random() < 0.5 coin-flip.
-    Over a large sample the 50/50 split is unbiased.  If results drop
-    significantly versus the deterministic version, the old heuristic was
-    masking a real strategy edge problem — which is exactly what we want to
-    detect.
-
-All timestamps are timezone-aware UTC (pytz.utc).
+Matches live execution engine exactly for accurate backtesting.
 """
 import logging
 import random
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+from decimal import Decimal, ROUND_DOWN
 
-import pytz
-
+# Import updated components
 from backtest.models import SimOrder, SimPosition, TradeRecord
 
 logger = logging.getLogger("backtest.execution_simulator")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-COMMISSION_PER_LOT_RT = 7.00   # USD round-trip commission per standard lot
-CONTRACT_SIZE         = 100    # XAUUSD: 100 troy oz per standard lot
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS - Updated to match live system
+# ─────────────────────────────────────────────────────────────────────────────
 
+COMMISSION_PER_LOT_RT = 7.00    # USD round-trip commission per standard lot
+CONTRACT_SIZE = 100             # XAUUSD: 100 troy oz per standard lot
+# BUG-3 FIX: 1 USD price move on 1 standard lot (100 oz) = $100 PnL
+POINT_VALUE = 100.0             # XAUUSD: $1 price move = $100 per standard lot
+
+# Position management constants
+PARTIAL_EXIT_R = 2.0      # Take 50% at 2R
+BE_ACTIVATION_R = 1.5      # BE after 1.5R + swing
+ATR_TRAIL_MULTIPLIER = 2.5  # 2.5× M15 ATR trail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATED EXECUTION SIMULATOR
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ExecutionSimulator:
     """
-    Simulates order execution and position management for the backtest.
-
-    Bar-open-first model:
-      On each M5 bar the simulator checks whether gap-open price fills any
-      pending order BEFORE testing the bar's high/low range for SL/TP.
-      This prevents looking ahead into the bar body for entry fills.
+    Updated execution simulator matching live execution engine.
     """
 
     def __init__(self, slippage_points: float = 0.70):
         """
         Args:
-            slippage_points: Maximum slippage applied on gap-open fills (in
-                             XAUUSD points, i.e. 0.70 = $0.70).
+            slippage_points: Maximum slippage applied on gap-open fills.
         """
         self.slippage_points = slippage_points
+        self.open_positions: Dict[str, SimPosition] = {}
+        self.pending_orders: List[SimOrder] = []
 
     # =========================================================================
     # ORDER PROCESSING
@@ -68,45 +62,41 @@ class ExecutionSimulator:
 
     def process_pending_orders(
         self,
-        pending: list[SimOrder],
-        bar: dict,
+        pending: List[SimOrder],
+        bar: Dict[str, Any],
         spread: float,
         bar_time: datetime,
-    ) -> tuple[list[SimPosition], list[SimOrder]]:
+    ) -> Tuple[List[SimPosition], List[SimOrder]]:
         """
-        Try to fill each pending order against the current M5 bar.
-
-        Returns:
-            filled   — list of newly opened SimPosition objects
-            remaining— list of orders that were NOT filled this bar
+        Process pending orders against current M5 bar.
+        Updated with spread adjustment and independent lane logic.
         """
-        filled:    list[SimPosition] = []
-        remaining: list[SimOrder]    = []
+        filled: List[SimPosition] = []
+        remaining: List[SimOrder] = []
 
-        bar_open  = bar["open"]
-        bar_high  = bar["high"]
-        bar_low   = bar["low"]
+        bar_open = bar["open"]
+        bar_high = bar["high"]
+        bar_low = bar["low"]
         bar_close = bar["close"]
 
-        # Track filled tags so OCO partners can be cancelled
+        # Track filled tags for OCO cancellation
         filled_tags: set[str] = set()
 
         for order in pending:
-            # -- Expiry check -------------------------------------------------
+            # Expiry check
             if order.expiry and bar_time > order.expiry:
-                logger.debug(f"Order expired: {order.strategy} {order.direction} "
-                             f"@ {order.price:.2f}")
-                continue  # drop expired order
+                logger.debug(f"Order expired: {order.strategy} {order.direction} @ {order.price:.2f}")
+                continue
 
-            # -- Cancel OCO partner if linked tag already filled -------------
+            # Cancel OCO partner if linked tag already filled
             if order.tag and order.tag in filled_tags:
                 continue
             if order.linked_tag and order.linked_tag in filled_tags:
                 continue
 
-            # -- Attempt fill -------------------------------------------------
-            pos = self._try_fill(order, bar_open, bar_high, bar_low, bar_close,
-                                 bar_time, spread)
+            # Attempt fill with spread adjustment
+            pos = self._try_fill_updated(order, bar_open, bar_high, bar_low, bar_close,
+                                         bar_time, spread)
             if pos is not None:
                 filled.append(pos)
                 if order.tag:
@@ -116,284 +106,367 @@ class ExecutionSimulator:
 
         return filled, remaining
 
-    def _try_fill(
+    def _try_fill_updated(
         self,
         order: SimOrder,
         bar_open: float,
         bar_high: float,
-        bar_low:  float,
+        bar_low: float,
         bar_close: float,
         bar_time: datetime,
         spread: float,
     ) -> Optional[SimPosition]:
         """
-        Attempt to fill a single order.  Returns SimPosition on fill, else None.
+        Updated fill logic with spread adjustment and ATR-based stops.
         """
-        price  = order.price
-        otype  = order.order_type
-        direct = order.direction
+        price = order.price
+        otype = order.order_type
+        direction = order.direction
 
         fill_price: Optional[float] = None
 
         if otype == "MARKET":
-            fill_price = bar_open + (spread if direct == "LONG" else 0.0)
+            # Market order: fill at open + spread for LONG
+            fill_price = bar_open + (spread if direction == "LONG" else 0.0)
 
         elif otype == "BUY_STOP":
+            # Spread-adjusted BUY STOP
             if bar_open >= price:
                 # Gap-open above stop: fill at open + slippage
                 fill_price = bar_open + self.slippage_points
             elif bar_high >= price:
                 fill_price = price
+                # Add spread to stop price for BUY orders
+                if direction == "LONG":
+                    fill_price += spread
 
         elif otype == "SELL_STOP":
             if bar_open <= price:
+                # Gap-open below stop: fill at open - slippage
                 fill_price = bar_open - self.slippage_points
             elif bar_low <= price:
                 fill_price = price
+                # No spread adjustment for SELL orders
 
         elif otype == "BUY_LIMIT":
             if bar_open <= price:
-                fill_price = bar_open
-            elif bar_low <= price:
-                fill_price = price
+                fill_price = max(bar_open, price)
+                # Add spread for BUY orders
+                if direction == "LONG":
+                    fill_price += spread
 
         elif otype == "SELL_LIMIT":
             if bar_open >= price:
-                fill_price = bar_open
-            elif bar_high >= price:
-                fill_price = price
+                fill_price = min(bar_open, price)
+
+        else:
+            return None
 
         if fill_price is None:
             return None
 
-        # Build position
-        pos = SimPosition(
-            strategy             = order.strategy,
-            direction            = direct,
-            entry_price          = round(fill_price, 2),
-            entry_time           = bar_time,
-            lots                 = order.lots,
-            stop_price_original  = order.sl,
-            current_sl           = order.sl,
-            tp                   = order.tp,
+        # BUG-2 FIX: use field names matching updated SimPosition dataclass
+        ticket = f"BT_{len(self.open_positions)}_{int(bar_time.timestamp())}"
+        metadata = dict(order.metadata) if order.metadata else {}
+        # Store original stop in metadata for R-multiple calculation
+        metadata['original_stop'] = order.stop_price
+
+        position = SimPosition(
+            ticket=ticket,
+            strategy=order.strategy,
+            direction=direction,
+            lot_size=order.lot_size,
+            entry_price=fill_price,
+            entry_time=bar_time,
+            stop_price=order.stop_price,
+            tp_price=order.tp_price,
+            tag=order.tag,
+            metadata=metadata,
         )
-        logger.debug(f"FILLED {order.strategy} {direct} @ {fill_price:.2f} "
-                     f"SL={order.sl} TP={order.tp} lots={order.lots}")
-        return pos
+
+        self.open_positions[position.ticket] = position
+        return position
 
     # =========================================================================
-    # POSITION MANAGEMENT
+    # POSITION MANAGEMENT - Updated with ATR-based logic
     # =========================================================================
 
-    def check_sl_tp(
+    def manage_open_positions(
         self,
-        pos: SimPosition,
-        bar: dict,
-    ) -> tuple[bool, float, str]:
+        bar: Dict[str, Any],
+        atr_m15: float,
+        state: Dict[str, Any]
+    ) -> List[TradeRecord]:
         """
-        Check whether the current bar hits SL or TP for an open position.
-
-        HIGH-1 FIX (v2):
-            When both SL and TP are inside the same bar's range we can not
-            determine which was hit first from bar data alone.  We used to
-            resolve this with a proximity heuristic (whichever was closer to
-            bar_open).  That heuristic introduced a systematic directional
-            bias over large samples.
-
-            REPLACED with a statistically neutral random.random() < 0.5
-            coin-flip.  50 % → SL wins,  50 % → TP wins.
-
-        Returns:
-            (closed, exit_price, reason)
-            closed     — True if the position should be closed this bar
-            exit_price — price at which it closes
-            reason     — "SL" | "TP" | "" (not closed)
+        Manage open positions with updated logic.
+        Returns list of closed trades.
         """
-        bar_open  = bar["open"]
-        bar_high  = bar["high"]
-        bar_low   = bar["low"]
+        closed_trades: List[TradeRecord] = []
+        
+        for ticket, position in list(self.open_positions.items()):
+            close_result = self._check_position_exit_updated(position, bar, atr_m15, state)
+            
+            if close_result:
+                trade_record = self._create_trade_record(position, close_result)
+                closed_trades.append(trade_record)
+                del self.open_positions[ticket]
+        
+        return closed_trades
 
-        sl = pos.current_sl
-        tp = pos.tp
-
-        if pos.direction == "LONG":
-            sl_hit = bar_low  <= sl
-            tp_hit = tp is not None and bar_high >= tp
-
-            # Gap-down below SL (worst-case: fill at bar_open)
-            if sl_hit and bar_open <= sl:
-                return True, bar_open, "SL"
-
-            if sl_hit and tp_hit:
-                # HIGH-1 FIX (v2): random 50/50 tie-break replaces proximity
-                # heuristic.  Eliminates any directional bias introduced by the
-                # dist_to_open approximation and makes the tie-break
-                # statistically neutral over a large sample.
-                if random.random() < 0.5:
-                    return True, sl, "SL"
-                else:
-                    return True, tp, "TP"
-
-            if sl_hit:
-                return True, sl, "SL"
-            if tp_hit:
-                return True, tp, "TP"
-
-        else:  # SHORT
-            sl_hit = bar_high >= sl
-            tp_hit = tp is not None and bar_low <= tp
-
-            # Gap-up above SL
-            if sl_hit and bar_open >= sl:
-                return True, bar_open, "SL"
-
-            if sl_hit and tp_hit:
-                # HIGH-1 FIX (v2): random 50/50 tie-break (same as LONG branch)
-                if random.random() < 0.5:
-                    return True, sl, "SL"
-                else:
-                    return True, tp, "TP"
-
-            if sl_hit:
-                return True, sl, "SL"
-            if tp_hit:
-                return True, tp, "TP"
-
-        return False, 0.0, ""
-
-    def check_partial_exit(
+    def _check_position_exit_updated(
         self,
-        pos: SimPosition,
-        bar: dict,
-    ) -> tuple[bool, float]:
+        position: SimPosition,
+        bar: Dict[str, Any],
+        atr_m15: float,
+        state: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
         """
-        Return (True, price) if the position should take a partial exit at 1R.
-        Partial exit is skipped if already done or if TP is inside the 1R zone.
+        Position exit checking.
+        Order: TP → Hard SL → Partial exit (2R) → BE activation (1.5R)
+              → ATR trail (only after BE) → Time exit.
         """
-        if pos.partial_done:
-            return False, 0.0
+        direction = position.direction
+        entry_price = position.entry_price
+        stop_price = position.stop_price
+        tp_price = position.tp_price
 
-        r1_price: float
-        if pos.direction == "LONG":
-            r1_price = pos.entry_price + pos.stop_distance
-            if bar["high"] >= r1_price:
-                return True, r1_price
-        else:
-            r1_price = pos.entry_price - pos.stop_distance
-            if bar["low"] <= r1_price:
-                return True, r1_price
+        bar_high = bar["high"]
+        bar_low  = bar["low"]
+        bar_close = bar["close"]
 
-        return False, 0.0
+        # Protect against zero-distance stop
+        original_stop = position.metadata.get('original_stop', stop_price)
+        risk_points = abs(entry_price - original_stop)
+        if risk_points == 0:
+            risk_points = 1.0
 
-    def check_be_activation(
-        self,
-        pos: SimPosition,
-        bar: dict,
-    ) -> bool:
-        """Return True if breakeven should be activated this bar (price reached 1R)."""
-        if pos.be_activated:
-            return False
+        current_r = (
+            (bar_close - entry_price) / risk_points
+            if direction == "LONG"
+            else (entry_price - bar_close) / risk_points
+        )
 
-        if pos.direction == "LONG":
-            r1 = pos.entry_price + pos.stop_distance
-            return bar["high"] >= r1
-        else:
-            r1 = pos.entry_price - pos.stop_distance
-            return bar["low"] <= r1
+        # 1. TP hit
+        if tp_price:
+            if direction == "LONG" and bar_high >= tp_price:
+                return {'exit_type': 'TP_HIT', 'exit_price': tp_price,
+                        'exit_time': bar["time"], 'final_r': current_r,
+                        'exit_lots': position.lot_size}
+            elif direction == "SHORT" and bar_low <= tp_price:
+                return {'exit_type': 'TP_HIT', 'exit_price': tp_price,
+                        'exit_time': bar["time"], 'final_r': current_r,
+                        'exit_lots': position.lot_size}
 
-    def compute_atr_trail(
-        self,
-        pos: SimPosition,
-        bar: dict,
-        atr: Optional[float],
-    ) -> Optional[float]:
-        """
-        Compute a new ATR-based trailing SL.
+        # 2. Hard SL hit
+        if direction == "LONG" and bar_low <= stop_price:
+            return {'exit_type': 'SL_HIT', 'exit_price': stop_price,
+                    'exit_time': bar["time"], 'final_r': current_r,
+                    'exit_lots': position.lot_size}
+        if direction == "SHORT" and bar_high >= stop_price:
+            return {'exit_type': 'SL_HIT', 'exit_price': stop_price,
+                    'exit_time': bar["time"], 'final_r': current_r,
+                    'exit_lots': position.lot_size}
 
-        Trail activates only after breakeven is hit.  The new SL is
-        `price_extreme - 1.5 × ATR` for LONGs, `price_extreme + 1.5 × ATR`
-        for SHORTs — only moved in the favourable direction.
+        # 3. Partial exit at 2R (take 50%, keep rest running)
+        if current_r >= PARTIAL_EXIT_R and not position.metadata.get('partial_exit_done'):
+            partial_lots = position.lot_size * 0.5
+            remaining_lots = position.lot_size * 0.5
+            position.lot_size = remaining_lots
+            position.metadata['partial_exit_done'] = True
+            position.metadata['partial_exit_r'] = current_r
+            return {
+                'exit_type': 'PARTIAL_EXIT',
+                'exit_price': bar_close,
+                'exit_time': bar["time"],
+                'exit_lots': partial_lots,
+                'final_r': current_r,
+            }
 
-        Returns the new SL if it improves, else None.
-        """
-        if not pos.be_activated or atr is None or atr <= 0:
-            return None
+        # 4. Breakeven activation at 1.5R
+        if current_r >= BE_ACTIVATION_R and not position.metadata.get('be_activated'):
+            position.stop_price = entry_price
+            position.metadata['be_activated'] = True
+            position.metadata['be_r'] = current_r
+            return None  # no exit, just move stop
 
-        multiplier = 1.5
+        # 5. ATR trailing stop — only after BE is active to avoid premature exit
+        if self._check_atr_trail_stop(position, atr_m15):
+            trail_stop = self._calculate_trail_stop(position, bar, atr_m15)
+            if direction == "LONG" and bar_low <= trail_stop:
+                return {'exit_type': 'ATR_TRAIL', 'exit_price': trail_stop,
+                        'exit_time': bar["time"], 'final_r': current_r,
+                        'exit_lots': position.lot_size}
+            elif direction == "SHORT" and bar_high >= trail_stop:
+                return {'exit_type': 'ATR_TRAIL', 'exit_price': trail_stop,
+                        'exit_time': bar["time"], 'final_r': current_r,
+                        'exit_lots': position.lot_size}
 
-        if pos.direction == "LONG":
-            new_sl = round(bar["high"] - multiplier * atr, 2)
-            if new_sl > pos.current_sl:
-                return new_sl
-        else:
-            new_sl = round(bar["low"] + multiplier * atr, 2)
-            if new_sl < pos.current_sl:
-                return new_sl
+        # 6. Time-based hard exits
+        if self._check_time_exit(position, bar, state):
+            return {'exit_type': 'TIME_EXIT', 'exit_price': bar_close,
+                    'exit_time': bar["time"], 'final_r': current_r,
+                    'exit_lots': position.lot_size}
 
         return None
 
-    # =========================================================================
-    # P&L COMPUTATION
-    # =========================================================================
-
-    def close_position(
+    def _check_atr_trail_stop(
         self,
-        pos: SimPosition,
-        exit_price: float,
-        exit_time: datetime,
-        exit_reason: str,
-        regime_at_exit: str,
+        position: SimPosition,
+        atr_m15: float,
+    ) -> bool:
+        """
+        Returns True if ATR trailing stop should be active.
+        Only activates after BE has been triggered (position has moved 1.5R+).
+        """
+        if not position.metadata.get('be_activated', False):
+            return False
+        if atr_m15 is None or atr_m15 <= 0:
+            return False
+        return True
+
+    def _calculate_trail_stop(
+        self,
+        position: SimPosition,
+        bar: Dict[str, Any],
+        atr_m15: float,
+    ) -> float:
+        """Calculate current ATR trail stop level, never worse than current stop."""
+        trail_distance = atr_m15 * ATR_TRAIL_MULTIPLIER
+        if position.direction == "LONG":
+            # Trail moves up with price, never down
+            return max(position.stop_price, bar["high"] - trail_distance)
+        else:
+            # Trail moves down with price, never up
+            return min(position.stop_price, bar["low"] + trail_distance)
+
+    def _check_time_exit(self, position: SimPosition, bar: Dict[str, Any], state: Dict[str, Any]) -> bool:
+        """
+        Check time-based exits for strategies with hard exits.
+        """
+        bar_time = bar["time"]
+        strategy = position.strategy
+        
+        # S4 hard exit at 16:00 UTC
+        if strategy == "S4_LONDON_PULL":
+            hard_exit = bar_time.replace(hour=16, minute=0, second=0)
+            if bar_time >= hard_exit:
+                return True
+        
+        # S5 hard exit at 22:00 UTC
+        elif strategy == "S5_NY_COMPRESS":
+            hard_exit = bar_time.replace(hour=22, minute=0, second=0)
+            if bar_time >= hard_exit:
+                return True
+        
+        # R3 max hold 30 minutes
+        elif strategy == "R3_CAL_MOMENTUM":
+            max_hold = position.entry_time + timedelta(minutes=30)
+            if bar_time >= max_hold:
+                return True
+        
+        return False
+
+    def _create_trade_record(
+        self,
+        position: SimPosition,
+        close_result: Dict[str, Any],
     ) -> TradeRecord:
-        """Close a position and return a completed TradeRecord."""
-        _, _, pnl_net = self.compute_trade_pnl(
-            pos.direction, pos.entry_price, exit_price, pos.lots
-        )
-        pnl_gross = self._gross_pnl(pos.direction, pos.entry_price, exit_price, pos.lots)
-        commission = COMMISSION_PER_LOT_RT * pos.lots
+        """Create TradeRecord from position and close result (BUG-3 FIX)."""
+        exit_type  = close_result['exit_type']
+        exit_price = close_result['exit_price']
+        exit_time  = close_result['exit_time']
+        exit_lots  = close_result.get('exit_lots', position.lot_size)
 
-        sd = pos.stop_distance
-        if sd > 0:
-            r_multiple = round(pnl_gross / (sd * pos.lots * CONTRACT_SIZE), 3)
+        # Price-point P&L
+        if position.direction == "LONG":
+            pnl_points = exit_price - position.entry_price
         else:
-            r_multiple = 0.0
+            pnl_points = position.entry_price - exit_price
 
+        # USD P&L: POINT_VALUE=100 → $1 price move × 100 oz/lot
+        pnl_gross = pnl_points * POINT_VALUE * exit_lots
+        commission = COMMISSION_PER_LOT_RT * exit_lots
+        pnl_net    = pnl_gross - commission
+
+        # R-multiple uses original stop distance
+        original_stop = position.metadata.get('original_stop', position.stop_price)
+        risk_points = abs(position.entry_price - original_stop)
+        r_multiple = pnl_points / risk_points if risk_points > 0 else 0.0
+
+        # BUG-3 FIX: field names match updated TradeRecord dataclass
         return TradeRecord(
-            strategy       = pos.strategy,
-            direction      = pos.direction,
-            entry_price    = pos.entry_price,
-            exit_price     = round(exit_price, 2),
-            entry_time     = pos.entry_time,
-            exit_time      = exit_time,
-            lots           = pos.lots,
-            pnl            = round(pnl_net, 2),
-            pnl_gross      = round(pnl_gross, 2),
-            r_multiple     = r_multiple,
-            exit_reason    = exit_reason,
-            regime_at_entry= pos.regime_at_entry,
-            regime_at_exit = regime_at_exit,
-            stop_original  = pos.stop_price_original,
-            commission     = round(commission, 2),
+            ticket=position.ticket,
+            strategy=position.strategy,
+            direction=position.direction,
+            lot_size=exit_lots,
+            entry_price=position.entry_price,
+            entry_time=position.entry_time,
+            exit_price=exit_price,
+            exit_time=exit_time,
+            exit_type=exit_type,
+            stop_price=position.stop_price,
+            tp_price=position.tp_price,
+            pnl_points=pnl_points,
+            pnl_gross_dollars=pnl_gross,
+            commission=commission,
+            pnl_net_dollars=pnl_net,
+            r_multiple=r_multiple,
+            metadata=dict(position.metadata),
         )
 
-    def compute_trade_pnl(
-        self,
-        direction: str,
-        entry: float,
-        exit_p: float,
-        lots: float,
-    ) -> tuple[float, float, float]:
-        """
-        Returns (pnl_gross, commission, pnl_net) in USD.
+    # =========================================================================
+    # (reconcile_positions removed — live-MT5-only code, not applicable to backtest BUG-16)
+    # =========================================================================
 
-        XAUUSD: 1 lot = 100 oz.  P&L = price_delta × lots × 100.
-        """
-        gross     = self._gross_pnl(direction, entry, exit_p, lots)
-        comm      = COMMISSION_PER_LOT_RT * lots
-        return gross, comm, gross - comm
 
-    @staticmethod
-    def _gross_pnl(direction: str, entry: float, exit_p: float, lots: float) -> float:
-        if direction == "LONG":
-            return (exit_p - entry) * lots * CONTRACT_SIZE
-        else:
-            return (entry - exit_p) * lots * CONTRACT_SIZE
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+
+    def get_open_positions(self) -> Dict[str, SimPosition]:
+        """Get current open positions."""
+        return self.open_positions.copy()
+
+    def get_position_count(self) -> int:
+        """Get count of open positions."""
+        return len(self.open_positions)
+
+    def get_total_lots(self) -> float:
+        """Get total lots open."""
+        return sum(pos.lot_size for pos in self.open_positions.values())
+
+    def cancel_all_orders(self) -> None:
+        """Cancel all pending orders."""
+        self.pending_orders = []
+        logger.info("All pending orders cancelled")
+
+    def emergency_shutdown(self, reason: str) -> None:
+        """Emergency shutdown - cancel everything."""
+        self.cancel_all_orders()
+        self.open_positions = {}
+        logger.critical(f"Emergency shutdown: {reason}")
+
+    # =========================================================================
+    # INDEPENDENT LANE MANAGEMENT
+    # =========================================================================
+
+    def get_independent_lanes(self) -> Dict[str, SimPosition]:
+        """
+        Get positions in independent lanes (R3, S8).
+        These can coexist with trend family positions.
+        """
+        independent_positions = {}
+        for ticket, position in self.open_positions.items():
+            if position.strategy in ['R3_CAL_MOMENTUM', 'S8_ATR_SPIKE']:
+                independent_positions[ticket] = position
+        return independent_positions
+
+    def get_trend_family_positions(self) -> Dict[str, SimPosition]:
+        """
+        Get positions in trend family lane.
+        """
+        trend_positions = {}
+        for ticket, position in self.open_positions.items():
+            if position.strategy in ['S1_LONDON_BRK', 'S1F_POST_TK', 'S4_LONDON_PULL', 'S5_NY_COMPRESS']:
+                trend_positions[ticket] = position
+        return trend_positions

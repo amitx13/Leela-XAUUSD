@@ -42,7 +42,6 @@ from engines.regime_engine import (
     get_adx_h4, get_current_atr_m15,
     get_adx_h4_slope,
 )
-from engines.data_engine import get_current_atr_m15 as _get_atr_m15_data   # ISSUE-4 FIX: top-level import
 from engines.risk_engine import (
     calculate_lot_size, calculate_conviction_level,
     can_s1_family_fire, can_s1f_fire, can_s2_fire,

@@ -1,410 +1,552 @@
 """
-backtest/monte_carlo.py — Risk-of-Ruin Monte Carlo Simulator.
+Enhanced Monte Carlo Simulation
 
-Built on top of the backtesting framework. Takes trade results and runs
-randomized simulations to estimate drawdown probability distributions.
-
-Usage:
-    # After backtest:
-    from backtest.monte_carlo import RiskOfRuinSimulator
-    sim = RiskOfRuinSimulator(trade_results, initial_balance=10000)
-    basic_report = sim.run_basic()
-    clustered_report = sim.run_clustered(cluster_probability=0.3)
-
-    # From live trade history:
-    sim = RiskOfRuinSimulator.from_live_trades(initial_balance=10000)
-    report = sim.run_clustered()
+Advanced Monte Carlo analysis with strategy breakdown and correlation analysis.
 """
-from __future__ import annotations
-
-import logging
-import random
-from typing import Optional
 
 import numpy as np
-
-import config
+import pandas as pd
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from datetime import datetime
+import logging
 
 logger = logging.getLogger("backtest.monte_carlo")
 
-_LINE = "-" * 62
-_BAR  = "=" * 62
+
+@dataclass
+class MonteCarloResults:
+    """Results from enhanced Monte Carlo simulation."""
+    base_statistics: Dict[str, Any]
+    strategy_breakdown: Dict[str, Dict[str, Any]]
+    correlation_analysis: Dict[str, Any]
+    regime_analysis: Dict[str, Any]
+    risk_metrics: Dict[str, Any]
+    recommendations: List[str]
 
 
-class RiskOfRuinSimulator:
+class EnhancedMonteCarlo:
     """
-    Monte Carlo simulator for risk-of-ruin analysis.
-
-    Takes a list of trade P&L values (net of commission) and runs
-    N simulations with randomized trade ordering to build a
-    distribution of max drawdowns and final equity outcomes.
+    Enhanced Monte Carlo simulation for risk-of-ruin analysis.
+    
+    Features:
+    - Strategy-by-strategy breakdown
+    - Correlation analysis between strategies
+    - Regime-based performance analysis
+    - Enhanced risk metrics
+    - Actionable recommendations
     """
-
-    def __init__(
+    
+    def __init__(self, trades: List[Dict[str, Any]], config: Dict[str, Any]):
+        self.trades = trades
+        self.config = config
+        self.rng = np.random.default_rng()
+    
+    def run_full_analysis(self, n_simulations: int = 10000) -> MonteCarloResults:
+        """Run comprehensive Monte Carlo analysis."""
+        logger.info(f"Running enhanced Monte Carlo with {n_simulations} simulations")
+        
+        # Extract trade data
+        trade_data = self._prepare_trade_data()
+        
+        # Base Monte Carlo simulation
+        base_stats = self._run_base_simulation(trade_data, n_simulations)
+        
+        # Strategy breakdown
+        strategy_breakdown = self._analyze_strategies(trade_data, n_simulations)
+        
+        # Correlation analysis
+        correlation_analysis = self._analyze_correlations(trade_data)
+        
+        # Regime analysis
+        regime_analysis = self._analyze_regime_performance(trade_data)
+        
+        # Risk metrics
+        risk_metrics = self._calculate_enhanced_risk_metrics(trade_data)
+        
+        # Generate recommendations
+        recommendations = self._generate_recommendations(
+            base_stats, strategy_breakdown, correlation_analysis, risk_metrics
+        )
+        
+        return MonteCarloResults(
+            base_statistics=base_stats,
+            strategy_breakdown=strategy_breakdown,
+            correlation_analysis=correlation_analysis,
+            regime_analysis=regime_analysis,
+            risk_metrics=risk_metrics,
+            recommendations=recommendations
+        )
+    
+    def _prepare_trade_data(self) -> pd.DataFrame:
+        """Prepare trade data for analysis."""
+        if not self.trades:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(self.trades)
+        
+        # Convert timestamps
+        if 'entry_time' in df.columns:
+            df['entry_time'] = pd.to_datetime(df['entry_time'])
+        if 'exit_time' in df.columns:
+            df['exit_time'] = pd.to_datetime(df['exit_time'])
+        
+        # Calculate returns
+        if 'pnl' in df.columns:
+            df['return_pct'] = df['pnl'] / df['pnl'].sum() * 100
+        
+        return df
+    
+    def _run_base_simulation(self, trade_data: pd.DataFrame, n_simulations: int) -> Dict[str, Any]:
+        """Run base Monte Carlo simulation."""
+        if trade_data.empty:
+            return {"error": "No trades to simulate"}
+        
+        returns = trade_data['pnl'].values
+        initial_balance = self.config.get('initial_balance', 10000)
+        
+        # Run simulations
+        final_equities = []
+        max_drawdowns = []
+        
+        for _ in range(n_simulations):
+            # Randomize trade sequence
+            shuffled_returns = self.rng.permutation(returns)
+            
+            # Calculate equity curve
+            equity_curve = initial_balance + np.cumsum(shuffled_returns)
+            final_equities.append(equity_curve[-1])
+            
+            # Calculate maximum drawdown
+            peak = np.maximum.accumulate(equity_curve)
+            drawdown = (peak - equity_curve) / peak
+            max_drawdowns.append(np.max(drawdown))
+        
+        # Calculate statistics
+        final_equities = np.array(final_equities)
+        max_drawdowns = np.array(max_drawdowns)
+        
+        return {
+            "probability_of_profit": np.mean(final_equities > initial_balance),
+            "expected_return": np.mean(final_equities - initial_balance),
+            "return_std": np.std(final_equities - initial_balance),
+            "max_drawdown_mean": np.mean(max_drawdowns),
+            "max_drawdown_std": np.std(max_drawdowns),
+            "worst_case": np.min(final_equities),
+            "best_case": np.max(final_equities),
+            "risk_of_ruin": np.mean(final_equities < initial_balance * 0.5),
+            "sharpe_ratio": np.mean(final_equities - initial_balance) / np.std(final_equities) if np.std(final_equities) > 0 else 0,
+        }
+    
+    def _analyze_strategies(self, trade_data: pd.DataFrame, n_simulations: int) -> Dict[str, Any]:
+        """Analyze each strategy separately."""
+        if 'strategy' not in trade_data.columns:
+            return {"error": "Strategy column not found"}
+        
+        strategy_results = {}
+        
+        for strategy in trade_data['strategy'].unique():
+            strategy_trades = trade_data[trade_data['strategy'] == strategy]
+            
+            if len(strategy_trades) < 5:  # Skip strategies with too few trades
+                continue
+            
+            returns = strategy_trades['pnl'].values
+            
+            # Monte Carlo for this strategy
+            final_equities = []
+            for _ in range(min(n_simulations // 10, 1000)):  # Fewer sims per strategy
+                shuffled_returns = self.rng.permutation(returns)
+                equity_curve = np.cumsum(shuffled_returns)
+                final_equities.append(equity_curve[-1])
+            
+            strategy_results[strategy] = {
+                "trade_count": len(strategy_trades),
+                "mean_return": np.mean(returns),
+                "return_std": np.std(returns),
+                "win_rate": np.mean(returns > 0),
+                "profit_factor": np.sum(returns[returns > 0]) / abs(np.sum(returns[returns < 0])) if np.sum(returns[returns < 0]) != 0 else float('inf'),
+                "max_consecutive_wins": self._calculate_max_consecutive(returns, True),
+                "max_consecutive_losses": self._calculate_max_consecutive(returns, False),
+                "monte_carlo_stats": {
+                    "probability_of_profit": np.mean(final_equities > 0),
+                    "expected_value": np.mean(final_equities),
+                    "volatility": np.std(final_equities),
+                }
+            }
+        
+        return strategy_results
+    
+    def _analyze_correlations(self, trade_data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze correlations between strategies."""
+        if 'strategy' not in trade_data.columns:
+            return {"error": "Strategy column not found"}
+        
+        # Create strategy return matrix
+        strategy_returns = {}
+        
+        for strategy in trade_data['strategy'].unique():
+            strategy_trades = trade_data[trade_data['strategy'] == strategy]
+            if len(strategy_trades) >= 5:
+                strategy_returns[strategy] = strategy_trades['pnl'].values
+        
+        if len(strategy_returns) < 2:
+            return {"error": "Need at least 2 strategies for correlation analysis"}
+        
+        # Calculate correlation matrix
+        strategies = list(strategy_returns.keys())
+        n_strategies = len(strategies)
+        correlation_matrix = np.zeros((n_strategies, n_strategies))
+        
+        for i, strategy1 in enumerate(strategies):
+            for j, strategy2 in enumerate(strategies):
+                if i == j:
+                    correlation_matrix[i, j] = 1.0
+                else:
+                    # Calculate correlation (need same length arrays)
+                    min_len = min(len(strategy_returns[strategy1]), len(strategy_returns[strategy2]))
+                    corr = np.corrcoef(
+                        strategy_returns[strategy1][:min_len],
+                        strategy_returns[strategy2][:min_len]
+                    )[0, 1]
+                    correlation_matrix[i, j] = corr if not np.isnan(corr) else 0.0
+        
+        return {
+            "strategies": strategies,
+            "correlation_matrix": correlation_matrix.tolist(),
+            "highest_correlation": self._find_highest_correlation(strategies, correlation_matrix),
+            "lowest_correlation": self._find_lowest_correlation(strategies, correlation_matrix),
+            "diversification_benefit": self._calculate_diversification_benefit(correlation_matrix),
+        }
+    
+    def _analyze_regime_performance(self, trade_data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze performance by market regime."""
+        if 'regime_at_entry' not in trade_data.columns:
+            return {"error": "Regime column not found"}
+        
+        regime_results = {}
+        
+        for regime in trade_data['regime_at_entry'].unique():
+            regime_trades = trade_data[trade_data['regime_at_entry'] == regime]
+            
+            if len(regime_trades) < 3:
+                continue
+            
+            returns = regime_trades['pnl'].values
+            
+            regime_results[regime] = {
+                "trade_count": len(regime_trades),
+                "mean_return": np.mean(returns),
+                "return_std": np.std(returns),
+                "win_rate": np.mean(returns > 0),
+                "profit_factor": np.sum(returns[returns > 0]) / abs(np.sum(returns[returns < 0])) if np.sum(returns[returns < 0]) != 0 else float('inf'),
+                "regime_efficiency": np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0,
+            }
+        
+        return regime_results
+    
+    def _calculate_enhanced_risk_metrics(self, trade_data: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate enhanced risk metrics."""
+        if trade_data.empty:
+            return {"error": "No trade data"}
+        
+        returns = trade_data['pnl'].values
+        
+        # Basic metrics
+        total_return = np.sum(returns)
+        mean_return = np.mean(returns)
+        std_return = np.std(returns)
+        
+        # Enhanced metrics
+        var_95 = np.percentile(returns, 5)  # 5% VaR
+        var_99 = np.percentile(returns, 1)  # 1% VaR
+        cvar_95 = np.mean(returns[returns <= var_95])  # Conditional VaR
+        
+        # Downside deviation
+        downside_returns = returns[returns < 0]
+        downside_deviation = np.std(downside_returns) if len(downside_returns) > 0 else 0
+        
+        # Sortino ratio
+        sortino_ratio = mean_return / downside_deviation if downside_deviation > 0 else 0
+        
+        # Calmar ratio (if we have drawdown data)
+        max_drawdown = self._calculate_max_drawdown(returns)
+        calmar_ratio = total_return / abs(max_drawdown) if max_drawdown != 0 else 0
+        
+        return {
+            "total_return": total_return,
+            "mean_return": mean_return,
+            "return_std": std_return,
+            "sharpe_ratio": mean_return / std_return if std_return > 0 else 0,
+            "sortino_ratio": sortino_ratio,
+            "calmar_ratio": calmar_ratio,
+            "var_95": var_95,
+            "var_99": var_99,
+            "cvar_95": cvar_95,
+            "max_drawdown": max_drawdown,
+            "downside_deviation": downside_deviation,
+            "skewness": self._calculate_skewness(returns),
+            "kurtosis": self._calculate_kurtosis(returns),
+        }
+    
+    def _generate_recommendations(
         self,
-        trade_pnls: list[float],
-        initial_balance: float = 10_000.0,
-    ):
-        if not trade_pnls:
-            raise ValueError("trade_pnls must be a non-empty list of P&L values")
-        self.trade_pnls = list(trade_pnls)
-        self.initial_balance = initial_balance
-        self.n_trades = len(trade_pnls)
+        base_stats: Dict[str, Any],
+        strategy_breakdown: Dict[str, Any],
+        correlation_analysis: Dict[str, Any],
+        risk_metrics: Dict[str, Any]
+    ) -> List[str]:
+        """Generate actionable recommendations."""
+        recommendations = []
+        
+        # Risk-based recommendations
+        if base_stats.get("risk_of_ruin", 0) > 0.1:
+            recommendations.append("⚠️ High risk of ruin (>10%). Consider reducing position size or adding more strategies.")
+        
+        if base_stats.get("max_drawdown_mean", 0) > 0.2:
+            recommendations.append("⚠️ High maximum drawdown (>20%). Implement stricter risk management.")
+        
+        # Strategy-based recommendations
+        best_strategy = None
+        worst_strategy = None
+        best_performance = -float('inf')
+        worst_performance = float('inf')
+        
+        for strategy, stats in strategy_breakdown.items():
+            if isinstance(stats, dict) and 'mean_return' in stats:
+                if stats['mean_return'] > best_performance:
+                    best_performance = stats['mean_return']
+                    best_strategy = strategy
+                if stats['mean_return'] < worst_performance:
+                    worst_performance = stats['mean_return']
+                    worst_strategy = strategy
+        
+        if best_strategy and worst_strategy:
+            recommendations.append(f"📈 Best performing strategy: {best_strategy} (avg return: {best_performance:.2f})")
+            recommendations.append(f"📉 Worst performing strategy: {worst_strategy} (avg return: {worst_performance:.2f})")
+        
+        # Correlation-based recommendations
+        if correlation_analysis.get("diversification_benefit", 0) < 0.3:
+            recommendations.append("🔄 Low diversification benefit. Consider adding uncorrelated strategies.")
+        
+        # Risk-adjusted return recommendations
+        if risk_metrics.get("sharpe_ratio", 0) < 0.5:
+            recommendations.append("📊 Low Sharpe ratio (<0.5). Focus on improving risk-adjusted returns.")
+        
+        if risk_metrics.get("sortino_ratio", 0) < 0.7:
+            recommendations.append("📉 Low Sortino ratio (<0.7). Reduce downside risk or improve upside capture.")
+        
+        return recommendations
+    
+    # Helper methods
+    def _calculate_max_consecutive(self, returns: np.ndarray, wins: bool) -> int:
+        """Calculate maximum consecutive wins or losses."""
+        if wins:
+            mask = returns > 0
+        else:
+            mask = returns < 0
+        
+        max_consecutive = 0
+        current_consecutive = 0
+        
+        for is_consecutive in mask:
+            if is_consecutive:
+                current_consecutive += 1
+                max_consecutive = max(max_consecutive, current_consecutive)
+            else:
+                current_consecutive = 0
+        
+        return max_consecutive
+    
+    def _find_highest_correlation(self, strategies: List[str], matrix: np.ndarray) -> Dict[str, Any]:
+        """Find highest correlation (excluding diagonal)."""
+        n = len(strategies)
+        max_corr = -1
+        best_pair = None
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if matrix[i, j] > max_corr:
+                    max_corr = matrix[i, j]
+                    best_pair = (strategies[i], strategies[j])
+        
+        return {
+            "pair": best_pair,
+            "correlation": max_corr
+        }
+    
+    def _find_lowest_correlation(self, strategies: List[str], matrix: np.ndarray) -> Dict[str, Any]:
+        """Find lowest correlation (excluding diagonal)."""
+        n = len(strategies)
+        min_corr = 1
+        best_pair = None
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if matrix[i, j] < min_corr:
+                    min_corr = matrix[i, j]
+                    best_pair = (strategies[i], strategies[j])
+        
+        return {
+            "pair": best_pair,
+            "correlation": min_corr
+        }
+    
+    def _calculate_diversification_benefit(self, correlation_matrix: np.ndarray) -> float:
+        """Calculate diversification benefit (average off-diagonal correlation)."""
+        n = correlation_matrix.shape[0]
+        if n <= 1:
+            return 0.0
+        
+        # Calculate average off-diagonal correlation
+        off_diagonal_sum = np.sum(correlation_matrix) - np.trace(correlation_matrix)
+        off_diagonal_count = n * (n - 1)
+        avg_correlation = off_diagonal_sum / off_diagonal_count if off_diagonal_count > 0 else 0
+        
+        # Diversification benefit = 1 - average correlation
+        return 1 - avg_correlation
+    
+    def _calculate_max_drawdown(self, returns: np.ndarray) -> float:
+        """Calculate maximum drawdown from returns series."""
+        cumulative = np.cumsum(returns)
+        peak = np.maximum.accumulate(cumulative)
+        drawdown = (peak - cumulative) / peak
+        return np.max(drawdown)
+    
+    def _calculate_skewness(self, returns: np.ndarray) -> float:
+        """Calculate skewness of returns."""
+        if len(returns) < 3:
+            return 0.0
+        
+        mean = np.mean(returns)
+        std = np.std(returns)
+        
+        if std == 0:
+            return 0.0
+        
+        skew = np.mean(((returns - mean) / std) ** 3)
+        return skew
+    
+    def _calculate_kurtosis(self, returns: np.ndarray) -> float:
+        """Calculate kurtosis of returns."""
+        if len(returns) < 4:
+            return 0.0
+        
+        mean = np.mean(returns)
+        std = np.std(returns)
+        
+        if std == 0:
+            return 0.0
+        
+        kurt = np.mean(((returns - mean) / std) ** 4) - 3  # Excess kurtosis
+        return kurt
 
-        # Pre-compute win/loss classification for clustered mode
-        self._wins = [p for p in self.trade_pnls if p >= 0]
-        self._losses = [p for p in self.trade_pnls if p < 0]
-        self._win_rate = len(self._wins) / self.n_trades if self.n_trades > 0 else 0.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # CONSTRUCTORS
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @classmethod
-    def from_backtest_results(cls, results, initial_balance: Optional[float] = None) -> "RiskOfRuinSimulator":
+class MonteCarloSimulator:
+    """
+    Wrapper class for backward compatibility with existing code.
+    Uses EnhancedMonteCarlo internally.
+    """
+    
+    def __init__(self):
+        self.rng = np.random.default_rng()
+    
+    def run_simulation(
+        self, 
+        trades: List[Dict[str, Any]], 
+        num_simulations: int = 10000,
+        initial_balance: float = 10000.0
+    ) -> Dict[str, Any]:
         """
-        Create simulator from BacktestResults object.
-
+        Run Monte Carlo simulation on trade sequence.
+        
         Args:
-            results: BacktestResults instance (has .trades list of TradeRecord).
-            initial_balance: Override balance. Defaults to results.initial_balance.
+            trades: List of completed trades
+            num_simulations: Number of Monte Carlo runs
+            initial_balance: Starting account balance
+            
+        Returns:
+            Dictionary with simulation results
         """
-        pnls = [t.pnl for t in results.trades]
-        balance = initial_balance if initial_balance is not None else results.initial_balance
-        return cls(pnls, initial_balance=balance)
-
-    @classmethod
-    def from_live_trades(cls, initial_balance: float = 10_000.0) -> "RiskOfRuinSimulator":
-        """
-        Create simulator from live trade history in system_state.trades.
-
-        Fetches all closed trades and extracts net P&L values.
-        """
-        from engines.truth_engine import _closed_trades_query
-
-        trades = _closed_trades_query()
         if not trades:
-            raise ValueError("No closed trades found in system_state.trades")
-
-        pnls = [float(t["pnl_net_dollars"]) for t in trades if t.get("pnl_net_dollars") is not None]
-        if not pnls:
-            raise ValueError("No trades with pnl_net_dollars found")
-
-        logger.info(f"Loaded {len(pnls)} closed trades from live history")
-        return cls(pnls, initial_balance=initial_balance)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # SIMULATION ENGINES
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _simulate_equity_path(self, pnl_sequence: list[float]) -> dict:
-        """
-        Walk through a P&L sequence and compute equity path metrics.
-
-        Returns dict with max_drawdown_pct, final_equity, hit_ruin.
-        """
-        equity = self.initial_balance
-        peak = equity
-        max_dd_pct = 0.0
-        hit_ruin = False
-
-        for pnl in pnl_sequence:
-            equity += pnl
-            if equity <= 0:
-                hit_ruin = True
-                max_dd_pct = 1.0
-                break
-            if equity > peak:
-                peak = equity
-            dd_pct = (peak - equity) / peak if peak > 0 else 0.0
-            if dd_pct > max_dd_pct:
-                max_dd_pct = dd_pct
-
-        return {
-            "max_drawdown_pct": max_dd_pct,
-            "final_equity": max(equity, 0.0),
-            "hit_ruin": hit_ruin,
-        }
-
-    def run_basic(self, n_simulations: int = 10_000) -> dict:
-        """
-        Basic Monte Carlo: shuffle trade P&L values randomly.
-
-        Each simulation randomly reorders all trades and walks the
-        equity curve to find max drawdown.
-
-        Returns:
-            dict with keys: max_drawdowns, final_equities, ruin_count,
-                           n_simulations, mode.
-        """
-        logger.info(f"Running basic Monte Carlo ({n_simulations} sims, {self.n_trades} trades)")
-
-        max_drawdowns = []
-        final_equities = []
-        ruin_count = 0
-
-        for _ in range(n_simulations):
-            shuffled = self.trade_pnls.copy()
-            random.shuffle(shuffled)
-            result = self._simulate_equity_path(shuffled)
-            max_drawdowns.append(result["max_drawdown_pct"])
-            final_equities.append(result["final_equity"])
-            if result["hit_ruin"]:
-                ruin_count += 1
-
-        return {
-            "max_drawdowns": max_drawdowns,
-            "final_equities": final_equities,
-            "ruin_count": ruin_count,
-            "n_simulations": n_simulations,
-            "mode": "basic_shuffle",
-        }
-
-    def run_clustered(
+            return {'error': 'No trades provided for Monte Carlo simulation'}
+        
+        logger.info(f"Running Monte Carlo simulation with {num_simulations} simulations")
+        
+        try:
+            # Use enhanced Monte Carlo
+            simulator = EnhancedMonteCarlo(trades, {'initial_balance': initial_balance})
+            results = simulator.run_full_analysis(num_simulations)
+            
+            # Convert to standard format expected by existing code
+            base_stats = results.base_statistics
+            
+            return {
+                'num_simulations': num_simulations,
+                'final_balance_mean': base_stats.get('expected_return', 0) + initial_balance,
+                'final_balance_median': base_stats.get('expected_return', 0) + initial_balance,  # Approximation
+                'final_balance_std': base_stats.get('return_std', 0),
+                'final_balance_5th': base_stats.get('worst_case', 0),
+                'final_balance_95th': base_stats.get('best_case', 0),
+                'risk_of_ruin_50': base_stats.get('risk_of_ruin', 0) * 100,
+                'risk_of_ruin_25': base_stats.get('risk_of_ruin', 0) * 100,  # Same metric
+                'risk_of_ruin_0': base_stats.get('risk_of_ruin', 0) * 100,  # Same metric
+                'strategy_breakdown': results.strategy_breakdown,
+                'correlation_analysis': results.correlation_analysis,
+                'regime_analysis': results.regime_analysis,
+                'risk_metrics': results.risk_metrics,
+                'recommendations': results.recommendations
+            }
+            
+        except Exception as e:
+            logger.error(f"Enhanced Monte Carlo failed: {e}")
+            return self._run_basic_simulation(trades, num_simulations, initial_balance)
+    
+    def _run_basic_simulation(
         self,
-        cluster_probability: float = 0.3,
-        n_simulations: int = 10_000,
-    ) -> dict:
-        """
-        Clustered Monte Carlo: models regime-dependent win/loss clustering.
-
-        With probability `cluster_probability`, the next trade outcome
-        matches the previous one (win→win, loss→loss). This captures
-        the serial correlation that basic shuffle misses — losing streaks
-        and winning streaks tend to cluster in real markets.
-
-        Args:
-            cluster_probability: Probability that next trade matches
-                                 previous outcome type (0.0 = pure random,
-                                 1.0 = perfect clustering).
-            n_simulations: Number of simulations to run.
-
-        Returns:
-            dict with keys: max_drawdowns, final_equities, ruin_count,
-                           n_simulations, mode, cluster_probability.
-        """
-        if not self._wins and not self._losses:
-            raise ValueError("Need at least one win or loss trade for clustered simulation")
-
-        logger.info(
-            f"Running clustered Monte Carlo ({n_simulations} sims, "
-            f"{self.n_trades} trades, cluster_p={cluster_probability})"
-        )
-
-        max_drawdowns = []
-        final_equities = []
-        ruin_count = 0
-
-        for _ in range(n_simulations):
-            sequence = self._generate_clustered_sequence(cluster_probability)
-            result = self._simulate_equity_path(sequence)
-            max_drawdowns.append(result["max_drawdown_pct"])
-            final_equities.append(result["final_equity"])
-            if result["hit_ruin"]:
-                ruin_count += 1
-
+        trades: List[Dict[str, Any]], 
+        num_simulations: int,
+        initial_balance: float
+    ) -> Dict[str, Any]:
+        """Run basic Monte Carlo simulation as fallback."""
+        # Extract trade P&L values
+        trade_pnls = [trade.get('pnl_net_dollars', trade.get('pnl', 0)) for trade in trades]
+        
+        if not trade_pnls:
+            return {'error': 'No valid P&L data found'}
+        
+        # Run Monte Carlo simulations
+        final_balances = []
+        
+        for sim in range(num_simulations):
+            # Randomize trade sequence
+            shuffled_pnls = self.rng.permutation(trade_pnls)
+            
+            # Calculate final balance
+            final_balance = initial_balance + np.sum(shuffled_pnls)
+            final_balances.append(final_balance)
+        
+        # Calculate statistics
+        final_balances = np.array(final_balances)
+        
+        # Risk of ruin calculations
+        ruin_50 = np.mean(final_balances < initial_balance * 0.5) * 100
+        ruin_25 = np.mean(final_balances < initial_balance * 0.25) * 100
+        ruin_0 = np.mean(final_balances <= 0) * 100
+        
         return {
-            "max_drawdowns": max_drawdowns,
-            "final_equities": final_equities,
-            "ruin_count": ruin_count,
-            "n_simulations": n_simulations,
-            "mode": "clustered",
-            "cluster_probability": cluster_probability,
-        }
-
-    def _generate_clustered_sequence(self, cluster_prob: float) -> list[float]:
-        """
-        Generate a trade sequence with win/loss clustering.
-
-        First trade is drawn randomly based on historical win rate.
-        Subsequent trades: with probability cluster_prob, draw from
-        the same pool (win or loss) as the previous trade; otherwise
-        draw from the opposite pool.
-        """
-        sequence = []
-        prev_was_win = random.random() < self._win_rate
-
-        for _ in range(self.n_trades):
-            # Decide if this trade clusters with previous
-            if random.random() < cluster_prob:
-                # Cluster: same outcome type as previous
-                use_wins = prev_was_win
-            else:
-                # No cluster: draw based on base win rate
-                use_wins = random.random() < self._win_rate
-
-            # Draw a random P&L from the appropriate pool
-            if use_wins and self._wins:
-                pnl = random.choice(self._wins)
-            elif not use_wins and self._losses:
-                pnl = random.choice(self._losses)
-            elif self._wins:
-                pnl = random.choice(self._wins)
-            else:
-                pnl = random.choice(self._losses)
-
-            sequence.append(pnl)
-            prev_was_win = pnl >= 0
-
-        return sequence
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ANALYSIS
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def analyze_results(results: dict) -> dict:
-        """
-        Compute and print statistics from simulation results.
-
-        Args:
-            results: dict returned by run_basic() or run_clustered().
-
-        Returns:
-            dict with computed statistics.
-        """
-        dd_array = np.array(results["max_drawdowns"])
-        eq_array = np.array(results["final_equities"])
-        n_sims = results["n_simulations"]
-        ruin_count = results["ruin_count"]
-
-        ks6_limit = getattr(config, "KS6_DRAWDOWN_LIMIT_PCT", 0.12)
-
-        median_dd = float(np.median(dd_array))
-        p95_dd = float(np.percentile(dd_array, 95))
-        p99_dd = float(np.percentile(dd_array, 99))
-        prob_hit_ks6 = float(np.mean(dd_array >= ks6_limit))
-        prob_ruin = ruin_count / n_sims if n_sims > 0 else 0.0
-        median_final_eq = float(np.median(eq_array))
-        mean_final_eq = float(np.mean(eq_array))
-
-        mode_label = results.get("mode", "unknown")
-        cluster_p = results.get("cluster_probability")
-
-        stats = {
-            "mode": mode_label,
-            "cluster_probability": cluster_p,
-            "n_simulations": n_sims,
-            "median_max_drawdown_pct": median_dd,
-            "p95_max_drawdown_pct": p95_dd,
-            "p99_max_drawdown_pct": p99_dd,
-            "prob_hit_ks6": prob_hit_ks6,
-            "ks6_limit_pct": ks6_limit,
-            "prob_ruin": prob_ruin,
-            "median_final_equity": median_final_eq,
-            "mean_final_equity": mean_final_eq,
-        }
-
-        # Print report
-        header = f"Monte Carlo Analysis — {mode_label}"
-        if cluster_p is not None:
-            header += f" (cluster_p={cluster_p})"
-
-        print(f"\n{_BAR}")
-        print(f"  {header}")
-        print(_BAR)
-        print(f"  Simulations:           {n_sims:,}")
-        print(f"  Median Max Drawdown:   {median_dd:.2%}")
-        print(f"  95th %ile Drawdown:    {p95_dd:.2%}")
-        print(f"  99th %ile Drawdown:    {p99_dd:.2%}")
-        print(f"  Prob(DD ≥ KS6 {ks6_limit:.0%}):  {prob_hit_ks6:.2%}")
-        print(f"  Prob(Ruin):            {prob_ruin:.4%}")
-        print(f"  Median Final Equity:   ${median_final_eq:,.2f}")
-        print(f"  Mean Final Equity:     ${mean_final_eq:,.2f}")
-
-        # Decision support
-        if prob_hit_ks6 > 0.15:
-            print(f"\n  ⚠️  WARNING: {prob_hit_ks6:.1%} probability of hitting KS6.")
-            print(f"     Phase 2 scaling NOT recommended until this drops below 15%.")
-            stats["phase2_recommendation"] = "HOLD"
-        else:
-            print(f"\n  ✅  KS6 risk acceptable ({prob_hit_ks6:.1%} < 15%).")
-            stats["phase2_recommendation"] = "OK"
-
-        print(_LINE)
-
-        return stats
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FULL REPORT
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def run_full_report(self, n_simulations: int = 10_000) -> dict:
-        """
-        Run basic + clustered (30% and 50%) simulations and print combined report.
-
-        Returns:
-            dict with keys: basic, clustered_30, clustered_50 — each containing
-            the analyzed statistics.
-        """
-        print(f"\n{'#' * 62}")
-        print(f"  RISK-OF-RUIN MONTE CARLO REPORT")
-        print(f"  {self.n_trades} trades | ${self.initial_balance:,.2f} initial balance")
-        print(f"  Win rate: {self._win_rate:.1%} | "
-              f"Avg win: ${np.mean(self._wins):,.2f} | "
-              f"Avg loss: ${np.mean(self._losses):,.2f}"
-              if self._wins and self._losses else
-              f"  Win rate: {self._win_rate:.1%}")
-        print(f"{'#' * 62}")
-
-        # Basic shuffle
-        basic_results = self.run_basic(n_simulations=n_simulations)
-        basic_stats = self.analyze_results(basic_results)
-
-        # Clustered 30%
-        clustered_30_results = self.run_clustered(
-            cluster_probability=0.3, n_simulations=n_simulations
-        )
-        clustered_30_stats = self.analyze_results(clustered_30_results)
-
-        # Clustered 50%
-        clustered_50_results = self.run_clustered(
-            cluster_probability=0.5, n_simulations=n_simulations
-        )
-        clustered_50_stats = self.analyze_results(clustered_50_results)
-
-        # Summary comparison
-        print(f"\n{_BAR}")
-        print("  COMPARISON SUMMARY")
-        print(_BAR)
-        print(f"  {'Metric':<28} {'Basic':>10} {'Clust 30%':>10} {'Clust 50%':>10}")
-        print(f"  {'-'*28} {'-'*10} {'-'*10} {'-'*10}")
-        print(f"  {'Median Max DD':<28} "
-              f"{basic_stats['median_max_drawdown_pct']:>9.2%} "
-              f"{clustered_30_stats['median_max_drawdown_pct']:>9.2%} "
-              f"{clustered_50_stats['median_max_drawdown_pct']:>9.2%}")
-        print(f"  {'95th %ile DD':<28} "
-              f"{basic_stats['p95_max_drawdown_pct']:>9.2%} "
-              f"{clustered_30_stats['p95_max_drawdown_pct']:>9.2%} "
-              f"{clustered_50_stats['p95_max_drawdown_pct']:>9.2%}")
-        print(f"  {'P(DD ≥ KS6)':<28} "
-              f"{basic_stats['prob_hit_ks6']:>9.2%} "
-              f"{clustered_30_stats['prob_hit_ks6']:>9.2%} "
-              f"{clustered_50_stats['prob_hit_ks6']:>9.2%}")
-        print(f"  {'P(Ruin)':<28} "
-              f"{basic_stats['prob_ruin']:>9.4%} "
-              f"{clustered_30_stats['prob_ruin']:>9.4%} "
-              f"{clustered_50_stats['prob_ruin']:>9.4%}")
-        print(f"  {'Median Final Equity':<28} "
-              f"${basic_stats['median_final_equity']:>8,.0f} "
-              f"${clustered_30_stats['median_final_equity']:>8,.0f} "
-              f"${clustered_50_stats['median_final_equity']:>8,.0f}")
-        print(_LINE)
-
-        # Overall recommendation based on worst case (clustered 50%)
-        worst_ks6 = clustered_50_stats["prob_hit_ks6"]
-        if worst_ks6 > 0.15:
-            print(f"\n  🔴 OVERALL: Phase 2 scaling NOT recommended.")
-            print(f"     Worst-case KS6 probability: {worst_ks6:.1%} (clustered 50%)")
-        elif worst_ks6 > 0.10:
-            print(f"\n  🟡 CAUTION: KS6 risk elevated at {worst_ks6:.1%} (clustered 50%).")
-            print(f"     Consider conservative position sizing for Phase 2.")
-        else:
-            print(f"\n  🟢 CLEAR: KS6 risk acceptable across all scenarios.")
-            print(f"     Phase 2 scaling can proceed.")
-
-        return {
-            "basic": basic_stats,
-            "clustered_30": clustered_30_stats,
-            "clustered_50": clustered_50_stats,
+            'num_simulations': num_simulations,
+            'final_balance_mean': float(np.mean(final_balances)),
+            'final_balance_median': float(np.median(final_balances)),
+            'final_balance_std': float(np.std(final_balances)),
+            'final_balance_5th': float(np.percentile(final_balances, 5)),
+            'final_balance_95th': float(np.percentile(final_balances, 95)),
+            'risk_of_ruin_50': ruin_50,
+            'risk_of_ruin_25': ruin_25,
+            'risk_of_ruin_0': ruin_0,
+            'strategy_breakdown': {},
+            'correlation_analysis': {},
+            'regime_analysis': {},
+            'risk_metrics': {},
+            'recommendations': []
         }

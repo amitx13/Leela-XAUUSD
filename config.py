@@ -11,6 +11,15 @@ load_dotenv()
 # ── Environment ──────────────────────────────────────────────────────────────
 ENV = os.getenv("ENV", "dev")   # 'dev' or 'prod'
 
+# ── Backtest Mode Configuration ───────────────────────────────────────────
+# CRITICAL: Set BACKTEST_MODE = False in live production
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False").lower() == "true"
+
+# KS6 Auto-Reset Configuration (Backtest Only)
+# CRITICAL: Set BACKTEST_KS6_AUTO_RESET = False in live production
+BACKTEST_KS6_AUTO_RESET = os.getenv("BACKTEST_KS6_AUTO_RESET", "False").lower() == "true"
+BACKTEST_KS6_COOLDOWN_BARS = int(os.getenv("BACKTEST_KS6_COOLDOWN_BARS", "96"))  # 96 x M15 bars = 24 hours
+
 # ── MT5 rpyc bridge (mt5linux) ───────────────────────────────────────────────
 MT5_HOST   = os.getenv("MT5_HOST", "localhost")
 MT5_PORT   = int(os.getenv("MT5_PORT", "18812"))

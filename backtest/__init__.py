@@ -7,6 +7,6 @@ simulates execution, and produces per-strategy P&L curves.
 """
 from backtest.engine import BacktestEngine
 from backtest.results import BacktestResults
-from backtest.monte_carlo import RiskOfRuinSimulator
+from backtest.monte_carlo import MonteCarloSimulator
 
-__all__ = ["BacktestEngine", "BacktestResults", "RiskOfRuinSimulator"]
+__all__ = ["BacktestEngine", "BacktestResults", "MonteCarloSimulator"]

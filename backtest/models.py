@@ -6,20 +6,6 @@ SimPosition: Represents an open position being tracked.
 TradeRecord: Immutable record of a completed (closed) trade.
 
 All timestamps are timezone-aware UTC (pytz.utc).
-
-CRIT-3 FIX: SimulatedState gains two new fields:
-  corr_throttle_active: bool  — set True when any strategy pair correlation
-                                 exceeds config.PORTFOLIO_CORR_THRESHOLD.
-  corr_throttle_pairs:  list  — list of (s1, s2, corr_value) tuples for the
-                                 pairs currently above threshold.
-These are read by _evaluate_strategies() in engine.py to apply the 0.65×
-lot-size reduction that the live check_portfolio_risk() SIZE-5 correlation
-kill applies for same-family same-direction concurrent entries.
-
-BUG-5 FIX: SimulatedState.size_multiplier default changed 0.0 → 0.5.
-  Initialising at 0.5 (the RANGING/ASIAN floor) makes intent explicit and
-  removes the fragile dependency on classify_regime_backtest() having already
-  run before the first _calc_lots() call on bar-0.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,14 +27,15 @@ class SimOrder:
     direction: str          # "LONG" or "SHORT"
     order_type: str         # "BUY_STOP", "SELL_STOP", "BUY_LIMIT", "SELL_LIMIT", "MARKET"
     price: float
-    sl: float
-    tp: Optional[float] = None
-    lots: float = 0.01
+    stop_price: float
+    tp_price: Optional[float] = None
+    lot_size: float = 0.01
     expiry: Optional[datetime] = None
     placed_time: Optional[datetime] = None
     # Metadata for tracking
     tag: str = ""           # e.g. "s7_buy_leg", "s7_sell_leg" for OCO pairs
     linked_tag: str = ""    # tag of the opposite OCO leg to cancel on fill
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -58,21 +45,30 @@ class SimPosition:
 
     Tracks entry details, current stop level, and management state
     (partial exit, breakeven activation, trailing stop).
+
+    Fields aligned with execution_simulator._try_fill_updated() exactly.
     """
     strategy: str
     direction: str          # "LONG" or "SHORT"
     entry_price: float
     entry_time: datetime
-    lots: float
-    stop_price_original: float
-    current_sl: float
-    tp: Optional[float] = None
+    lot_size: float
+    stop_price: float       # current stop level (moves to BE, then trails)
+    # Optional fields
+    tp_price: Optional[float] = None
+    ticket: str = ""        # unique identifier e.g. "BT_42_1234567890.0"
+    tag: str = ""           # OCO tag
     regime_at_entry: str = ""
-    partial_done: bool = False
-    be_activated: bool = False
+    # Position management flags (stored in metadata dict below)
+    metadata: dict = field(default_factory=dict)
     # Tracking metrics
     max_r: float = 0.0
     max_favorable: float = 0.0
+
+    @property
+    def stop_price_original(self) -> float:
+        """Original stop level stored in metadata (for R-multiple calc)."""
+        return self.metadata.get('original_stop', self.stop_price)
 
     @property
     def stop_distance(self) -> float:
@@ -90,11 +86,11 @@ class SimPosition:
             return (self.entry_price - price) / sd
 
     def unrealized_pnl(self, price: float) -> float:
-        """Unrealized P&L in USD at given price (XAUUSD: 100 oz/lot)."""
+        """Unrealized P&L in USD at given price (XAUUSD: $100/point/lot)."""
         if self.direction == "LONG":
-            return (price - self.entry_price) * self.lots * 100.0
+            return (price - self.entry_price) * self.lot_size * 100.0
         else:
-            return (self.entry_price - price) * self.lots * 100.0
+            return (self.entry_price - price) * self.lot_size * 100.0
 
 
 @dataclass
@@ -102,8 +98,11 @@ class TradeRecord:
     """
     Immutable record of a completed trade.
 
-    pnl is NET of commission ($7.00/lot round trip).
-    r_multiple = pnl_gross / (stop_distance * lots * 100).
+    pnl_net_dollars is NET of commission ($7.00/lot round trip).
+    r_multiple = pnl_gross_dollars / (stop_distance * lot_size * 100).
+
+    Fields aligned with execution_simulator._create_trade_record() and
+    engine._finalize_backtest() exactly.
     """
     strategy: str
     direction: str
@@ -111,42 +110,81 @@ class TradeRecord:
     exit_price: float
     entry_time: datetime
     exit_time: datetime
-    lots: float
-    pnl: float              # net of commission
-    pnl_gross: float         # before commission
+    lot_size: float
+    pnl_net_dollars: float          # net of commission
+    pnl_gross_dollars: float        # before commission
+    pnl_points: float               # raw price-point P&L
     r_multiple: float
-    exit_reason: str         # "SL", "TP", "PARTIAL", "BE", "ATR_TRAIL", "TIME_KILL", "SESSION_CLOSE"
-    regime_at_entry: str
-    regime_at_exit: str
-    stop_original: float
-    commission: float        # total commission for this trade
+    exit_type: str                  # "SL_HIT", "TP_HIT", "PARTIAL_EXIT", "ATR_TRAIL",
+                                    # "TIME_EXIT", "FORCED_CLOSE"
+    stop_price: float               # stop level at time of close
+    commission: float               # total commission for this trade
+    # Optional / metadata
+    ticket: str = ""
+    tp_price: Optional[float] = None
+    regime_at_entry: str = ""
+    regime_at_exit: str = ""
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Convert to plain dict for JSON export."""
+        return {
+            "ticket": self.ticket,
+            "strategy": self.strategy,
+            "direction": self.direction,
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "entry_time": str(self.entry_time),
+            "exit_time": str(self.exit_time),
+            "lot_size": self.lot_size,
+            "pnl_net_dollars": self.pnl_net_dollars,
+            "pnl_gross_dollars": self.pnl_gross_dollars,
+            "pnl_points": self.pnl_points,
+            "r_multiple": self.r_multiple,
+            "exit_type": self.exit_type,
+            "stop_price": self.stop_price,
+            "tp_price": self.tp_price,
+            "commission": self.commission,
+            "regime_at_entry": self.regime_at_entry,
+            "regime_at_exit": self.regime_at_exit,
+        }
 
 
 @dataclass
 class EquityPoint:
     """Single point on the equity curve."""
-    timestamp: datetime
+    time: datetime
     equity: float
+    balance: float = 0.0
+    open_positions: int = 0
+    regime: str = "NO_TRADE"
     drawdown_pct: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "time": str(self.time),
+            "equity": self.equity,
+            "balance": self.balance,
+            "open_positions": self.open_positions,
+            "regime": self.regime,
+            "drawdown_pct": self.drawdown_pct,
+        }
 
 
 @dataclass
 class SimulatedState:
     """
     ENHANCED backtest state matching live system state.py exactly.
-    
+
     Tracks all strategy state, risk management, and position data.
     Mirrors the live system's state structure for perfect parity.
 
-    CRIT-3 fields added:
-      corr_throttle_active  — True when _run_portfolio_correlation_check()
-                              finds any pair above config.PORTFOLIO_CORR_THRESHOLD.
-      corr_throttle_pairs   — list of (strat_a, strat_b, corr_float) tuples.
+    BUG-4 FIX: to_dict() now exposes 'regime' and 'session' aliases so
+        strategies using state.get('regime') and state.get('session')
+        correctly read current_regime and current_session.
 
-    BUG-5 FIX:
-      size_multiplier initialised to 0.5 (RANGING/ASIAN floor) instead of 0.0.
-      Prevents _calc_lots() from receiving a zero multiplier on bar-0 before
-      the first classify_regime_backtest() call has executed.
+    BUG-5 FIX: size_multiplier initialised to 0.5 (RANGING floor) instead of
+        0.0 to prevent zero-multiplier lot sizes on bar-0.
     """
     # Account metrics
     balance: float = 10000.0
@@ -155,8 +193,6 @@ class SimulatedState:
 
     # Regime state (from live regime_engine.py)
     current_regime: str = "NO_TRADE"
-    # BUG-5 FIX: was 0.0 — initialise to 0.5 (RANGING floor) so bar-0
-    # lot sizing is safe even before classify_regime_backtest() runs.
     size_multiplier: float = 0.5
     consecutive_regime_readings: int = 0
     pending_regime_state: Optional[str] = None
@@ -164,11 +200,11 @@ class SimulatedState:
     last_atr_pct_h1: float = 0.0
     last_atr_h1_raw: float = 0.0
     last_atr_m15: float = 0.0
-    last_di_plus_h4: Optional[float] = None  # V3.0: ADX/DI cache
-    last_di_minus_h4: Optional[float] = None  # V3.0: ADX/DI cache
+    last_di_plus_h4: Optional[float] = None
+    last_di_minus_h4: Optional[float] = None
     current_session: str = "OFF_HOURS"
 
-    # S1 family state (all strategies)
+    # S1 family state
     s1_family_attempts_today: int = 0
     s1f_attempts_today: int = 0
     s1b_pending_ticket: Optional[int] = None
@@ -194,13 +230,13 @@ class SimulatedState:
     s2_fired_today: bool = False
 
     # S1d / S1e pyramid tracking
-    s1d_pyramid_count: int = 0   # number of M5-pullback pyramids added today
-    s1e_pyramid_count: int = 0   # number of aggressive pyramids added today
+    s1d_pyramid_count: int = 0
+    s1e_pyramid_count: int = 0
 
     # S1f post-time-kill re-entry tracking
-    s1f_reentered_today: bool = False          # re-entry already taken today
-    s1f_killed_position_profitable: bool = False  # was the TK'd position in profit?
-    s1f_original_size: float = 0.0            # lot size of original S1 position
+    s1f_reentered_today: bool = False
+    s1f_killed_position_profitable: bool = False
+    s1f_original_size: float = 0.0
 
     # R3 state (independent lane)
     r3_armed: bool = False
@@ -209,26 +245,18 @@ class SimulatedState:
     r3_fired_today: bool = False
     ks7_pre_event_price: float = 0.0
 
-    # Position state (enhanced for independent lanes)
+    # Position state
     trend_family_occupied: bool = False
     trend_family_strategy: Optional[str] = None
-    # Direction of the currently open trend-family position.
-    # Set to pos.direction on OPEN, cleared to None on CLOSE.
-    # Read by S1d and S1e to determine pyramid order direction.
     trend_trade_direction: Optional[str] = None
     reversal_family_occupied: bool = False
-    open_position: Optional[int] = None  # Main trend family ticket
+    open_position: Optional[int] = None
     entry_price: float = 0.0
     stop_price_original: float = 0.0
     stop_price_current: float = 0.0
     original_lot_size: float = 0.0
     open_trade_id: Optional[str] = None
     open_campaign_id: Optional[str] = None
-    # BUG-6 NOTE: last_s1_direction and last_s1_max_r are intentionally NOT
-    # reset in _daily_reset. They persist across UTC midnight so that an S1
-    # trade filled late on Day N can still qualify S1b on Day N+1 (08:00–14:00
-    # UTC window). They are only overwritten when a new S1 order fills or when
-    # the trend family closes — both handled in the run loop.
     last_s1_direction: Optional[str] = None
     last_s1_max_r: float = 0.0
     position_partial_done: bool = False
@@ -236,7 +264,7 @@ class SimulatedState:
     position_pyramid_done: bool = False
     position_m5_count: int = 0
 
-    # Independent position lanes (V3.0)
+    # Independent position lanes (R3, S8)
     s8_open_ticket: Optional[int] = None
     s8_entry_price: float = 0.0
     s8_stop_price_original: float = 0.0
@@ -251,7 +279,7 @@ class SimulatedState:
     r3_stop_price: float = 0.0
     r3_tp_price: float = 0.0
 
-    # Pending orders (all strategies)
+    # Pending orders
     s1_pending_buy_ticket: Optional[int] = None
     s1_pending_sell_ticket: Optional[int] = None
     s6_pending_buy_ticket: Optional[int] = None
@@ -269,8 +297,9 @@ class SimulatedState:
     ks7_active: bool = False
     ks7_pre_event_atr: float = 0.0
 
-    # Daily tracking
+    # Daily / weekly tracking
     daily_pnl: float = 0.0
+    weekly_pnl: float = 0.0
     daily_trades: int = 0
     daily_commission_paid: float = 0.0
     consecutive_m5_losses: int = 0
@@ -291,28 +320,28 @@ class SimulatedState:
     total_pnl_gross: float = 0.0
     total_commission: float = 0.0
 
-    # ── CRIT-3: Portfolio correlation kill ────────────────────────────────────
-    # Set by _run_portfolio_correlation_check() in engine.py every time a
-    # position closes (mirrors live portfolio_risk.run_correlation_check).
-    # Read by _evaluate_strategies() to apply 0.65× lot reduction for
-    # same-family same-direction concurrent entries.
+    # Portfolio correlation throttle (CRIT-3)
     corr_throttle_active: bool = False
     corr_throttle_pairs: list = field(default_factory=list)
-    # Counter: how many trades have closed since the last correlation check.
-    # Check runs every PORTFOLIO_CORR_CHECK_EVERY_N trades (default 5).
     _corr_check_trade_counter: int = field(default=0, repr=False)
-    # ─────────────────────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
-        """Convert to dict for compatibility with strategy evaluation functions."""
+        """
+        Convert to dict for strategy evaluation functions.
+
+        BUG-4/13 FIX: Exposes 'regime' and 'session' as aliases for
+        current_regime and current_session so all strategy state.get()
+        calls work regardless of which key name they use.
+        """
         return {
             # Account
             "balance": self.balance,
             "equity": self.equity,
             "peak_equity": self.peak_equity,
-            
-            # Regime
+
+            # Regime — expose BOTH canonical and alias names
             "current_regime": self.current_regime,
+            "regime": self.current_regime,          # BUG-4 alias
             "size_multiplier": self.size_multiplier,
             "consecutive_regime_readings": self.consecutive_regime_readings,
             "pending_regime_state": self.pending_regime_state,
@@ -323,21 +352,26 @@ class SimulatedState:
             "last_di_plus_h4": self.last_di_plus_h4,
             "last_di_minus_h4": self.last_di_minus_h4,
             "current_session": self.current_session,
-            
+            "session": self.current_session,        # BUG-13 alias
+
             # S1 family
             "s1_family_attempts_today": self.s1_family_attempts_today,
             "s1f_attempts_today": self.s1f_attempts_today,
+            "s1_attempts_today": self.s1_family_attempts_today,   # legacy alias
             "s1b_pending_ticket": self.s1b_pending_ticket,
             "s1d_ema_touched_today": self.s1d_ema_touched_today,
             "s1d_fired_today": self.s1d_fired_today,
             "s1e_pyramid_done": self.s1e_pyramid_done,
             "s1f_post_tk_active": self.s1f_post_tk_active,
+            "s1b_fired_today": self.s1d_fired_today,              # legacy alias
             "s3_sweep_candle_time": self.s3_sweep_candle_time,
             "s3_sweep_low": self.s3_sweep_low,
             "s3_fired_today": self.s3_fired_today,
             "s3_sweep_direction": self.s3_sweep_direction,
             "s4_fired_today": self.s4_fired_today,
+            "s4_ema_touched": self.s1d_ema_touched_today,         # legacy alias
             "s5_fired_today": self.s5_fired_today,
+            "s5_compression_confirmed": self.range_computed,      # reused flag
             "s6_placed_today": self.s6_placed_today,
             "s7_placed_today": self.s7_placed_today,
             "s8_fired_today": self.s8_fired_today,
@@ -348,19 +382,19 @@ class SimulatedState:
             "s8_spike_direction": self.s8_spike_direction,
             "s8_confirmation_passed": self.s8_confirmation_passed,
             "s2_fired_today": self.s2_fired_today,
+            "r3_fired_today": self.r3_fired_today,
             "s1d_pyramid_count": self.s1d_pyramid_count,
             "s1e_pyramid_count": self.s1e_pyramid_count,
             "s1f_reentered_today": self.s1f_reentered_today,
             "s1f_killed_position_profitable": self.s1f_killed_position_profitable,
             "s1f_original_size": self.s1f_original_size,
-            
+
             # R3
             "r3_armed": self.r3_armed,
             "r3_arm_time": self.r3_arm_time,
             "r3_direction": self.r3_direction,
-            "r3_fired_today": self.r3_fired_today,
             "ks7_pre_event_price": self.ks7_pre_event_price,
-            
+
             # Position state
             "trend_family_occupied": self.trend_family_occupied,
             "trend_family_strategy": self.trend_family_strategy,
@@ -379,7 +413,7 @@ class SimulatedState:
             "position_be_activated": self.position_be_activated,
             "position_pyramid_done": self.position_pyramid_done,
             "position_m5_count": self.position_m5_count,
-            
+
             # Independent lanes
             "s8_open_ticket": self.s8_open_ticket,
             "s8_entry_price": self.s8_entry_price,
@@ -393,7 +427,7 @@ class SimulatedState:
             "r3_entry_price": self.r3_entry_price,
             "r3_stop_price": self.r3_stop_price,
             "r3_tp_price": self.r3_tp_price,
-            
+
             # Pending orders
             "s1_pending_buy_ticket": self.s1_pending_buy_ticket,
             "s1_pending_sell_ticket": self.s1_pending_sell_ticket,
@@ -401,7 +435,7 @@ class SimulatedState:
             "s6_pending_sell_ticket": self.s6_pending_sell_ticket,
             "s7_pending_buy_ticket": self.s7_pending_buy_ticket,
             "s7_pending_sell_ticket": self.s7_pending_sell_ticket,
-            
+
             # Risk management
             "trading_enabled": self.trading_enabled,
             "shutdown_reason": self.shutdown_reason,
@@ -411,14 +445,15 @@ class SimulatedState:
             "stop_hunt_detected": self.stop_hunt_detected,
             "ks7_active": self.ks7_active,
             "ks7_pre_event_atr": self.ks7_pre_event_atr,
-            
+
             # Daily tracking
             "daily_pnl": self.daily_pnl,
+            "weekly_pnl": self.weekly_pnl,
             "daily_trades": self.daily_trades,
             "daily_commission_paid": self.daily_commission_paid,
             "consecutive_m5_losses": self.consecutive_m5_losses,
             "consecutive_losses": self.consecutive_losses,
-            
+
             # Range data
             "range_high": self.range_high,
             "range_low": self.range_low,
@@ -426,7 +461,7 @@ class SimulatedState:
             "range_computed": self.range_computed,
             "s7_prev_day_high": self.s7_prev_day_high,
             "s7_prev_day_low": self.s7_prev_day_low,
-            
+
             # Performance
             "total_closed_trades": self.total_closed_trades,
             "total_wins": self.total_wins,
@@ -434,7 +469,7 @@ class SimulatedState:
             "total_pnl_gross": self.total_pnl_gross,
             "total_commission": self.total_commission,
 
-            # CRIT-3 correlation kill
+            # Correlation kill (CRIT-3)
             "corr_throttle_active": self.corr_throttle_active,
-            "corr_throttle_pairs":  self.corr_throttle_pairs,
+            "corr_throttle_pairs": self.corr_throttle_pairs,
         }
