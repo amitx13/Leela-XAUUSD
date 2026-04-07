@@ -123,6 +123,7 @@ class BacktestEngine:
             # Load warm-up bars (100 H1 bars = ~4 days before start_date)
             warmup_start = self.start_date - timedelta(days=5)
             warmup_feed = HistoricalDataFeed(warmup_start, self.start_date)
+            warmup_data = None
             try:
                 warmup_data = warmup_feed.load()
                 # Pre-populate bar buffer with warm-up data (don't generate signals)
@@ -142,8 +143,20 @@ class BacktestEngine:
         self.total_bars = len(m5_data)
         logger.info(f"Processing {self.total_bars} M5 bars")
         
-        # Initialize state
+        # Initialize state — must happen AFTER warm-up buffer is populated
         self._initialize_state()
+
+        # ── WARM-UP RANGE BACKFILL ────────────────────────────────────────────
+        # pre_london_range / asian_range / prev_day_ohlc start as None.
+        # They are only updated inside _update_strategy_state() when the live
+        # bar clock hits exact timestamps (07:55, 05:30, 00:00).  On a run
+        # that starts mid-day those timestamps are never reached before the
+        # first strategy evaluation, so S1/S6/S7/S4 always return None on
+        # day-1 (and often day-2).  Fix: derive these ranges directly from the
+        # warm-up bars that are already in the bar buffer.
+        if warmup_data is not None and not warmup_data.empty:
+            self._backfill_ranges_from_warmup(warmup_data)
+        # ─────────────────────────────────────────────────────────────────────
         
         # Main processing loop
         start_time = time.time()
@@ -192,14 +205,14 @@ class BacktestEngine:
         self.state.ks4_reduced_trades_remaining = 0
         
         # Strategy-specific state
-        self.state.s1_attempts_today = 0
-        self.state.s1b_fired_today = False
-        self.state.s1d_reentries_today = 0
-        self.state.s1f_fired_today = False
+        self.state.s1_family_attempts_today = 0
+        self.state.s1d_fired_today = False
+        self.state.s1d_reentries_today = 0  # legacy alias — kept for safety
+        self.state.s1f_reentered_today = False
         self.state.s4_fired_today = False
         self.state.s4_ema_touched = False
         self.state.s5_fired_today = False
-        self.state.s5_compression_confirmed = False
+        self.state.range_computed = False
         self.state.r3_fired_today = False
         self.state.s8_fired_today = False
         
@@ -208,6 +221,96 @@ class BacktestEngine:
         self.state.trend_family_occupied = False
         self.state.reversal_family_occupied = False
         self.state.independent_lanes_occupied = {}
+
+    def _backfill_ranges_from_warmup(self, warmup_data: pd.DataFrame) -> None:
+        """
+        Derive pre_london_range, asian_range, and prev_day_ohlc from the
+        warm-up DataFrame so strategies have valid state from bar-1 of the
+        live window.
+
+        Called once, after _initialize_state() and after the bar buffer has
+        been populated with warm-up bars.
+        """
+        try:
+            # Ensure times are tz-aware UTC
+            wdf = warmup_data.copy()
+            if wdf['time'].dt.tz is None:
+                wdf['time'] = wdf['time'].dt.tz_localize(pytz.utc)
+
+            # ── prev_day_ohlc ────────────────────────────────────────────────
+            # Use the last full calendar day present in the warm-up window.
+            wdf['_date'] = wdf['time'].dt.date
+            dates = sorted(wdf['_date'].unique())
+            if len(dates) >= 1:
+                last_day = dates[-1]
+                day_bars = wdf[wdf['_date'] == last_day]
+                self.state.prev_day_ohlc = {
+                    'high':  float(day_bars['high'].max()),
+                    'low':   float(day_bars['low'].min()),
+                    'open':  float(day_bars.iloc[0]['open']),
+                    'close': float(day_bars.iloc[-1]['close']),
+                }
+                logger.info(
+                    f"Backfill prev_day_ohlc from warm-up: "
+                    f"H={self.state.prev_day_ohlc['high']:.2f} "
+                    f"L={self.state.prev_day_ohlc['low']:.2f}"
+                )
+
+            # ── asian_range ──────────────────────────────────────────────────
+            # Asian session = 22:00–07:00 UTC.  Use the last Asian window in
+            # the warm-up data (bars where hour is 22-23 OR 0-6).
+            asian_mask = (wdf['time'].dt.hour >= 22) | (wdf['time'].dt.hour < 7)
+            asian_bars = wdf[asian_mask]
+            if not asian_bars.empty:
+                self.state.asian_range = {
+                    'high': float(asian_bars['high'].max()),
+                    'low':  float(asian_bars['low'].min()),
+                }
+                logger.info(
+                    f"Backfill asian_range from warm-up: "
+                    f"H={self.state.asian_range['high']:.2f} "
+                    f"L={self.state.asian_range['low']:.2f}"
+                )
+
+            # ── pre_london_range ─────────────────────────────────────────────
+            # Pre-London range = Asian session bars of the LAST warm-up day
+            # (hour 0-6 UTC on the final date, which is the day before live
+            # trading starts).
+            if len(dates) >= 1:
+                last_date = dates[-1]
+                pre_london_mask = (
+                    (wdf['_date'] == last_date) &
+                    (wdf['time'].dt.hour < 7)
+                )
+                pre_london_bars = wdf[pre_london_mask]
+                # Fallback: if the last warm-up day has no pre-07:00 bars
+                # (e.g. data starts at 01:00), extend to the previous date.
+                if pre_london_bars.empty and len(dates) >= 2:
+                    prev_date = dates[-2]
+                    pre_london_mask = (
+                        (wdf['_date'] == prev_date) &
+                        (wdf['time'].dt.hour < 7)
+                    )
+                    pre_london_bars = wdf[pre_london_mask]
+
+                if not pre_london_bars.empty:
+                    self.state.pre_london_range = {
+                        'high': float(pre_london_bars['high'].max()),
+                        'low':  float(pre_london_bars['low'].min()),
+                    }
+                    logger.info(
+                        f"Backfill pre_london_range from warm-up: "
+                        f"H={self.state.pre_london_range['high']:.2f} "
+                        f"L={self.state.pre_london_range['low']:.2f}"
+                    )
+                else:
+                    # Last resort: use the full Asian range as pre-London range
+                    self.state.pre_london_range = self.state.asian_range
+                    logger.info("Backfill pre_london_range: used asian_range as fallback")
+
+        except Exception as exc:
+            logger.warning(f"_backfill_ranges_from_warmup failed (non-fatal): {exc}")
+            # Leave fields as None — strategies will skip gracefully
 
     def _process_bar(self, bar, events: List[Dict[str, Any]], spreads: pd.DataFrame) -> None:
         """
