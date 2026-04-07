@@ -29,7 +29,7 @@ import pytz
 # Import updated components
 from backtest.indicators import calculate_atr, calculate_rsi, calculate_ema, calculate_adx_h4
 from backtest.data_feed import (
-    HistoricalDataFeed, HistoricalEventFeed, HistoricalSpreadFeed, BarBuffer
+    HistoricalDataFeed, HistoricalEventFeed, HistoricalSpreadFeed, BarBuffer, HistoricalDXYFeed
 )
 from backtest.strategies import ALL_STRATEGIES, STRATEGY_CONFIGS, get_strategy_family
 from backtest.strategies import evaluate_strategy
@@ -51,8 +51,9 @@ except ImportError:
 logger = logging.getLogger("backtest.engine")
 
 # Trading constants for XAUUSD
-POINT_VALUE = 1.0  # XAUUSD: 1 point = $1 USD per standard lot
+POINT_VALUE = 100.0  # XAUUSD: $1 price move × 100 oz/lot = $100 per standard lot
 COMMISSION_PER_LOT_RT = 7.00  # USD round-trip per standard lot
+SWAP_PER_LOT_PER_NIGHT = -7.0  # USD per standard lot per overnight hold (XAUUSD long typical)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN BACKTEST ENGINE
@@ -81,6 +82,7 @@ class BacktestEngine:
         self.data_feed = HistoricalDataFeed(start_date, end_date)
         self.event_feed = HistoricalEventFeed(start_date, end_date)
         self.spread_feed = HistoricalSpreadFeed(start_date, end_date)
+        self.dxy_feed = HistoricalDXYFeed(start_date, end_date)
         self.bar_buffer = BarBuffer()
         
         self.regime_classifier = RegimeClassifier()
@@ -117,6 +119,19 @@ class BacktestEngine:
             m5_data = self.data_feed.load()
             events = self.event_feed.load()
             spreads = self.spread_feed.load()
+
+            # Load warm-up bars (100 H1 bars = ~4 days before start_date)
+            warmup_start = self.start_date - timedelta(days=5)
+            warmup_feed = HistoricalDataFeed(warmup_start, self.start_date)
+            try:
+                warmup_data = warmup_feed.load()
+                # Pre-populate bar buffer with warm-up data (don't generate signals)
+                for bar in warmup_data.itertuples():
+                    self.bar_buffer.add_m5_bar(bar._asdict())
+                logger.info(f"Warm-up complete: {len(warmup_data)} bars pre-loaded")
+            except Exception as e:
+                logger.warning(f"Could not load warm-up data: {e}")
+
             # Enable KS7 only when a real events CSV was loaded.
             # Hardcoded events are not timestamp-accurate enough for bar-level blackouts.
             self._ks7_enabled = getattr(self.event_feed, 'loaded_from_csv', False)
@@ -202,6 +217,10 @@ class BacktestEngine:
         bar_time = bar.time
         self.bar_buffer.add_m5_bar(bar._asdict())
 
+        # Apply overnight swap at midnight
+        if bar_time.hour == 0 and bar_time.minute == 0:
+            self._apply_overnight_swap(bar_time)
+
         session = self._get_session(bar_time)
         self.state.current_session = session  # BUG-4: keep SimulatedState in sync
 
@@ -230,11 +249,12 @@ class BacktestEngine:
             self.state.trading_enabled = False
         
         # BUG-8 FIX: correct classify_regime call signature — dxy_macro is 4th arg
+        dxy_macro = self.dxy_feed.get_daily_change(bar_time)  # Returns None if no data
         regime, size_multiplier = self.regime_classifier.classify_regime(
             context.get('adx_h4', 20.0),
             context.get('atr_pct_h1', 50.0),
             session,
-            None,           # dxy_macro — not available in backtest
+            dxy_macro,           # dxy_macro — retrieved from feed
             has_upcoming_event,
             current_spread / median_spread if median_spread > 0 else 1.0
         )
@@ -503,54 +523,55 @@ class BacktestEngine:
                     'open': m15_bars[0]['open'],
                     'close': m15_bars[-1]['close']
                 }
-            # KS6: Drawdown circuit breaker
-        # KS6: Drawdown circuit breaker (checked daily at midnight)
-        ks6_triggered, ks6_reason = check_ks6_drawdown(
-            self.state.equity, self.state.peak_equity, self.state.to_dict()
-        )
-        if ks6_triggered:
-            if should_enable_ks6_auto_reset() and "AUTO_RESET" in ks6_reason:
-                # BUG-10 FIX: capture returned dict before reconstructing state
-                updated_state_dict = handle_ks6_trigger_backtest(
-                    self.state.to_dict(),
-                    self.processed_bars,
-                    bar._asdict(),
-                    (self.state.peak_equity - self.state.equity) / self.state.peak_equity * 100
-                )
-                # Rebuild SimulatedState from the *returned* dict, not self.state
-                new_state = SimulatedState()
-                for k, v in updated_state_dict.items():
-                    if hasattr(new_state, k):
-                        setattr(new_state, k, v)
-                self.state = new_state
-            else:
-                self.state.trading_enabled = False
-                self.state.shutdown_reason = ks6_reason
 
-        # Reset daily counters and kill-switch baselines
-        self.state.s1_family_attempts_today = 0
-        self.state.s1d_fired_today = False
-        self.state.s1d_pyramid_count = 0
-        self.state.s1e_pyramid_count = 0
-        self.state.s1f_reentered_today = False
-        self.state.s1f_post_tk_active = False
-        self.state.s4_fired_today = False
-        self.state.s4_ema_touched = False
-        self.state.s1d_ema_touched_today = False
-        self.state.s5_fired_today = False
-        self.state.range_computed = False  # s5_compression_confirmed alias
-        self.state.r3_fired_today = False
-        self.state.s8_fired_today = False
-        self.state.s2_fired_today = False
-        self.state.s3_fired_today = False
-        self.state.s6_placed_today = False
-        self.state.s7_placed_today = False
-        self.state.daily_pnl = 0.0
-        self.state.daily_trades = 0
-        self.state.daily_commission_paid = 0.0
-        self.kill_switch_checker.reset_daily(self.state.balance)
-        if bar_time.weekday() == 0:  # Monday
-            self.kill_switch_checker.reset_weekly(self.state.balance)
+            # KS6: Drawdown circuit breaker (checked daily at midnight)
+            ks6_triggered, ks6_reason = check_ks6_drawdown(
+                self.state.equity, self.state.peak_equity, self.state.to_dict()
+            )
+            if ks6_triggered:
+                if should_enable_ks6_auto_reset() and "AUTO_RESET" in ks6_reason:
+                    # BUG-10 FIX: capture returned dict before reconstructing state
+                    updated_state_dict = handle_ks6_trigger_backtest(
+                        self.state.to_dict(),
+                        self.processed_bars,
+                        bar._asdict(),
+                        (self.state.peak_equity - self.state.equity) / self.state.peak_equity * 100
+                    )
+                    # Rebuild SimulatedState from the *returned* dict, not self.state
+                    new_state = SimulatedState()
+                    for k, v in updated_state_dict.items():
+                        if hasattr(new_state, k):
+                            setattr(new_state, k, v)
+                    self.state = new_state
+                else:
+                    self.state.trading_enabled = False
+                    self.state.shutdown_reason = ks6_reason
+
+            # Reset daily counters and kill-switch baselines
+            self.state.s1_family_attempts_today = 0
+            self.state.s1d_fired_today = False
+            self.state.s1d_pyramid_count = 0
+            self.state.s1e_pyramid_count = 0
+            self.state.s1f_reentered_today = False
+            self.state.s1f_post_tk_active = False
+            self.state.s4_fired_today = False
+            self.state.s4_ema_touched = False
+            self.state.s1d_ema_touched_today = False
+            self.state.s5_fired_today = False
+            self.state.range_computed = False  # s5_compression_confirmed alias
+            self.state.r3_fired_today = False
+            self.state.s8_fired_today = False
+            self.state.s2_fired_today = False
+            self.state.s3_fired_today = False
+            self.state.s6_placed_today = False
+            self.state.s7_placed_today = False
+            self.state.daily_pnl = 0.0
+            self.state.daily_trades = 0
+            self.state.daily_commission_paid = 0.0
+            self.kill_switch_checker.reset_daily(self.state.balance)
+
+            if bar_time.weekday() == 0:  # Monday
+                self.kill_switch_checker.reset_weekly(self.state.balance)
         
         # Update event-related state
         if upcoming_events:
@@ -622,6 +643,21 @@ class BacktestEngine:
             
             del self.state.open_positions[trade.ticket]
 
+    def _apply_overnight_swap(self, bar_time: datetime) -> None:
+        """Deduct overnight swap cost for all open positions."""
+        total_swap = 0.0
+        for ticket, position in self.execution_sim.open_positions.items():
+            # Only charge swap if position was open before today
+            if position.entry_time.date() < bar_time.date():
+                swap_cost = SWAP_PER_LOT_PER_NIGHT * position.lot_size
+                total_swap += swap_cost
+
+        if total_swap != 0.0:
+            self.state.equity += total_swap
+            self.state.balance = self.state.equity
+            self.state.daily_pnl += total_swap
+            logger.debug(f"Overnight swap applied: ${total_swap:.2f} at {bar_time.date()}")
+
     def _update_equity_curve(self, bar_time: datetime) -> None:
         """Update equity curve."""
         equity_point = EquityPoint(
@@ -648,7 +684,7 @@ class BacktestEngine:
                 else:
                     pnl_points = position.entry_price - last_price
 
-                pnl_usd    = pnl_points * 100.0 * position.lot_size  # POINT_VALUE=100
+                pnl_usd    = pnl_points * POINT_VALUE * position.lot_size
                 commission = COMMISSION_PER_LOT_RT * position.lot_size
                 net_pnl    = pnl_usd - commission
 
@@ -685,41 +721,62 @@ class BacktestEngine:
             return {'error': 'No trades executed'}
         
         # Calculate performance metrics
-        total_trades = len(self.trades)
-        winning_trades = len([t for t in self.trades if t.pnl_net_dollars > 0])
-        losing_trades = total_trades - winning_trades
+        # Separate full closes from partial exits
+        full_trades = [t for t in self.trades if t.exit_type != 'PARTIAL_EXIT']
+        partial_exits = [t for t in self.trades if t.exit_type == 'PARTIAL_EXIT']
+
+        total_trades = len(full_trades)       # Report only full closes as "trades"
+        winning_trades = len([t for t in full_trades if t.pnl_net_dollars > 0])
+        losing_trades = len([t for t in full_trades if t.pnl_net_dollars <= 0])
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
-        
-        total_pnl = sum(t.pnl_net_dollars for t in self.trades)
-        total_commission = sum(t.commission for t in self.trades)
-        
+
+        # For P&L, expectancy, and R-multiple stats — use ALL trades (full + partial)
+        all_closed_trades = self.trades
+        total_pnl = sum(t.pnl_net_dollars for t in all_closed_trades)
+        total_commission = sum(t.commission for t in all_closed_trades)
+
         # Calculate expectancy
-        avg_win = sum(t.pnl_net_dollars for t in self.trades if t.pnl_net_dollars > 0)
+        avg_win = sum(t.pnl_net_dollars for t in full_trades if t.pnl_net_dollars > 0)
         avg_win = avg_win / winning_trades if winning_trades > 0 else 0
-        avg_loss = sum(abs(t.pnl_net_dollars) for t in self.trades if t.pnl_net_dollars < 0)
+        avg_loss = sum(abs(t.pnl_net_dollars) for t in full_trades if t.pnl_net_dollars <= 0)
         avg_loss = avg_loss / losing_trades if losing_trades > 0 else 0
-        
+
         expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
-        
+
         # Calculate drawdown
         equity_values = [ep.equity for ep in self.equity_curve]
         peak = equity_values[0]
         max_dd = 0.0
-        
+
         for equity in equity_values:
             if equity > peak:
                 peak = equity
             dd = (peak - equity) / peak if peak > 0 else 0
             max_dd = max(max_dd, dd)
-        
-        # Calculate Sharpe ratio (simplified)
-        if len(equity_values) > 1:
-            returns = [equity_values[i] / equity_values[i-1] - 1 for i in range(1, len(equity_values))]
-            avg_return = np.mean(returns)
-            std_return = np.std(returns)
-            sharpe = avg_return / std_return if std_return > 0 else 0
-        else:
-            sharpe = 0
+
+        # Calculate Sharpe ratio — on DAILY returns, annualized
+        # Group equity_curve by calendar date, take end-of-day (last) equity per day
+        sharpe = 0.0
+        try:
+            daily_equity = {}
+            for ep in self.equity_curve:
+                day_key = ep.time.date()
+                daily_equity[day_key] = ep.equity  # overwrites with last bar of each day
+
+            sorted_days = sorted(daily_equity.keys())
+            if len(sorted_days) > 2:
+                daily_equities = [daily_equity[d] for d in sorted_days]
+                daily_returns = [
+                    daily_equities[i] / daily_equities[i-1] - 1
+                    for i in range(1, len(daily_equities))
+                ]
+                avg_daily = np.mean(daily_returns)
+                std_daily = np.std(daily_returns)
+                # Annualize: multiply by sqrt(252 trading days)
+                sharpe = (avg_daily / std_daily * np.sqrt(252)) if std_daily > 0 else 0.0
+        except Exception as e:
+            logger.warning(f"Sharpe calculation failed: {e}")
+            sharpe = 0.0
         
         # Strategy breakdown
         strategy_performance = {}
@@ -747,6 +804,8 @@ class BacktestEngine:
                 'total_commission': total_commission,
                 'pnl_pct': (total_pnl / self.initial_balance) * 100,
                 'total_trades': total_trades,
+                'partial_exits': len(partial_exits),
+                'total_closures': len(self.trades),
                 'winning_trades': winning_trades,
                 'losing_trades': losing_trades,
                 'win_rate': win_rate * 100,

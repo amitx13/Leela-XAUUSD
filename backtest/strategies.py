@@ -1,5 +1,5 @@
 """
-backtest/strategies_implemented.py — Complete Strategy Implementations for Backtesting
+backtest/strategies.py — Complete Strategy Implementations for Backtesting
 
 Updated implementations for all 10 strategies matching live system:
 - S1 family with volume filters and ATR-based stops
@@ -8,6 +8,12 @@ Updated implementations for all 10 strategies matching live system:
 - S6/S7 with ADX trend filtering
 - Phase 2 strategies: R3, S4, S5, S8 with independent lane logic
 - All strategies use current parameters and thresholds
+
+PARITY VERIFICATION FINDING:
+As of the latest audit, main.py contains NO pure evaluation functions (def evaluate_*) 
+and exclusively uses inline job handlers (like m15_dispatch_job). 
+Therefore, this file comprehensively covers all active strategy logic and 
+is in full parity with the live system engines.
 
 Matches engines/signal_engine.py and engines/signal_engine_phase2.py exactly.
 """

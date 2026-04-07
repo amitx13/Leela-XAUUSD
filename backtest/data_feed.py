@@ -47,8 +47,8 @@ TF_RESAMPLE_RULE = {
 # ---------------------------------------------------------------------------
 # Default paths for data files
 # ---------------------------------------------------------------------------
-_DEFAULT_EVENTS_CSV = Path(__file__).parent.parent / "backtest_data" / "events.csv"
-_DEFAULT_SPREAD_CSV = Path(__file__).parent.parent / "backtest_data" / "spread.csv"
+_DEFAULT_EVENTS_CSV = Path(__file__).parent.parent / "backtest_data" / "events_calendar.csv"
+_DEFAULT_SPREAD_CSV = Path(__file__).parent.parent / "backtest_data" / "spreads_XAUUSD_M5.csv"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTRACT SPECIFICATIONS
@@ -510,3 +510,61 @@ class BarBuffer:
         if 'time' in df.columns:
             df['time'] = pd.to_datetime(df['time'], utc=True)
         return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DXY FEED - Macro proxy for SUPER_TRENDING regime
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HistoricalDXYFeed:
+    """
+    Historical feed for DXY daily change to enable SUPER_TRENDING regime.
+    """
+
+    def __init__(self, start_date: datetime, end_date: datetime, cache_dir: str = "backtest_data"):
+        self.start_date = start_date.replace(tzinfo=pytz.utc) if start_date.tzinfo is None else start_date
+        self.end_date   = end_date.replace(tzinfo=pytz.utc) if end_date.tzinfo is None else end_date
+        self.cache_dir = Path(cache_dir)
+        self._df: Optional[pd.DataFrame] = None
+
+    def load(self) -> pd.DataFrame:
+        """Load DXY/UUP data from CSV if available."""
+        if self._df is not None:
+            return self._df
+            
+        csv_path = Path(__file__).parent.parent / self.cache_dir / "dxy_daily.csv"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path)
+            # Assume columns: date, close
+            time_col = 'date' if 'date' in df.columns else 'time'
+            df[time_col] = pd.to_datetime(df[time_col], utc=True)
+            df = df.sort_values(time_col).reset_index(drop=True)
+            
+            # Calculate daily change
+            if 'close' in df.columns:
+                df['daily_change'] = df['close'].pct_change() * 100
+                df['daily_change'] = df['daily_change'].fillna(0)
+            
+            self._df = df
+            logger.info(f"Loaded DXY data from {csv_path}: {len(df)} days")
+            return self._df
+            
+        logger.warning(f"No DXY CSV found at {csv_path}. SUPER_TRENDING regime will be disabled.")
+        self._df = pd.DataFrame()
+        return self._df
+
+    def get_daily_change(self, bar_time: datetime) -> Optional[float]:
+        """Get daily % change for the given bar's date."""
+        if self._df is None:
+            self.load()
+            
+        if self._df.empty or 'daily_change' not in self._df.columns:
+            return None
+            
+        time_col = 'date' if 'date' in self._df.columns else 'time'
+        mask = self._df[time_col].dt.date <= bar_time.date()
+        valid_rows = self._df[mask]
+        
+        if valid_rows.empty:
+            return None
+            
+        return float(valid_rows.iloc[-1]['daily_change'])

@@ -98,8 +98,8 @@ Examples:
                                help="Strategy group to run")
     
     # Analysis options
-    parser.add_argument("--walk-forward", action="store_true",
-                        help="Run walk-forward analysis after backtest")
+    parser.add_argument("--no-walk-forward", action="store_true",
+                        help="Skip walk-forward analysis (not recommended)")
     parser.add_argument("--train-months", type=int, default=3,
                         help="Walk-forward training window in months (default: 3)")
     parser.add_argument("--test-months", type=int, default=1,
@@ -319,7 +319,13 @@ def run_monte_carlo(results: dict, args: argparse.Namespace) -> Optional[dict]:
 
 def run_walk_forward(results: dict, args: argparse.Namespace) -> Optional[dict]:
     """Run walk-forward analysis if requested."""
-    if not args.walk_forward:
+    if hasattr(args, 'no_walk_forward') and args.no_walk_forward:
+        logger.warning("=" * 60)
+        logger.warning("WARNING: Walk-forward analysis not enabled.")
+        logger.warning("All results are IN-SAMPLE ONLY.")
+        logger.warning("Do not use these results for live deployment.")
+        logger.warning("Re-run without --no-walk-forward for valid out-of-sample results.")
+        logger.warning("=" * 60)
         return None
     
     logger.info("Running walk-forward analysis...")

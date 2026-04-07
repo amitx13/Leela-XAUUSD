@@ -83,6 +83,12 @@ class ExecutionSimulator:
         filled_tags: set[str] = set()
 
         for order in pending:
+            # ONE-BAR DELAY: Orders placed on bar T cannot be filled until bar T+1.
+            # This prevents same-bar fill look-ahead bias.
+            if order.placed_time is not None and bar_time <= order.placed_time:
+                remaining.append(order)
+                continue
+
             # Expiry check
             if order.expiry and bar_time > order.expiry:
                 logger.debug(f"Order expired: {order.strategy} {order.direction} @ {order.price:.2f}")
