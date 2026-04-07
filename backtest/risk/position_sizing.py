@@ -257,11 +257,13 @@ class PortfolioRiskChecker:
         self.daily_var_used += position.get('lot_size', 0) * atr_h1
     
     def remove_position(self, position: Dict[str, Any]) -> None:
-        """Remove position from tracking."""
-        if position in self.open_positions:
-            self.open_positions.remove(position)
-            atr_h1 = position.get('atr_h1', 20.0)
-            self.daily_var_used -= position.get('lot_size', 0) * atr_h1
+        """Remove position from tracking — matches by ticket ID, not object identity."""
+        ticket = position.get("ticket")
+        existing = next((p for p in self.open_positions if p.get("ticket") == ticket), None)
+        if existing:
+            self.open_positions.remove(existing)
+            atr_h1 = existing.get("atr_h1", 20.0)
+            self.daily_var_used -= existing.get("lot_size", 0) * atr_h1
     
     def reset_daily(self) -> None:
         """Reset daily state."""

@@ -107,8 +107,8 @@ def check_ks4_loss_streak(
     
     # Decrement countdown if active
     if ks4_reduced_trades_remaining > 0:
-        new_countdown = ks4_reduced_trades_remaining - 1
-        return False, f"KS4: Size reduction active - {new_countdown} trades remaining", new_countdown
+        # Countdown is decremented per trade-close in engine._update_state_after_trade(), not here.
+        return False, f"KS4: Size reduction active - {ks4_reduced_trades_remaining} trades remaining", ks4_reduced_trades_remaining
     
     return False, "OK", ks4_reduced_trades_remaining
 
@@ -308,12 +308,11 @@ class KillSwitchChecker:
             results['state_updates']['trading_enabled'] = False
             results['state_updates']['shutdown_reason'] = ks5_reason
         
-        # KS6: Drawdown circuit breaker
-        ks6_triggered, ks6_reason = check_ks6_drawdown(equity, self.peak_equity)
-        if ks6_triggered:
-            results['triggered_switches'].append('KS6')
-            results['state_updates']['trading_enabled'] = False
-            results['state_updates']['shutdown_reason'] = ks6_reason
+        # KS6: Intentionally NOT checked here.
+        # KS6 is a daily circuit breaker handled exclusively at midnight
+        # in BacktestEngine._update_strategy_state() which has the correct
+        # auto-reset recovery path. Checking it here causes an intraday
+        # permanent block with no recovery.
         
         # KS7: Event blackout
         ks7_triggered, ks7_reason, ks7_data = check_ks7_event_blackout(current_time, upcoming_events)

@@ -222,6 +222,9 @@ class BacktestEngine:
         self.state.reversal_family_occupied = False
         self.state.independent_lanes_occupied = {}
 
+        self.kill_switch_checker.reset_daily(self.initial_balance)
+        self.kill_switch_checker.reset_weekly(self.initial_balance)
+
     def _backfill_ranges_from_warmup(self, warmup_data: pd.DataFrame) -> None:
         """
         Derive pre_london_range, asian_range, and prev_day_ohlc from the
@@ -615,7 +618,7 @@ class BacktestEngine:
             # Update Asian range
             if bar_time.hour == 5 and bar_time.minute == 30:
                 m5_bars = self.bar_buffer.get_latest_bars('M5', 72)
-                asian_bars = [b for b in m5_bars if 0 <= b['time'].hour < 6]
+                asian_bars = [b for b in m5_bars if b['time'].hour >= 22 or b['time'].hour < 7]
                 if asian_bars:
                     asian_high = max(b['high'] for b in asian_bars)
                     asian_low = min(b['low'] for b in asian_bars)
@@ -653,6 +656,8 @@ class BacktestEngine:
                         if hasattr(new_state, k):
                             setattr(new_state, k, v)
                     self.state = new_state
+                    self.execution_sim.open_positions.clear()
+                    self.pending_orders.clear()
                 else:
                     self.state.trading_enabled = False
                     self.state.shutdown_reason = ks6_reason
@@ -679,9 +684,11 @@ class BacktestEngine:
             self.state.daily_trades = 0
             self.state.daily_commission_paid = 0.0
             self.kill_switch_checker.reset_daily(self.state.balance)
+            self.portfolio_checker.reset_daily()
 
             if bar_time.weekday() == 0:  # Monday
                 self.kill_switch_checker.reset_weekly(self.state.balance)
+                self.state.weekly_pnl = 0.0
         
         # Update event-related state
         if upcoming_events:
@@ -706,6 +713,14 @@ class BacktestEngine:
         # Add to open positions
         self.state.open_positions[position.ticket] = position
 
+        self.portfolio_checker.add_position({
+            "strategy": position.strategy,
+            "direction": position.direction,
+            "lot_size": position.lot_size,
+            "ticket": position.ticket,
+            "atr_h1": self.state.__dict__.get("atr_h1", 20.0)
+        })
+
     def _update_state_after_trade(self, trade: TradeRecord) -> None:
         """Update state after trade close."""
         # Update P&L
@@ -724,11 +739,23 @@ class BacktestEngine:
         else:
             self.kill_switch_checker.update_trade_result(1)
         
+        if self.kill_switch_checker.ks4_reduced_trades_remaining > 0:
+            self.kill_switch_checker.ks4_reduced_trades_remaining -= 1
+            self.state.ks4_reduced_trades_remaining = self.kill_switch_checker.ks4_reduced_trades_remaining
+        
         # Update position tracking
         strategy_family = get_strategy_family(trade.strategy)
         
         if trade.ticket in self.state.open_positions:
             position = self.state.open_positions[trade.ticket]
+
+            self.portfolio_checker.remove_position({
+                "strategy": position.strategy,
+                "direction": position.direction,
+                "lot_size": position.lot_size,
+                "ticket": position.ticket,
+                "atr_h1": self.state.__dict__.get("atr_h1", 20.0)
+            })
             
             # Check if position was in trend family
             if strategy_family == "trend":
@@ -875,7 +902,7 @@ class BacktestEngine:
                 daily_equity[day_key] = ep.equity  # overwrites with last bar of each day
 
             sorted_days = sorted(daily_equity.keys())
-            if len(sorted_days) > 2:
+            if len(sorted_days) >= 30:
                 daily_equities = [daily_equity[d] for d in sorted_days]
                 daily_returns = [
                     daily_equities[i] / daily_equities[i-1] - 1
@@ -885,6 +912,11 @@ class BacktestEngine:
                 std_daily = np.std(daily_returns)
                 # Annualize: multiply by sqrt(252 trading days)
                 sharpe = (avg_daily / std_daily * np.sqrt(252)) if std_daily > 0 else 0.0
+            if len(sorted_days) > 0 and len(sorted_days) < 30:
+                logger.warning(
+                    f"Sharpe ratio skipped: only {len(sorted_days)} trading days in run "
+                    f"(minimum 30 required for statistical validity). Set to 0."
+                )
         except Exception as e:
             logger.warning(f"Sharpe calculation failed: {e}")
             sharpe = 0.0
