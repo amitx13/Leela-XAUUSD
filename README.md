@@ -5,7 +5,7 @@
 Leela is a sophisticated algorithmic trading system designed specifically for XAUUSD (Gold) trading on MetaTrader 5. The system implements multiple trading strategies across different market sessions with advanced risk management, real-time analytics, and comprehensive monitoring capabilities.
 
 **Key Features:**
-- **10 Trading Strategies** across different market conditions and sessions
+- **13 Trading Strategies** across different market conditions and sessions
 - **6-State Regime Engine** for dynamic market classification
 - **Advanced Risk Management** with 7 kill switches and portfolio-level controls
 - **Multi-Session Coverage** (Asian, London, New York, and overlaps)
@@ -112,7 +112,7 @@ If you're new to algorithmic trading or this system, follow these steps:
    
    # Create virtual environment
    python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   source venv/bin/activate
    
    # Install dependencies
    pip install -r requirements.txt
@@ -165,27 +165,32 @@ If you're new to algorithmic trading or this system, follow these steps:
 
 3. **Monitor**
    - Watch for WARM_START completion
-   - Check S6/S7 order placement
-   - Monitor S1 pending order setup
+   - Monitor order placement
 
 ---
 
 ## Trading Strategies
 
-The system implements 10 distinct strategies across different market conditions:
+The system implements 13 distinct strategies across different market conditions:
 
 ### Phase 1 Strategies (Core)
 
 #### S1 Family - London Momentum Strategies
 
 **S1_LONDON_BRK** - Primary London Breakout
-- **Session**: London (08:00-16:30 London time)
+- **Session**: London (08:00-17:00 London local time, DST-adjusted)
 - **Setup**: Pre-London range (00:00-07:55 UTC)
 - **Entry**: BUY/SELL STOP at range boundaries + 12% breakout distance
 - **Volume Filter**: Rejects breakouts with low volume confirmation
 - **Stop Loss**: ATR-based (max(0.3×H1 ATR, 5.0 points))
 - **Take Profit**: 2.5R from entry
 - **Max per Day**: 4 attempts
+
+**S1C_STOP_HUNT** - Stop Hunt Pre-Signal Detection
+- **Purpose**: Detects potential liquidity sweeps before London open
+- **Trigger**: Price touches EMA20 on M15 during pre-London session
+- **Action**: Sets state flag to reduce S1 confirmation threshold from 3 to 2 touches
+- **Reset**: Clears at London open if no sweep confirmed
 
 **S1B_FAILED_BRK** - Failed Breakout Reversal
 - **Trigger**: S1 fills and hits stop loss
@@ -277,17 +282,21 @@ The system implements 10 distinct strategies across different market conditions:
 
 ### Position Sizing Algorithm
 
-```
-1. Base risk = 1.0% (Phase 1) or 2.0% (Phase 2)
-2. Conviction boost: A+ = ×1.25, OBSERVATION = ×0.75
-3. KS4 countdown: ×0.5 for 3 trades after 4-loss streak
-4. Severity multiplier: from economic event risk score
-5. Spread multiplier: from current vs median spread ratio
-6. Vol scalar: from EWMA ATR percentile
-7. Reduction floor: severity × spread × vol_scalar clamped to minimum 0.50
-8. Compound gate: if severity × spread × vol_scalar < 0.35 → block trade
-9. Final: max(volume_min, min(calculated_lots, V1_LOT_HARD_CAP))
-```
+**Step-by-Step Calculation:**
+1. **Base Risk**: 1.0% account equity (Phase 1) or 2.0% (Phase 2)
+2. **Conviction Adjustment**: 
+   - A_PLUS: ×1.25 (clear horizon + regime alignment)
+   - OBSERVATION: ×0.75 (macro misalignment)
+   - STANDARD: ×1.0 (default)
+3. **KS4 Recovery**: ×0.5 for 3 trades after 4-loss streak
+4. **Event Severity**: 0.5-1.5× based on economic event risk score
+5. **Spread Penalty**: 0.7-1.0× based on current vs median spread ratio
+6. **Volatility Scalar**: 0.7-1.3× from EWMA ATR percentile
+7. **Reduction Floor**: Combined multipliers minimum 0.50
+8. **Compound Gate**: Block if combined < 0.35
+9. **Final Sizing**: Apply to account risk → convert to lots using contract specs
+
+**Formula**: `Lots = (Equity × BaseRisk × Multipliers) / (StopLossPoints × TickValue × ContractSize)`
 
 ### Portfolio Risk Controls
 
@@ -302,6 +311,20 @@ The system implements 10 distinct strategies across different market conditions:
 
 The system classifies market conditions into 6 states with hysteresis:
 
+**Regime Calculation Overview:**
+- **ADX H4**: 14-period ADX on 4-hour timeframe (trend strength)
+- **ATR Percentile**: Current H1 ATR vs 90-day historical distribution
+- **DXY Correlation**: 20-period correlation with Dollar Index
+- **Hysteresis**: Requires 3 consecutive readings to confirm state change
+
+**State Transitions:**
+- NO_TRADE: Triggered by extreme ATR (>95th percentile) or system errors
+- UNSTABLE: High volatility (85-95% ATR) with low trend strength
+- RANGING_CLEAR: Low ADX (<18) regardless of volatility
+- WEAK_TRENDING: Moderate ADX (18-26) with any volatility
+- NORMAL_TRENDING: Strong ADX (26-35) with normal volatility
+- SUPER_TRENDING: Very strong ADX (>35) + high volatility + bearish DXY
+
 | State | ADX H4 | ATR Percentile H1 | DXY Macro | Size Multiplier | Strategies Allowed |
 |-------|--------|-------------------|-----------|-----------------|-------------------|
 | NO_TRADE | Any | >95% | Any | 0.0× | S7 only (pending) |
@@ -311,14 +334,16 @@ The system classifies market conditions into 6 states with hysteresis:
 | NORMAL_TRENDING | 26-35 | Any | No boost | 1.0× | All strategies |
 | SUPER_TRENDING | >35 | >55% | DXY < -0.70 | **1.5×** | All strategies |
 
-### Session Definitions (UTC)
+### Session Definitions (DST-Safe Local Time)
 
-| Session | Start | End | Characteristics |
-|---------|-------|-----|----------------|
-| ASIAN | 22:00 | 07:00 | Lower volatility, tight ranges |
-| LONDON | 07:00 | 16:00 | High volatility, trend formation |
-| NY | 13:00 | 21:00 | Second highest liquidity |
-| OVERLAP | 13:00 | 16:00 | Peak liquidity, strongest moves |
+| Session | Local Time Zone | Start | End | Characteristics |
+|---------|-----------------|-------|-----|----------------|
+| ASIAN | UTC | 22:00 | 07:00 | Lower volatility, tight ranges |
+| LONDON | London Time (BST/GMT) | 08:00 | 17:00 | High volatility, trend formation |
+| NY | New York Time (EDT/EST) | 08:00 | 17:00 | Second highest liquidity |
+| OVERLAP | Both | 13:00-16:00 London | 08:00-11:00 NY | Peak liquidity, strongest moves |
+
+**Note**: Session detection uses pytz for automatic DST adjustments. London and NY sessions follow local business hours, not fixed UTC times.
 
 ---
 
@@ -375,7 +400,7 @@ The system classifies market conditions into 6 states with hysteresis:
 
 6. **Database Initialization**
    ```bash
-   python -c "from db.init_db import init_database; init_database()"
+   python db/init_db.py
    ```
 
 7. **System Verification**
@@ -412,6 +437,13 @@ S6_MIN_RANGE_PTS       = 8.0    # Minimum Asian range
 S7_MIN_RANGE_ATR_RATIO = 0.75   # Minimum daily range ratio
 PARTIAL_EXIT_R         = 2.0    # Take 50% at 2R
 BE_ACTIVATION_R        = 1.5    # BE after 1.5R
+```
+
+#### ATR and Volatility
+```python
+ATR_PERIOD             = 14      # ATR calculation period
+ATR_MAMODE             = "RMA"   # Wilder's smoothing
+ATR_EWMA_DECAY         = 0.95    # EWMA decay for percentile calc
 ```
 
 ### Environment Variables (.env)
@@ -518,6 +550,12 @@ python main.py --weekly
 
 ### Conviction Levels
 
+**Conviction Calculation:**
+- **Macro Bias**: DXY trend + TLT/TIP yield curve analysis
+- **Regime Alignment**: Current regime vs optimal regime for strategy
+- **Event Context**: Proximity to high-impact economic events
+- **Recent Performance**: Last 10 trades for same strategy
+
 | Level | Criteria | Size Effect |
 |-------|----------|-------------|
 | STANDARD | Default conditions | 1.0× |
@@ -537,6 +575,13 @@ python main.py --weekly
 
 The system monitors for strategy degradation:
 
+**Performance Metrics Calculation:**
+- **Expectancy**: (WinRate × AvgWin) - (LossRate × AvgLoss) in R-multiples
+- **Win Rate**: Winning trades / Total trades
+- **Minimum Trades**: 50 trades required for reliable statistics
+- **Rolling Window**: Last 100 trades for current performance
+
+**Thresholds:**
 - **Warning Level**: Expectancy < 0.10R or Win Rate < 40%
 - **Critical Level**: Expectancy < 0.05R or Win Rate < 35%
 - **Action**: Auto-revert to Phase 1 if critical levels detected
